@@ -61,6 +61,13 @@ function fixture(t: TestContext) {
   return { base, workspace, context, db };
 }
 
+function parseApprovalSignature(signature: string | undefined): unknown[] {
+  assert.ok(signature, "approval signature should be present");
+  const parsed: unknown = JSON.parse(signature);
+  assert.ok(Array.isArray(parsed), "approval signature should be an array");
+  return parsed;
+}
+
 test("read handles files, directories, and artifacts", async (t) => {
   const { base, workspace, context } = fixture(t);
   if (process.platform === "win32") assert.equal(existsSync(join(base, "state.db")), true);
@@ -416,11 +423,16 @@ test("Bash keeps executable approval scope while PowerShell stays exact-command 
   const first = bashTool.approvalSignature?.({ command: firstCommand, workdir: null, timeout_ms: null }, context);
   const second = bashTool.approvalSignature?.({ command: secondCommand, workdir: "subdir", timeout_ms: 5_000 }, context);
   if (windows) {
-    assert.match(first ?? "", /"shell-exec",1,"powershell","Get-Content one\.txt"/);
+    assert.deepEqual(parseApprovalSignature(first), [
+      "shell-exec", 1, "powershell", firstCommand, workspace, context.config.tools.shellTimeoutMs,
+    ]);
+    assert.deepEqual(parseApprovalSignature(second), [
+      "shell-exec", 1, "powershell", secondCommand, join(workspace, "subdir"), 5_000,
+    ]);
     assert.notEqual(second, first);
   } else {
-    assert.equal(first, JSON.stringify(["shell-executable", 1, shell, executable]));
-    assert.equal(second, first);
+    assert.deepEqual(parseApprovalSignature(first), ["shell-executable", 1, shell, executable]);
+    assert.deepEqual(parseApprovalSignature(second), ["shell-executable", 1, shell, executable]);
   }
   assert.equal(bashApprovalExecutable("VALUE='hello world' cat file"), "cat");
   assert.equal(bashApprovalExecutable("'cat' file"), "cat");
@@ -434,10 +446,12 @@ test("Bash keeps executable approval scope while PowerShell stays exact-command 
   const criticalGit = bashTool.approvalSignature?.({ command: "git push --force origin main", workdir: null, timeout_ms: null }, context);
   if (windows) {
     assert.notEqual(ordinaryGit, criticalGit);
-    assert.match(ordinaryGit ?? "", /"shell-exec",1,"powershell","git status"/);
+    assert.deepEqual(parseApprovalSignature(ordinaryGit), [
+      "shell-exec", 1, "powershell", "git status", workspace, context.config.tools.shellTimeoutMs,
+    ]);
   } else {
     assert.equal(ordinaryGit, criticalGit);
-    assert.match(ordinaryGit ?? "", new RegExp(`"shell-executable",1,"${shell}","git"`));
+    assert.deepEqual(parseApprovalSignature(ordinaryGit), ["shell-executable", 1, shell, "git"]);
   }
 
   const relativeCommand = process.platform === "win32" ? ".\\task one" : "./task one";
@@ -446,10 +460,12 @@ test("Bash keeps executable approval scope while PowerShell stays exact-command 
   const movedRelative = bashTool.approvalSignature?.({ command: movedRelativeCommand, workdir: "subdir", timeout_ms: null }, context);
   if (windows) {
     assert.notEqual(relative, movedRelative);
-    assert.match(relative ?? "", /"shell-exec",1,"powershell","\.\\task one"/);
+    assert.deepEqual(parseApprovalSignature(relative), [
+      "shell-exec", 1, "powershell", relativeCommand, workspace, context.config.tools.shellTimeoutMs,
+    ]);
   } else {
     assert.equal(relative, movedRelative);
-    assert.match(relative ?? "", /"\.\/task"/);
+    assert.deepEqual(parseApprovalSignature(relative), ["shell-executable", 1, shell, "./task"]);
   }
 
   const compound = {
@@ -459,11 +475,13 @@ test("Bash keeps executable approval scope while PowerShell stays exact-command 
   };
   const scoped = bashTool.approvalSignature?.(compound, context);
   if (windows) {
-    assert.match(scoped ?? "", /"shell-exec",1,"powershell","Set-Location subdir; npm test"/);
+    assert.deepEqual(parseApprovalSignature(scoped), [
+      "shell-exec", 1, "powershell", compound.command, workspace, context.config.tools.shellTimeoutMs,
+    ]);
     assert.notEqual(bashTool.approvalSignature?.({ ...compound, workdir: "subdir" }, context), scoped);
     assert.notEqual(bashTool.approvalSignature?.({ ...compound, timeout_ms: 5_000 }, context), scoped);
   } else {
-    assert.equal(scoped, JSON.stringify(["shell-executable", 1, shell, "cd"]));
+    assert.deepEqual(parseApprovalSignature(scoped), ["shell-executable", 1, shell, "cd"]);
     assert.equal(bashTool.approvalSignature?.({ ...compound, workdir: "subdir" }, context), scoped);
     assert.equal(bashTool.approvalSignature?.({ ...compound, timeout_ms: 5_000 }, context), scoped);
   }
@@ -617,12 +635,14 @@ test("default code mode asks before every shell command", async (t) => {
   assert.equal(approvals, 1);
 });
 
-test("always approval remembers Bash executables for main and automated work", async (t) => {
+test("always approval remembers Bash executables or exact PowerShell commands", async (t) => {
   const { context, workspace } = fixture(t);
+  const windows = process.platform === "win32";
+  const rememberedCommand = outputCommand("remembered");
   context.approvalMode = "review";
   const registry = new ToolRegistry().register(bashTool);
   const args = registry.parseArguments("bash", JSON.stringify({
-    command: outputCommand("remembered"),
+    command: rememberedCommand,
     workdir: null,
     timeout_ms: null,
   }));
@@ -635,7 +655,7 @@ test("always approval remembers Bash executables for main and automated work", a
   assert.match((await registry.execute("bash", args, context)).output, /remembered/);
   assert.equal(requests.length, 1);
   assert.equal(requests[0]?.canAlwaysApprove, true);
-  if (process.platform === "win32") {
+  if (windows) {
     assert.ok((requests[0]?.details ?? "").includes("Only this exact PowerShell command"));
   } else {
     assert.ok((requests[0]?.details ?? "").includes("All Bash commands starting with 'printf'"));
@@ -663,7 +683,7 @@ test("always approval remembers Bash executables for main and automated work", a
     return "always";
   };
   const aborted = registry.parseArguments("bash", JSON.stringify({
-    command: process.platform === "win32" ? "Get-Location" : "uname",
+    command: windows ? "Get-Location" : "uname",
     workdir: null,
     timeout_ms: null,
   }));
@@ -678,46 +698,46 @@ test("always approval remembers Bash executables for main and automated work", a
     return "deny";
   };
   const changedTimeout = registry.parseArguments("bash", JSON.stringify({
-    command: outputCommand("another-value"),
+    command: rememberedCommand,
     workdir: null,
     timeout_ms: 5_000,
   }));
-  if (process.platform === "win32") {
+  if (windows) {
     await assert.rejects(registry.execute("bash", changedTimeout, context), /denied/);
   } else {
-    assert.match((await registry.execute("bash", changedTimeout, context)).output, /another-value/);
+    assert.match((await registry.execute("bash", changedTimeout, context)).output, /remembered/);
   }
   mkdirSync(join(workspace, "subdir"));
   const changedWorkdir = registry.parseArguments("bash", JSON.stringify({
-    command: outputCommand("from-subdir"),
+    command: rememberedCommand,
     workdir: "subdir",
     timeout_ms: null,
   }));
-  if (process.platform === "win32") {
+  if (windows) {
     await assert.rejects(registry.execute("bash", changedWorkdir, context), /denied/);
   } else {
-    assert.match((await registry.execute("bash", changedWorkdir, context)).output, /from-subdir/);
+    assert.match((await registry.execute("bash", changedWorkdir, context)).output, /remembered/);
   }
   const compound = registry.parseArguments("bash", JSON.stringify({
     command: compoundWriteCommand("compound.txt", "compound"),
     workdir: "subdir",
     timeout_ms: 5_000,
   }));
-  if (process.platform === "win32") {
+  if (windows) {
     await assert.rejects(registry.execute("bash", compound, context), /denied/);
   } else {
     assert.match((await registry.execute("bash", compound, context)).output, /exit: 0/);
     assert.equal(readFileSync(join(workspace, "subdir", "compound.txt"), "utf8"), "compound");
   }
-  assert.equal(changedPrompts, process.platform === "win32" ? 3 : 0);
+  assert.equal(changedPrompts, windows ? 3 : 0);
 
   const otherExecutable = registry.parseArguments("bash", JSON.stringify({
-    command: process.platform === "win32" ? "Get-Location" : "pwd",
+    command: windows ? "Get-Location" : "pwd",
     workdir: null,
     timeout_ms: null,
   }));
   await assert.rejects(registry.execute("bash", otherExecutable, context), /denied/);
-  assert.equal(changedPrompts, process.platform === "win32" ? 4 : 1);
+  assert.equal(changedPrompts, windows ? 4 : 1);
 
   const other = context.sessions.create({
     workspace,
@@ -728,7 +748,7 @@ test("always approval remembers Bash executables for main and automated work", a
   });
   context.sessionId = other.id;
   await assert.rejects(registry.execute("bash", args, context), /denied/);
-  assert.equal(changedPrompts, process.platform === "win32" ? 5 : 2);
+  assert.equal(changedPrompts, windows ? 5 : 2);
 
   context.sessionId = context.sessions.list(workspace).find((session) => session.id !== other.id)!.id;
   context.approvalMode = "unrestricted";

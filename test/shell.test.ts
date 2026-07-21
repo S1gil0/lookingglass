@@ -37,8 +37,10 @@ test("Windows process cancellation uses direct taskkill tree termination", async
   ]);
   assert.equal(calls[0]?.options.shell, false);
   assert.equal(calls[0]?.options.windowsHide, true);
+  assert.equal(calls[0]?.options.windowsVerbatimArguments, true);
   assert.equal(calls[1]?.options.shell, false);
   assert.equal(calls[1]?.options.windowsHide, true);
+  assert.equal(calls[1]?.options.windowsVerbatimArguments, undefined);
 });
 
 test("Windows taskkill errors and nonzero exits fall back to the child handle", async () => {

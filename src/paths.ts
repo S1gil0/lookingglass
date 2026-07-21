@@ -1,12 +1,18 @@
 import { mkdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve, win32 } from "node:path";
+import { dirname, join, posix, resolve, win32 } from "node:path";
 
 type Environment = Readonly<Record<string, string | undefined>>;
 
-function envPath(environment: Environment, name: string, fallback: string): string {
+type PathApi = Pick<typeof posix, "join" | "resolve">;
+
+function pathApi(platform: NodeJS.Platform): PathApi {
+  return platform === "win32" ? win32 : posix;
+}
+
+function envPath(environment: Environment, name: string, fallback: string, paths: PathApi): string {
   const value = environment[name];
-  return value ? resolve(value) : fallback;
+  return value ? paths.resolve(value) : fallback;
 }
 
 /** Return whether POSIX mode bits and umask should be enforced on a platform. */
@@ -15,15 +21,17 @@ export function shouldEnforcePosixPermissions(platform: NodeJS.Platform = proces
 }
 
 function configRoot(platform: NodeJS.Platform, environment: Environment, home: string): string {
-  const fallback = platform === "win32" ? join(home, "AppData", "Roaming") : join(home, ".config");
+  const paths = pathApi(platform);
+  const fallback = platform === "win32" ? paths.join(home, "AppData", "Roaming") : paths.join(home, ".config");
   const appData = platform === "win32" ? environment.APPDATA : undefined;
-  return envPath(environment, "XDG_CONFIG_HOME", appData ? resolve(appData) : fallback);
+  return envPath(environment, "XDG_CONFIG_HOME", appData ? paths.resolve(appData) : fallback, paths);
 }
 
 function dataRoot(platform: NodeJS.Platform, environment: Environment, home: string): string {
-  const fallback = platform === "win32" ? join(home, "AppData", "Local") : join(home, ".local", "share");
+  const paths = pathApi(platform);
+  const fallback = platform === "win32" ? paths.join(home, "AppData", "Local") : paths.join(home, ".local", "share");
   const localAppData = platform === "win32" ? environment.LOCALAPPDATA : undefined;
-  return envPath(environment, "XDG_DATA_HOME", localAppData ? resolve(localAppData) : fallback);
+  return envPath(environment, "XDG_DATA_HOME", localAppData ? paths.resolve(localAppData) : fallback, paths);
 }
 
 export function configDir(
@@ -31,7 +39,7 @@ export function configDir(
   environment: Environment = process.env,
   home: string = homedir(),
 ): string {
-  return join(configRoot(platform, environment, home), "looking-glass");
+  return pathApi(platform).join(configRoot(platform, environment, home), "looking-glass");
 }
 
 export function dataDir(
@@ -39,7 +47,7 @@ export function dataDir(
   environment: Environment = process.env,
   home: string = homedir(),
 ): string {
-  return join(dataRoot(platform, environment, home), "looking-glass");
+  return pathApi(platform).join(dataRoot(platform, environment, home), "looking-glass");
 }
 
 export function stateDbPath(
@@ -48,8 +56,9 @@ export function stateDbPath(
   home: string = homedir(),
 ): string {
   const configured = environment.LOOKING_GLASS_DB;
-  if (configured) return platform === "win32" ? win32.resolve(configured) : resolve(configured);
-  return join(dataDir(platform, environment, home), "state.db");
+  const paths = pathApi(platform);
+  if (configured) return paths.resolve(configured);
+  return paths.join(dataDir(platform, environment, home), "state.db");
 }
 
 export function artifactsDir(
@@ -57,7 +66,7 @@ export function artifactsDir(
   environment: Environment = process.env,
   home: string = homedir(),
 ): string {
-  return join(dataDir(platform, environment, home), "artifacts");
+  return pathApi(platform).join(dataDir(platform, environment, home), "artifacts");
 }
 
 export function ensureStateDirectories(): void {
