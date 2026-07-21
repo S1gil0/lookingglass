@@ -19,6 +19,7 @@ export interface ProcessOptions {
   timeoutMs: number;
   captureBytes: number;
   signal?: AbortSignal;
+  /** Defaults to detached on POSIX (for process-group cancellation) and attached on Windows. */
   detached?: boolean;
   /** Override the host platform in tests without changing process.platform. */
   platform?: NodeJS.Platform;
@@ -41,11 +42,12 @@ export function runProcess(command: string, args: string[], options: ProcessOpti
   const platform = options.platform ?? process.platform;
   const spawnProcess = options.spawnProcess ?? spawn;
   const windows = platform === "win32";
+  const detached = options.detached ?? !windows;
   return new Promise((resolve, reject) => {
     const child = spawnProcess(command, args, {
       cwd: options.cwd,
       env: options.env ?? process.env,
-      detached: options.detached ?? true,
+      detached,
       shell: false,
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: windows,
@@ -172,7 +174,7 @@ export function runProcess(command: string, args: string[], options: ProcessOpti
     });
     child.once("close", (exitCode, signal) => {
       if (settled) return;
-      if (!windows && (options.detached ?? true)) signalGroup("SIGKILL");
+      if (!windows && detached) signalGroup("SIGKILL");
       complete(exitCode, signal);
     });
 

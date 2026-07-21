@@ -68,10 +68,10 @@ function parseApprovalSignature(signature: string | undefined): unknown[] {
   return parsed;
 }
 
-function decodePowerShellCommand(args: readonly string[]): string {
-  assert.deepEqual(args.slice(0, 4), ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand"]);
+function powerShellCommandArgument(args: readonly string[]): string {
+  assert.deepEqual(args.slice(0, 4), ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"]);
   assert.equal(args.length, 5);
-  return Buffer.from(args[4]!, "base64").toString("utf16le");
+  return args[4]!;
 }
 
 test("read handles files, directories, and artifacts", async (t) => {
@@ -513,7 +513,7 @@ test("shell selection, Windows safety classification, and environment filtering 
   assert.equal(windowsSystemRoot("D:/Windows"), "D:\\Windows");
   assert.equal(powershellExecutable("D:\\Windows"), "D:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
   assert.equal(taskkillExecutable("D:\\Windows"), "D:\\Windows\\System32\\taskkill.exe");
-  assert.equal(decodePowerShellCommand(powershellArguments("Write-Output café")),
+  assert.equal(powerShellCommandArgument(powershellArguments("Write-Output café")),
     "$OutputEncoding = [System.Text.UTF8Encoding]::new($false); [Console]::OutputEncoding = $OutputEncoding; Write-Output café");
   assert.match(shellDefinition("win32").description, /PowerShell/);
 

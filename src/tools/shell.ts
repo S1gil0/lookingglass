@@ -49,9 +49,7 @@ export function taskkillExecutable(systemRoot?: string): string {
 
 /** Select arguments for a noninteractive UTF-8 Windows PowerShell process. */
 export function powershellArguments(command: string): string[] {
-  const script = `${POWERSHELL_UTF8_SETUP}${command}`;
-  const encodedCommand = Buffer.from(script, "utf16le").toString("base64");
-  return ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encodedCommand];
+  return ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", `${POWERSHELL_UTF8_SETUP}${command}`];
 }
 
 export function shellKind(platform: NodeJS.Platform = process.platform): ShellKind {

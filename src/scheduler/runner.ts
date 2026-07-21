@@ -106,7 +106,6 @@ export class CommandRunner {
           timeoutMs: job.timeoutMs ?? 1,
           captureBytes: job.outputBytes ?? 0,
           ...(signal ? { signal } : {}),
-          detached: true,
         });
         const state = signal?.aborted
           ? "unknown"

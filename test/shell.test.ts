@@ -6,12 +6,12 @@ import test from "node:test";
 import { runProcess } from "../src/tools/process.js";
 import { powershellArguments } from "../src/tools/shell.js";
 
-test("PowerShell encoded commands round-trip Unicode, quotes, and newlines", () => {
+test("PowerShell commands use attached -Command transport for Unicode, quotes, and newlines", () => {
   const command = `Write-Output "café 'quoted'";\nWrite-Output 'line 2 — 日本語'`;
   const args = powershellArguments(command);
-  assert.deepEqual(args.slice(0, 4), ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand"]);
+  assert.deepEqual(args.slice(0, 4), ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"]);
   assert.equal(args.length, 5);
-  assert.equal(Buffer.from(args[4]!, "base64").toString("utf16le"),
+  assert.equal(args[4],
     "$OutputEncoding = [System.Text.UTF8Encoding]::new($false); [Console]::OutputEncoding = $OutputEncoding; " + command);
 });
 
@@ -46,9 +46,34 @@ test("Windows process cancellation uses direct taskkill tree termination", async
     ["C:\\Windows\\System32\\taskkill.exe", "/PID", "4242", "/T", "/F"],
   ]);
   assert.equal(calls[0]?.options.shell, false);
+  assert.equal(calls[0]?.options.detached, false);
   assert.equal(calls[0]?.options.windowsHide, true);
   assert.equal(calls[1]?.options.shell, false);
   assert.equal(calls[1]?.options.windowsHide, true);
+});
+
+test("POSIX process defaults remain detached for process-group cancellation", async () => {
+  const calls: { options: Record<string, unknown> }[] = [];
+  let main: FakeChild | undefined;
+  const spawnProcess = ((_command: string, _args: readonly string[], options: Record<string, unknown>) => {
+    calls.push({ options });
+    main = new FakeChild(0);
+    return main as unknown as ChildProcess;
+  }) as unknown as typeof spawn;
+
+  const running = runProcess("bash", ["-c", "true"], {
+    cwd: process.cwd(),
+    env: {},
+    timeoutMs: 10_000,
+    captureBytes: 1_024,
+    platform: "linux",
+    spawnProcess,
+  });
+  assert.equal(calls[0]?.options.detached, true);
+  main!.emit("close", 0, null);
+  const result = await running;
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.signal, null);
 });
 
 test("Windows taskkill errors and nonzero exits fall back to the child handle", async () => {
