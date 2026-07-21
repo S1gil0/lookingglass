@@ -45,10 +45,10 @@
     <path d="M18 48H412" stroke="#62e6ff" stroke-opacity="0.45"/>
     <circle cx="36" cy="25" r="5" fill="#ff728d"/><circle cx="56" cy="25" r="5" fill="#ffd166"/><circle cx="76" cy="25" r="5" fill="#70e1a0"/>
     <g fill="#91a7ff" font-family="monospace" font-size="15">
-      <text x="36" y="82">$ glass run "open the portal"</text>
-      <text x="36" y="113" fill="#70e1a0">[session] context restored</text>
-      <text x="36" y="144" fill="#62e6ff">[tools] workspace ready</text>
-      <text x="36" y="175"><tspan fill="#e7d3ff">_</tspan><tspan fill="#b98cff"> durable by design</tspan></text>
+      <text x="36" y="82">$ glass schedule "check tests later"</text>
+      <text x="36" y="113" fill="#70e1a0">[session] persisted after exit</text>
+      <text x="36" y="144" fill="#62e6ff">[scheduler] future turn started</text>
+      <text x="36" y="175"><tspan fill="#e7d3ff">_</tspan><tspan fill="#b98cff"> continuing with context + tools</tspan></text>
     </g>
   </g>
 
@@ -59,10 +59,11 @@
   </g>
 
   <g fill="#d9fbff" font-family="system-ui, -apple-system, sans-serif">
-    <text x="760" y="105" font-size="17" letter-spacing="5" fill="#8fa9ff">LOCAL AI WORKSPACE</text>
+    <text x="760" y="105" font-size="17" letter-spacing="5" fill="#8fa9ff">LOCAL AI AUTOMATION</text>
     <text x="760" y="160" font-size="43" font-weight="700" letter-spacing="2">LOOKING GLASS</text>
-    <text x="760" y="210" font-size="18" fill="#b9c8ff">Durable sessions. Scheduled intelligence.</text>
-    <text x="760" y="244" font-size="14" fill="#8c9ac5">A terminal chat interface for work that remembers where it left off.</text>
+    <text x="760" y="210" font-size="18" fill="#b9c8ff">Schedule the next turn. Close the terminal.</text>
+    <text x="760" y="244" font-size="14" fill="#8c9ac5">Persistent agent sessions wake up later,</text>
+    <text x="760" y="267" font-size="14" fill="#8c9ac5">resume the workspace, and continue working.</text>
   </g>
-  <text x="760" y="304" fill="#62e6ff" font-family="monospace" font-size="13">glass  |  sessions  |  tools  |  agents  |  scheduler</text>
+  <text x="760" y="304" fill="#62e6ff" font-family="monospace" font-size="13">glass  |  sessions  |  tools  |  agents  |  automation</text>
 </svg>
