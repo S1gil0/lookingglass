@@ -1,0 +1,53 @@
+{
+  "name": "@sigil0/looking-glass",
+  "version": "0.1.0",
+  "description": "A lean local coding harness for OpenAI-compatible gateways and LM Studio",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/S1gil0/lookingglass.git"
+  },
+  "bugs": {
+    "url": "https://github.com/S1gil0/lookingglass/issues"
+  },
+  "homepage": "https://github.com/S1gil0/lookingglass",
+  "publishConfig": {
+    "access": "public"
+  },
+  "type": "module",
+  "bin": {
+    "glass": "dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "clean": "node --input-type=module -e \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true })\"",
+    "build": "npm run clean && tsc -p tsconfig.build.json && chmod +x dist/cli.js",
+    "dev": "tsx src/cli.ts",
+    "start": "node dist/cli.js",
+    "prepublishOnly": "npm run build",
+    "test": "node --import tsx --test test/**/*.test.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "os": [
+    "linux"
+  ],
+  "dependencies": {
+    "@earendil-works/pi-tui": "0.80.10",
+    "ajv": "8.20.0",
+    "better-sqlite3": "12.11.1",
+    "croner": "10.0.1",
+    "jsonc-parser": "3.3.1",
+    "openai": "6.48.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "7.6.13",
+    "@types/node": "22.19.11",
+    "tsx": "4.20.6",
+    "typescript": "5.9.3"
+  }
+}

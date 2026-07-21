@@ -1,0 +1,15 @@
+node_modules/
+dist/
+coverage/
+*.log
+npm-debug.log*
+.env
+.env.*
+!.env.example
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.tgz
+.looking-glass/
