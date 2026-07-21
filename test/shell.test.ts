@@ -4,6 +4,16 @@ import { PassThrough } from "node:stream";
 import { spawn, type ChildProcess } from "node:child_process";
 import test from "node:test";
 import { runProcess } from "../src/tools/process.js";
+import { powershellArguments } from "../src/tools/shell.js";
+
+test("PowerShell encoded commands round-trip Unicode, quotes, and newlines", () => {
+  const command = `Write-Output "café 'quoted'";\nWrite-Output 'line 2 — 日本語'`;
+  const args = powershellArguments(command);
+  assert.deepEqual(args.slice(0, 4), ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand"]);
+  assert.equal(args.length, 5);
+  assert.equal(Buffer.from(args[4]!, "base64").toString("utf16le"),
+    "$OutputEncoding = [System.Text.UTF8Encoding]::new($false); [Console]::OutputEncoding = $OutputEncoding; " + command);
+});
 
 test("Windows process cancellation uses direct taskkill tree termination", async () => {
   const calls: { command: string; args: readonly string[]; options: Record<string, unknown> }[] = [];
@@ -37,10 +47,8 @@ test("Windows process cancellation uses direct taskkill tree termination", async
   ]);
   assert.equal(calls[0]?.options.shell, false);
   assert.equal(calls[0]?.options.windowsHide, true);
-  assert.equal(calls[0]?.options.windowsVerbatimArguments, true);
   assert.equal(calls[1]?.options.shell, false);
   assert.equal(calls[1]?.options.windowsHide, true);
-  assert.equal(calls[1]?.options.windowsVerbatimArguments, undefined);
 });
 
 test("Windows taskkill errors and nonzero exits fall back to the child handle", async () => {

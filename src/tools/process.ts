@@ -28,16 +28,6 @@ export interface ProcessOptions {
   systemRoot?: string;
 }
 
-/**
- * Native Windows PowerShell parses its command-line tail itself rather than
- * using the usual Windows CRT argv rules. Keep verbatim argument mode scoped
- * to that fixed executable; other Windows processes still need Node's normal
- * argument quoting.
- */
-function isPowerShellExecutable(command: string): boolean {
-  return /(?:^|[\\/])powershell\.exe$/i.test(command);
-}
-
 function appendBounded(chunks: Buffer[], chunk: Buffer, currentBytes: number, limit: number): void {
   const remaining = limit - currentBytes;
   if (remaining <= 0) return;
@@ -59,7 +49,6 @@ export function runProcess(command: string, args: string[], options: ProcessOpti
       shell: false,
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: windows,
-      ...(windows && isPowerShellExecutable(command) ? { windowsVerbatimArguments: true } : {}),
     });
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
