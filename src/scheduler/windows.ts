@@ -356,15 +356,14 @@ function taskStateScript(taskName: string): string {
   return [
     "$ErrorActionPreference = 'Stop'",
     "try {",
-    `  $task = Get-ScheduledTask -TaskName ${powerShellLiteral(taskName)} -ErrorAction Stop`,
-    `  if ($null -eq $task) { [Console]::Error.Write('${TASK_NOT_FOUND_SENTINEL}'); exit 3 }`,
-    "  [Console]::Out.Write($task.State.ToString())",
+    // Enumerate tasks and filter exact root-path/name properties instead of
+    // querying an absent path or name. Filtered cmdlet queries throw errors whose
+    // FullyQualifiedErrorId has varied between Windows releases, while this
+    // successful enumeration is independent of localization and error text.
+    `  $tasks = @(Get-ScheduledTask -ErrorAction Stop | Where-Object { $_.TaskPath -eq '\\' -and $_.TaskName -eq ${powerShellLiteral(taskName)} })`,
+    `  if ($tasks.Count -eq 0) { [Console]::Error.Write('${TASK_NOT_FOUND_SENTINEL}'); exit 3 }`,
+    "  [Console]::Out.Write($tasks[0].State.ToString())",
     "} catch {",
-    "  $id = [string]$_.FullyQualifiedErrorId",
-    // Get-ScheduledTask uses this invariant FullyQualifiedErrorId for an
-    // empty task query.  Match it exactly; ObjectNotFound/NotFound text also
-    // occurs for operational failures and is not safe to interpret broadly.
-    `  if ($id -eq 'CmdletizationQuery_NotFound,Get-ScheduledTask') { [Console]::Error.Write('${TASK_NOT_FOUND_SENTINEL}'); exit 3 }`,
     "  [Console]::Error.Write('LOOKING_GLASS_TASK_ERROR')",
     "  exit 4",
     "}",

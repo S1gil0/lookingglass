@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
@@ -43,8 +44,8 @@ test("Windows scheduler dispatches without invoking a host scheduler", () => {
   const commands: Array<{ command: string; args: string[] }> = [];
   const runner = (command: string, args: string[]) => {
     commands.push({ command, args });
-    // A localized schtasks result must not affect status; the PowerShell enum
-    // value is stable across Windows locales.
+    // Status comes from the PowerShell enum value, which is stable across
+    // Windows locales; no localized command output is parsed.
     if (command.endsWith("\\System32\\schtasks.exe")) return { status: 0, stdout: "Status: Wird ausgeführt\n" };
     return { status: 0, stdout: "Running\n" };
   };
@@ -56,7 +57,21 @@ test("Windows scheduler dispatches without invoking a host scheduler", () => {
   assert.equal(backend.serviceStatus().includes("ActiveState=active"), true);
   assert.equal(commands.length, 1);
   assert.equal(commands[0]?.command, "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
-  assert.match(commands[0]?.args.at(-1) ?? "", /Get-ScheduledTask/);
+  const script = commands[0]?.args.at(-1) ?? "";
+  assert.match(script, /Get-ScheduledTask/);
+  assert.equal(script.includes("Get-ScheduledTask -ErrorAction Stop"), true);
+  assert.match(script, /Where-Object \{ \$_.TaskPath -eq '\\' -and \$_.TaskName -eq/);
+  assert.equal(script.includes("FullyQualifiedErrorId"), false);
+});
+
+test("Windows runtime reports a truly absent root task as inactive", { skip: process.platform !== "win32" }, () => {
+  const directory = mkdtempSync(join(tmpdir(), "looking-glass-windows-"));
+  try {
+    const taskName = `Looking Glass Missing ${randomUUID()}`;
+    assert.match(serviceStatus({ configDirectory: directory, taskName }), /ActiveState=inactive/);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("install and uninstall preserve state while cleaning generated files", () => {

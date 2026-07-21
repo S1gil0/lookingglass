@@ -1,6 +1,6 @@
 {
   "name": "@sigil0/looking-glass",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "A lean local coding harness for OpenAI-compatible gateways and LM Studio",
   "license": "MIT",
   "repository": {

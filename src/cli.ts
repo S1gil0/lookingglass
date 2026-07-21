@@ -10,8 +10,9 @@ import { runTui } from "./ui/tui.js";
 import { resolveWorkspacePath } from "./tools/paths.js";
 import { resolveExecutableFromPath } from "./tools/executable.js";
 import { credentialEnvironmentNames } from "./security.js";
+import { schedulerDoctorCheck, type DoctorCheck } from "./doctor.js";
 
-const VERSION = "0.2.0";
+const VERSION = "0.2.1";
 
 function usage(): string {
   return `Looking Glass ${VERSION}
@@ -42,7 +43,7 @@ Environment:
 }
 
 async function runDoctor(app: LookingGlassApp): Promise<void> {
-  const checks: Array<{ name: string; ok: boolean; detail: string }> = [];
+  const checks: DoctorCheck[] = [];
   const integrity = app.db.pragma("integrity_check") as Array<{ integrity_check: string }>;
   checks.push({
     name: "SQLite",
@@ -68,14 +69,9 @@ async function runDoctor(app: LookingGlassApp): Promise<void> {
       checks.push({ name: provider, ok: false, detail: error instanceof Error ? error.message : String(error) });
     }
   }
-  const scheduler = serviceStatus();
-  checks.push({
-    name: "scheduler",
-    ok: /ActiveState=active/.test(scheduler),
-    detail: scheduler.replace(/\n/g, ", "),
-  });
+  checks.push(schedulerDoctorCheck(serviceStatus));
   for (const check of checks) process.stdout.write(`${check.ok ? "ok" : "fail"}\t${check.name}\t${check.detail}\n`);
-  if (checks.some((check) => !check.ok && check.name !== "scheduler")) process.exitCode = 1;
+  if (checks.some((check) => !check.ok && check.fatal !== false)) process.exitCode = 1;
 }
 
 interface ScheduleCliArgs {
