@@ -1,7 +1,8 @@
 import type { SchedulerStore } from "../scheduler/store.js";
 import type { GlassTool } from "./types.js";
 import { isWithin, resolveWorkspacePath } from "./paths.js";
-import { bashCommandRisk } from "./safety.js";
+import { shellCommandRisk } from "./safety.js";
+import { shellKind } from "./shell.js";
 
 interface ScheduleCreateArgs {
   kind: "reminder" | "command" | "session_prompt";
@@ -51,7 +52,7 @@ export function createScheduleTools(store: SchedulerStore): GlassTool[] {
     name: "schedule_create",
     description: "Create a persistent reminder, deterministic shell command, or prompt for this persistent session. Use only after an explicit user request.",
     risk: "persistent",
-    classifyRisk: (args) => args.kind === "command" && args.command && bashCommandRisk(args.command) === "critical"
+    classifyRisk: (args) => args.kind === "command" && args.command && shellCommandRisk(args.command, shellKind()) === "critical"
       ? "critical"
       : "persistent",
     parameters: {
@@ -153,7 +154,7 @@ export function createScheduleTools(store: SchedulerStore): GlassTool[] {
       if (
         job?.kind === "command"
         && (args.action === "resume" || args.action === "run_now" || args.action === "resolve_unknown")
-        && bashCommandRisk(job.command ?? "") === "critical"
+        && shellCommandRisk(job.command ?? "", shellKind()) === "critical"
       ) return "critical";
       return "persistent";
     },

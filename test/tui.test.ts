@@ -8,6 +8,7 @@ import {
   UserMessage,
   activityLine,
   contextUsageLabel,
+  formatCommandApproval,
   inboxLine,
   initialTuiSession,
   markInboxItemsRead,
@@ -180,6 +181,42 @@ test("renders activity separately from ordered session metadata", () => {
   assert.equal(contextUsageLabel(1, 0), "ctx:?");
   assert.equal(activityLine(true, "Thinking", 1, 12), "Thinking.. | scroll:+12");
   assert.equal(activityLine(false, "ignored", 0, 0), "Ready");
+});
+
+test("formats shell approval signatures as readable scopes", () => {
+  const approvedAt = Date.parse("2026-07-19T12:00:00Z");
+  assert.deepEqual(formatCommandApproval(
+    JSON.stringify(["shell-executable", 1, "powershell", "Get-Process"]),
+    approvedAt,
+  ), {
+    label: "All PowerShell commands starting with 'Get-Process'",
+    description: "2026-07-19T12:00:00.000Z",
+  });
+  assert.deepEqual(formatCommandApproval(
+    JSON.stringify(["shell-executable", 1, "bash", "git"]),
+    approvedAt,
+  ), {
+    label: "All Bash commands starting with 'git'",
+    description: "2026-07-19T12:00:00.000Z",
+  });
+  assert.deepEqual(formatCommandApproval(
+    JSON.stringify(["shell-exec", 1, "powershell", "Get-Process", "C:\\workspace", 5_000]),
+    approvedAt,
+  ), {
+    label: "Get-Process",
+    description: "C:\\workspace | 5000ms | 2026-07-19T12:00:00.000Z",
+  });
+});
+
+test("preserves legacy Bash approval signature formatting", () => {
+  const approvedAt = Date.parse("2026-07-19T12:00:00Z");
+  assert.deepEqual(formatCommandApproval(
+    JSON.stringify(["bash-exec", 3, "git status", "/workspace", 120_000]),
+    approvedAt,
+  ), {
+    label: "git status",
+    description: "/workspace | 120000ms | 2026-07-19T12:00:00.000Z",
+  });
 });
 
 test("uses distinct transcript tones without repeating the assistant title", () => {

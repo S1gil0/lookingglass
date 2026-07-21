@@ -97,6 +97,36 @@ function parsePath(line: string, prefix: string): string {
   return path;
 }
 
+/**
+ * Patch paths are workspace-relative, so Windows drive, device, and stream
+ * syntax is never meaningful here. In particular, letting a colon through
+ * could select an NTFS alternate data stream (for example, `notes.txt:secret`).
+ */
+export function validatePatchPath(path: string, platform: NodeJS.Platform = process.platform): void {
+  if (platform !== "win32") return;
+
+  if (path.startsWith("/") || path.startsWith("\\") || /^[A-Za-z]:/u.test(path)) {
+    throw new Error(`Windows path must be workspace-relative: ${path}`);
+  }
+  if (/[:<>"|?*\u0000-\u001f]/u.test(path)) {
+    throw new Error(`Windows path contains reserved syntax: ${path}`);
+  }
+
+  for (const component of path.split(/[\\/]+/u)) {
+    if (component.length === 0 || component === "." || component === "..") continue;
+    if (/[. ]$/u.test(component)) {
+      throw new Error(`Windows path has a trailing dot or space: ${path}`);
+    }
+
+    // DOS device names remain devices when followed by an extension. Trim
+    // separator-like suffixes from the stem as Windows does while parsing.
+    const deviceStem = component.split(".")[0]?.replace(/[. ]+$/u, "") ?? "";
+    if (/^(?:con|prn|aux|nul|clock\$|conin\$|conout\$|com[1-9¹²³]|lpt[1-9¹²³])$/iu.test(deviceStem)) {
+      throw new Error(`Windows path names a reserved device: ${path}`);
+    }
+  }
+}
+
 function parseHunkHeader(line: string): string | null {
   if (line === "@@") return null;
   if (!line.startsWith("@@ ")) throw new Error(`Malformed hunk header: ${line}`);
@@ -242,6 +272,15 @@ function canonicalPath(path: string): string {
   return resolve(realpathSync(existingPath), ...missingParts);
 }
 
+function pathIdentity(path: string, platform: NodeJS.Platform): string {
+  const canonical = canonicalPath(path);
+  return platform === "win32" ? canonical.toLowerCase() : canonical;
+}
+
+function samePath(left: string, right: string, platform: NodeJS.Platform): boolean {
+  return platform === "win32" ? left.toLowerCase() === right.toLowerCase() : left === right;
+}
+
 function assertRegularFile(path: string, requestedPath: string): number {
   const stat = statSync(path);
   if (!stat.isFile()) throw new Error(`Not a regular file: ${requestedPath}`);
@@ -298,12 +337,16 @@ function applyHunks(content: string, hunks: Hunk[], requestedPath: string): stri
   return lines.join(lineEnding);
 }
 
-function preflight(operations: Operation[], workspace: string): PreparedOperation[] {
+function preflight(
+  operations: Operation[],
+  workspace: string,
+  platform: NodeJS.Platform = process.platform,
+): PreparedOperation[] {
   const prepared: PreparedOperation[] = [];
   const changedPaths: ChangedPath[] = [];
 
   const registerPath = (path: string, requestedPath: string): void => {
-    const identity = canonicalPath(path);
+    const identity = pathIdentity(path, platform);
     const duplicate = changedPaths.find((entry) => entry.identity === identity);
     if (duplicate) {
       throw new Error(`Conflicting paths in patch: ${duplicate.requestedPath} and ${requestedPath}`);
@@ -312,6 +355,7 @@ function preflight(operations: Operation[], workspace: string): PreparedOperatio
   };
 
   for (const operation of operations) {
+    validatePatchPath(operation.path, platform);
     if (operation.kind === "add") {
       const targetPath = resolveWorkspacePath(workspace, operation.path, true);
       if (pathEntryExists(targetPath)) throw new Error(`Add File target already exists: ${operation.path}`);
@@ -336,6 +380,7 @@ function preflight(operations: Operation[], workspace: string): PreparedOperatio
       let targetRequestedPath = operation.path;
       const moved = operation.moveTo !== null;
       if (operation.moveTo !== null) {
+        validatePatchPath(operation.moveTo, platform);
         targetRequestedPath = operation.moveTo;
         targetPath = resolveWorkspacePath(workspace, operation.moveTo, true);
         if (pathEntryExists(targetPath)) throw new Error(`Move target already exists: ${operation.moveTo}`);
@@ -393,7 +438,54 @@ function ensureParentDirectories(workspace: string, targetPath: string): void {
   }
 }
 
-function atomicWrite(path: string, content: string, mode: number | null): void {
+interface AtomicFileSystem {
+  renameSync: typeof renameSync;
+  unlinkSync: typeof unlinkSync;
+}
+
+const atomicFileSystem: AtomicFileSystem = { renameSync, unlinkSync };
+
+/** Replace a staged file, working around Windows' refusal to rename over a file. */
+export function replaceStagedFile(
+  tempPath: string,
+  targetPath: string,
+  platform: NodeJS.Platform = process.platform,
+  fileSystem: AtomicFileSystem = atomicFileSystem,
+): void {
+  if (platform !== "win32" || !pathEntryExists(targetPath)) {
+    fileSystem.renameSync(tempPath, targetPath);
+    return;
+  }
+
+  const backupPath = join(dirname(targetPath), `.glass-patch-${process.pid}-${randomUUID()}.bak`);
+  fileSystem.renameSync(targetPath, backupPath);
+  try {
+    fileSystem.renameSync(tempPath, targetPath);
+  } catch (error) {
+    try {
+      fileSystem.renameSync(backupPath, targetPath);
+    } catch (rollbackError) {
+      throw new AggregateError(
+        [error, rollbackError],
+        `Failed to replace and restore ${targetPath}`,
+      );
+    }
+    throw error;
+  }
+
+  try {
+    fileSystem.unlinkSync(backupPath);
+  } catch {
+    // The replacement succeeded; leave the backup in place if cleanup is blocked.
+  }
+}
+
+function atomicWrite(
+  path: string,
+  content: string,
+  mode: number | null,
+  platform: NodeJS.Platform = process.platform,
+): void {
   const tempPath = join(dirname(path), `.glass-patch-${process.pid}-${randomUUID()}.tmp`);
   let descriptor: number | null = null;
   try {
@@ -403,7 +495,7 @@ function atomicWrite(path: string, content: string, mode: number | null): void {
     fsyncSync(descriptor);
     closeSync(descriptor);
     descriptor = null;
-    renameSync(tempPath, path);
+    replaceStagedFile(tempPath, path, platform);
   } catch (error) {
     if (descriptor !== null) {
       try {
@@ -423,7 +515,11 @@ function atomicWrite(path: string, content: string, mode: number | null): void {
   }
 }
 
-function commit(prepared: PreparedOperation[], workspace: string): void {
+function commit(
+  prepared: PreparedOperation[],
+  workspace: string,
+  platform: NodeJS.Platform = process.platform,
+): void {
   for (const operation of prepared) {
     if (operation.kind === "add") {
       ensureParentDirectories(workspace, operation.targetPath);
@@ -431,13 +527,13 @@ function commit(prepared: PreparedOperation[], workspace: string): void {
       if (pathEntryExists(operation.targetPath)) {
         throw new Error(`Add File target already exists: ${operation.requestedPath}`);
       }
-      atomicWrite(operation.targetPath, operation.content, null);
+      atomicWrite(operation.targetPath, operation.content, null, platform);
       continue;
     }
 
     if (operation.kind === "update") {
       const currentSource = resolveWorkspacePath(workspace, operation.sourceRequestedPath);
-      if (currentSource !== operation.sourcePath) {
+      if (!samePath(currentSource, operation.sourcePath, platform)) {
         throw new Error(`Update source changed during patch application: ${operation.sourceRequestedPath}`);
       }
       if (operation.moved) {
@@ -447,13 +543,13 @@ function commit(prepared: PreparedOperation[], workspace: string): void {
           throw new Error(`Move target already exists: ${operation.targetRequestedPath}`);
         }
       }
-      atomicWrite(operation.targetPath, operation.content, operation.mode);
+      atomicWrite(operation.targetPath, operation.content, operation.mode, platform);
       if (operation.moved) unlinkSync(operation.sourcePath);
       continue;
     }
 
     const currentSource = resolveWorkspacePath(workspace, operation.requestedPath);
-    if (currentSource !== operation.sourcePath) {
+    if (!samePath(currentSource, operation.sourcePath, platform)) {
       throw new Error(`Delete source changed during patch application: ${operation.requestedPath}`);
     }
     unlinkSync(currentSource);
@@ -499,8 +595,17 @@ export const applyPatchTool: GlassTool<ApplyPatchArgs> = {
   },
   summarize: (args) => `Apply patch (${args.patch.length} characters)`,
   async execute(args, context) {
-    const prepared = preflight(parsePatch(args.patch), context.workspace);
-    commit(prepared, context.workspace);
-    return { output: changedFileSummary(prepared) };
+    return { output: applyPatchForPlatform(args.patch, context.workspace) };
   },
 };
+
+/** Apply a patch with an explicit platform, so platform-specific path rules can be tested off-host. */
+export function applyPatchForPlatform(
+  patch: string,
+  workspace: string,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  const prepared = preflight(parsePatch(patch), workspace, platform);
+  commit(prepared, workspace, platform);
+  return changedFileSummary(prepared);
+}

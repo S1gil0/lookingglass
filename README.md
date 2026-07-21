@@ -27,23 +27,32 @@ The main model and worker-agent model are configured independently, including se
 ## What It Provides
 
 - **Interactive TUI and one-shot CLI prompts** for complete day-to-day development work.
-- **Workspace tools** for reading, searching, patching, and bounded Bash execution.
+- **Workspace tools** for reading, searching, patching, and bounded host-shell execution.
 - **Persistent approval modes** for interactive and automated turns, including remembered approvals.
 - **Scheduled AI prompts, reminders, and deterministic shell commands.**
 - **Concurrent worker agents** with independently selected models and reasoning settings.
 - **OpenAI-compatible local or hosted gateways**, including LM Studio and codex-lb.
 - **SQLite-backed sessions, scheduler state, and artifacts** with context recovery and compaction.
-- **A user-level systemd scheduler** that runs independently of the interactive terminal.
+- **A user-level scheduler** that runs independently of the interactive terminal (systemd on Linux and Task Scheduler on Windows).
 
 Looking Glass is designed for one local operator. It is not a hosted service, multi-user system, or replacement for operating-system isolation.
 
 ## Requirements
 
-- Linux
-- Node.js 22 or newer
+- Linux or native Windows
+- Node.js 22.19.0 or newer
 - npm
-- `ripgrep` (`rg`)
+- `ripgrep` (`rg` on Linux, `rg.exe` on Windows) on `PATH`
 - A running LM Studio or other OpenAI-compatible server exposing a Responses API
+
+The npm package targets Linux and native Windows (`win32`); macOS is not a
+supported install target.
+
+On Windows, use Windows Terminal or another modern terminal. Looking Glass
+invokes the system Windows PowerShell directly and runs shell tools and
+scheduled commands noninteractively; use PowerShell syntax for those commands.
+Linux uses noninteractive Bash. Windows support is covered by the GitHub Actions
+matrix; no additional local-platform validation is implied here.
 
 For a local LM Studio setup, the gateway URL is:
 
@@ -53,20 +62,25 @@ http://127.0.0.1:1234/v1
 
 ## Install from npm
 
-On Linux with Node.js 22 or newer:
+On Linux or native Windows with Node.js 22.19.0 or newer:
 
-```bash
+```text
 npm install --global @sigil0/looking-glass
 glass --version
 ```
 
-The package is Linux-only for now. Windows users can run it through WSL2.
+The same commands run natively from PowerShell in Windows Terminal:
+
+```powershell
+npm install --global @sigil0/looking-glass
+glass --version
+```
 
 ## Install From Source
 
 For development or to work from the source tree, clone the public repository:
 
-```bash
+```text
 git clone https://github.com/S1gil0/lookingglass.git
 cd lookingglass
 npm ci
@@ -85,16 +99,25 @@ Looking Glass expects an OpenAI-compatible Responses API and `/v1/models`. The o
 export LM_STUDIO_API_KEY=replace-with-your-token
 ```
 
+In Windows PowerShell, use `$env:LM_STUDIO_API_KEY = 'your-token'` instead.
+
 Configuration is loaded in this order:
 
 ```text
-~/.config/looking-glass/config.jsonc
-~/.config/looking-glass/config.json
+Linux:   ~/.config/looking-glass/config.jsonc
+         ~/.config/looking-glass/config.json
+Windows: %APPDATA%\looking-glass\config.jsonc
+         %APPDATA%\looking-glass\config.json
 <workspace>/.looking-glass.jsonc
 <workspace>/.looking-glass.json
 ```
 
-Set `LOOKING_GLASS_CONFIG` to use a different explicit JSON or JSONC file. Workspace settings are applied after global settings, so a project can select its own model, gateway, instructions, or safety defaults.
+Set `LOOKING_GLASS_CONFIG` to use a different explicit JSON or JSONC file. On
+Windows, `APPDATA` and `LOCALAPPDATA` provide the roaming configuration and
+local state roots respectively. `XDG_CONFIG_HOME` and `XDG_DATA_HOME` can
+override those platform defaults. Workspace settings are applied after global
+settings, so a project can select its own model, gateway, instructions, or
+safety defaults.
 
 Example configuration:
 
@@ -140,7 +163,9 @@ Ollama, or hosted OpenAI-compatible endpoints. The exact feature set depends
 on the gateway's support for Responses API streaming, tools, and model
 metadata.
 
-If authentication is disabled, omit `apiKeyEnv` from the gateway configuration:
+For an authenticated gateway, set the environment variable named by
+`apiKeyEnv`. If authentication is disabled, omit `apiKeyEnv` from the gateway
+configuration:
 
 ```bash
 export LM_STUDIO_API_KEY=replace-with-your-token
@@ -155,6 +180,8 @@ export LM_STUDIO_API_KEY=replace-with-your-token
   }
 }
 ```
+
+On Windows PowerShell, set it with `$env:LM_STUDIO_API_KEY = 'your-token'`.
 
 Inspect the configured model catalog and gateway health:
 
@@ -371,7 +398,7 @@ Looking Glass supports three schedule types:
 | Job | What it does | Best for |
 | --- | --- | --- |
 | `reminder` | Writes a durable inbox message | Human follow-ups and deadlines |
-| `command` | Runs the exact stored Bash string | Deterministic tests, scripts, and maintenance |
+| `command` | Runs the exact stored command through the host shell | Deterministic tests, scripts, and maintenance |
 | `session_prompt` | Runs one model turn in a persistent session | Context-aware project automation |
 
 Create a reminder:
@@ -381,11 +408,22 @@ glass cron reminder --once 2026-07-20T12:00:00Z "Review the deployment dashboard
 glass cron reminder --cron "0 9 * * 1-5" --timezone UTC "Review the deployment dashboard"
 ```
 
-Create a deterministic command. Pass the full shell command as one quoted argument so its exact text is preserved:
+Create a deterministic command. Pass the full command as one quoted argument so
+its exact text is preserved. It runs through Bash on Linux and Windows
+PowerShell on Windows:
 
 ```bash
 glass cron command --once 2026-07-20T12:00:00Z "npm test"
-glass cron command --cron "0 2 * * *" --cwd . "./scripts/backup.sh"
+```
+
+Use host-shell syntax for scripts, for example:
+
+```bash
+glass cron command --cron "0 2 * * *" --cwd . "./scripts/backup.sh"  # Linux
+```
+
+```powershell
+glass cron command --cron "0 2 * * *" --cwd . ".\scripts\backup.ps1"  # Windows
 ```
 
 Unlike `session_prompt`, a deterministic command does not use model context. It runs exactly the command stored in the job, with the configured timeout and output limit.
@@ -409,32 +447,56 @@ glass cron ack INBOX_ID
 
 ## Install the Scheduler Service
 
-The scheduler must be running for schedules to execute while the TUI is closed. Build first, then install the user-level systemd service:
+The scheduler must be running for schedules to execute while the TUI is closed.
+Build first, then install the native per-user scheduler:
 
-```bash
+```text
 npm run build
 glass cron install
 glass cron status
 ```
 
-The service is installed at:
+On Linux, `glass cron install` manages the user-level systemd unit at
+`~/.config/systemd/user/looking-glass-scheduler.service`. On Windows, it
+creates and starts the current user's logon task named `Looking Glass
+Scheduler` through Task Scheduler. The Windows task uses the generated files
+`%APPDATA%\looking-glass\scheduler-launcher.ps1` and
+`%APPDATA%\looking-glass\scheduler-task.xml`; it runs with the user's
+interactive token and least privilege. The task is not a Windows service.
 
-```text
-~/.config/systemd/user/looking-glass-scheduler.service
-```
-
-It uses the current user's state database, takes one durable daemon lease, claims occurrences safely, fences stale workers after failure, and restarts on failure. The service does not delete scheduler state when uninstalled:
+Both schedulers use the current user's state database, take one durable daemon
+lease, claim occurrences safely, and preserve scheduler state across
+uninstallation:
 
 ```bash
 glass cron uninstall
 ```
 
-Authenticated gateways used by scheduled prompts need their token available to the service. Keep it in a mode-`0600` environment file outside the repository:
+Authenticated gateways used by scheduled prompts need their token available to
+the scheduler. The optional environment file is
+`~/.config/looking-glass/scheduler.env` on Linux and
+`%APPDATA%\looking-glass\scheduler.env` on Windows. On Linux, keep it outside
+the repository with mode `0600`:
 
 ```bash
 install -d -m 700 ~/.config/looking-glass
-printf '%s\n' 'LM_STUDIO_API_KEY=replace-with-your-token' > ~/.config/looking-glass/scheduler.env
+token="$(printenv LM_STUDIO_API_KEY)"
+key_name='LM_STUDIO_API_KEY'
+printf '%s' "$key_name=$token" > ~/.config/looking-glass/scheduler.env
 chmod 600 ~/.config/looking-glass/scheduler.env
+```
+
+On Windows, create the same file from PowerShell and keep it accessible only to
+your user account:
+
+```powershell
+$config = Join-Path $env:APPDATA 'looking-glass'
+New-Item -ItemType Directory -Force $config | Out-Null
+$utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+$token = [Environment]::GetEnvironmentVariable('LM_STUDIO_API_KEY')
+$keyName = 'LM_STUDIO_API_KEY'
+$line = $keyName + '=' + $token
+[IO.File]::WriteAllText((Join-Path $config 'scheduler.env'), $line, $utf8NoBom)
 ```
 
 Exported environment variables take precedence. Never commit this file.
@@ -469,20 +531,23 @@ The model can use these built-in tools:
 | `glob` | Find files with bounded `ripgrep` searches |
 | `grep` | Search workspace text with bounded regular expressions |
 | `apply_patch` | Apply atomic workspace patches |
-| `bash` | Run bounded noninteractive Bash commands |
+| `bash` | Run bounded noninteractive host-shell commands |
 | `ask_user` | Ask the interactive operator a question |
 | `run_agents` | Run isolated leaf-agent tasks concurrently |
 | `schedule_create` | Create reminders, deterministic commands, or session prompts |
 | `schedule_list` | List schedules and scoped scheduler inbox records |
 | `schedule_manage` | Pause, resume, delete, run, resolve, or acknowledge schedules |
 
-File tools are workspace-bound and symlink-aware. Bash disables startup profiles, bounds captured output, stores oversized results as artifacts, and terminates process groups on cancellation or timeout.
+File tools are workspace-bound and symlink-aware. The shell tool disables startup
+profiles, bounds captured output, stores oversized results as artifacts, and
+terminates process groups on cancellation or timeout. It runs noninteractive
+Bash on Linux or Windows PowerShell (`powershell.exe`) on Windows.
 
 ## Approval Modes
 
 Approval mode is durable per session and applies to both interactive and scheduled model turns:
 
-| Mode | Reads | Normal writes | Bash | Persistent actions | Critical actions |
+| Mode | Reads | Normal writes | Host shell | Persistent actions | Critical actions |
 | --- | --- | --- | --- | --- | --- |
 | `review` | No prompt | Prompt | Prompt | Prompt | Prompt |
 | `code` | No prompt | No prompt | Prompt | Prompt | Prompt |
@@ -498,26 +563,38 @@ Change the mode inside the TUI:
 
 `unrestricted` is fully noninteractive. It does not ask for confirmation for destructive commands, access-critical changes, schedules, or uncertain reruns. Risk is still classified for logging and display, but does not gate execution.
 
-In `code`, choose `Always approve` when a command family should be reusable. Bash approvals are scoped by the leading executable: approving `cat one.txt` authorizes later commands starting with `cat`, regardless of arguments, redirects, working directory, timeout, risk classification, or compound suffix. Other tools use their canonical action arguments. Remembered approvals apply to the session's main turns, agents, and scheduled turns.
+In `code`, choose `Always approve` when a command family should be reusable.
+Shell approvals are scoped by shell kind. Bash keeps leading-executable
+remembered scopes: approving `cat one.txt` on Linux authorizes later Bash
+commands starting with `cat`, regardless of arguments, redirects, working
+directory, timeout, risk classification, or compound suffix. PowerShell
+approvals are exact command, working-directory, and timeout only. Other tools
+use their canonical action arguments. Remembered approvals apply to the
+session's main turns, agents, and scheduled turns.
 
 Looking Glass is not a sandbox. The process has the operating-system permissions of the user who launched it. Use `review` for unfamiliar repositories and reserve `unrestricted` for trusted local work.
 
 ## State and Workspace Instructions
 
-Default XDG locations:
+Default platform paths:
 
-| Data | Default path | Override |
-| --- | --- | --- |
-| Global config | `~/.config/looking-glass/` | `XDG_CONFIG_HOME` |
-| SQLite state | `~/.local/share/looking-glass/state.db` | `LOOKING_GLASS_DB` |
-| Artifacts | `~/.local/share/looking-glass/artifacts/` | `XDG_DATA_HOME` |
-| Scheduler environment | `~/.config/looking-glass/scheduler.env` | fixed optional path |
+| Data | Linux | Windows | Override |
+| --- | --- | --- | --- |
+| Global config | `~/.config/looking-glass/` | `%APPDATA%\looking-glass\` | `XDG_CONFIG_HOME` |
+| SQLite state | `~/.local/share/looking-glass/state.db` | `%LOCALAPPDATA%\looking-glass\state.db` | `LOOKING_GLASS_DB` |
+| Artifacts | `~/.local/share/looking-glass/artifacts/` | `%LOCALAPPDATA%\looking-glass\artifacts\` | `XDG_DATA_HOME` |
+| Scheduler environment | `~/.config/looking-glass/scheduler.env` | `%APPDATA%\looking-glass\scheduler.env` | follows `XDG_CONFIG_HOME` |
 
-State directories use mode `0700`. Large tool output is retained as a durable artifact and referenced from the model result. Do not commit the database, artifacts, credentials, `.env` files, or local configuration.
+On Windows, `APPDATA` and `LOCALAPPDATA` select the roaming configuration and
+local data roots (with a home-directory fallback if unset). State directories
+use mode `0700` where POSIX permissions are available. Large tool output is
+retained as a durable artifact and referenced from the model result. Do not
+commit the database, artifacts, credentials, `.env` files, or local
+configuration.
 
 Looking Glass loads instruction files in this order:
 
-1. `~/.config/looking-glass/AGENTS.md`
+1. Linux: `~/.config/looking-glass/AGENTS.md`; Windows: `%APPDATA%\looking-glass\AGENTS.md`
 2. `<workspace>/AGENTS.md`
 3. Paths listed in the `instructions` configuration array
 
@@ -537,7 +614,7 @@ Common fixes:
 
 - If the model list is empty, verify the gateway URL and API key environment variable.
 - If a scheduled prompt does not run, verify the session is persistent and `glass cron status` shows an active daemon.
-- If LM Studio schedules fail after the TUI exits, put the token in `~/.config/looking-glass/scheduler.env` with mode `0600`.
+- If LM Studio schedules fail after the TUI exits, put the token in the platform scheduler environment file (`~/.config/looking-glass/scheduler.env` on Linux or `%APPDATA%\looking-glass\scheduler.env` on Windows).
 - If a recurring job is blocked, inspect `glass cron list`, review the unknown outcome, then run `glass cron resolve JOB_ID` deliberately.
 - If a resumed session appears to have lost context, confirm you used `--session ID` and are looking at the same workspace and state database.
 - After source changes, run `npm run build` before using the installed `glass` command or reinstalling the scheduler service.

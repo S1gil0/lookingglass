@@ -1,6 +1,9 @@
 import type { GlassTool } from "./types.js";
 import { runProcess } from "./process.js";
 import { resolveWorkspacePath } from "./paths.js";
+import { resolveExecutableFromPath } from "./executable.js";
+import { shellEnvironment } from "./safety.js";
+import { credentialEnvironmentNames } from "../security.js";
 
 interface GlobArgs {
   pattern: string;
@@ -41,10 +44,11 @@ export const globTool: GlassTool<GlobArgs> = {
   summarize: (args) => `Find files matching ${args.pattern}`,
   async execute(args, context) {
     const limit = Math.min(args.limit ?? 1_000, 5_000);
-    const commandArgs = ["--no-config", "--files", "--hidden", "--glob", "!.git", "--glob", args.pattern];
+    const commandArgs = ["--no-config", "--path-separator", "/", "--files", "--hidden", "--glob", "!.git", "--glob", args.pattern];
     if (args.path) commandArgs.push(resolveWorkspacePath(context.workspace, args.path));
-    const result = await runProcess("rg", commandArgs, {
+    const result = await runProcess(resolveExecutableFromPath("rg", { cwd: context.workspace }), commandArgs, {
       cwd: context.workspace,
+      env: shellEnvironment(process.env, credentialEnvironmentNames(context.config)),
       timeoutMs: 30_000,
       captureBytes: context.config.tools.maxOutputBytes * 4,
       signal: context.signal,
@@ -72,11 +76,12 @@ export const grepTool: GlassTool<GrepArgs> = {
   summarize: (args) => `Search for ${args.pattern}`,
   async execute(args, context) {
     const limit = Math.min(args.limit ?? 500, 5_000);
-    const commandArgs = ["--no-config", "--line-number", "--column", "--no-heading", "--color", "never", "--hidden", "--glob", "!.git"];
+    const commandArgs = ["--no-config", "--path-separator", "/", "--line-number", "--column", "--no-heading", "--color", "never", "--hidden", "--glob", "!.git"];
     if (args.include) commandArgs.push("--glob", args.include);
     commandArgs.push("--", args.pattern, args.path ? resolveWorkspacePath(context.workspace, args.path) : ".");
-    const result = await runProcess("rg", commandArgs, {
+    const result = await runProcess(resolveExecutableFromPath("rg", { cwd: context.workspace }), commandArgs, {
       cwd: context.workspace,
+      env: shellEnvironment(process.env, credentialEnvironmentNames(context.config)),
       timeoutMs: 30_000,
       captureBytes: context.config.tools.maxOutputBytes * 4,
       signal: context.signal,

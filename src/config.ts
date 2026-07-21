@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { parse, printParseErrorCode, type ParseError } from "jsonc-parser";
-import { configDir } from "./paths.js";
+import { configDir, shouldEnforcePosixPermissions } from "./paths.js";
 import {
   REASONING_EFFORTS,
   type ApprovalMode,
@@ -112,10 +112,12 @@ function validate(config: GlassConfig): void {
 function loadEnvironmentFile(): void {
   const path = join(configDir(), "scheduler.env");
   if (!existsSync(path)) return;
-  if ((statSync(path).mode & 0o077) !== 0) {
+  // Windows does not expose POSIX mode bits; do not reject a scheduler.env file
+  // there based on the synthetic mode value returned by statSync.
+  if (shouldEnforcePosixPermissions() && (statSync(path).mode & 0o077) !== 0) {
     throw new Error(`${path} must not be readable or writable by group or other users`);
   }
-  for (const rawLine of readFileSync(path, "utf8").split(/\r?\n/)) {
+  for (const rawLine of readFileSync(path, "utf8").replace(/^\uFEFF/, "").split(/\r?\n/)) {
     const line = rawLine.trim();
     if (!line || line.startsWith("#")) continue;
     const match = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(line);

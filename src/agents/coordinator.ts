@@ -119,7 +119,7 @@ export class AgentCoordinator implements AgentBatchRunner {
           },
           modelInfo: model,
           automated: true,
-          readOnly: parent.approvalMode === "review",
+          readOnly: context.readOnly || parent.approvalMode === "review",
           authorizationSessionId: context.authorizationSessionId ?? parent.id,
         });
         results[index] = {

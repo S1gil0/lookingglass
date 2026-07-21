@@ -4,13 +4,14 @@ import { spawnSync } from "node:child_process";
 import { stdioCallbacks, stdioInteraction } from "./ui/stdio.js";
 import { SchedulerDaemon } from "./scheduler/daemon.js";
 import { scheduledSessionReadOnly } from "./scheduler/runner.js";
-import { installService, serviceStatus, uninstallService } from "./scheduler/systemd.js";
+import { installService, serviceStatus, uninstallService } from "./scheduler/service.js";
 import { configDir, stateDbPath } from "./paths.js";
 import { runTui } from "./ui/tui.js";
 import { resolveWorkspacePath } from "./tools/paths.js";
+import { resolveExecutableFromPath } from "./tools/executable.js";
 import { credentialEnvironmentNames } from "./security.js";
 
-const VERSION = "0.1.0";
+const VERSION = "0.2.0";
 
 function usage(): string {
   return `Looking Glass ${VERSION}
@@ -48,12 +49,16 @@ async function runDoctor(app: LookingGlassApp): Promise<void> {
     ok: integrity[0]?.integrity_check === "ok",
     detail: integrity.map((row) => row.integrity_check).join(", ") || "no result",
   });
-  const rg = spawnSync("rg", ["--version"], { encoding: "utf8" });
-  checks.push({
-    name: "ripgrep",
-    ok: rg.status === 0,
-    detail: (rg.stdout || rg.stderr || "not found").split(/\r?\n/, 1)[0] ?? "not found",
-  });
+  try {
+    const rg = spawnSync(resolveExecutableFromPath("rg"), ["--version"], { encoding: "utf8" });
+    checks.push({
+      name: "ripgrep",
+      ok: rg.status === 0,
+      detail: rg.error ? "not found" : (rg.stdout || rg.stderr || "not found").split(/\r?\n/, 1)[0] ?? "not found",
+    });
+  } catch {
+    checks.push({ name: "ripgrep", ok: false, detail: "not found" });
+  }
   for (const provider of app.configuredProviders()) {
     try {
       const models = await app.modelsForProvider(provider, true);

@@ -1,5 +1,9 @@
+import { statSync } from "node:fs";
+import { isAbsolute } from "node:path";
 import { runProcess } from "../tools/process.js";
+import { resolveWorkspacePath } from "../tools/paths.js";
 import { shellEnvironment } from "../tools/safety.js";
+import { shellDefinition } from "../tools/shell.js";
 import type {
   ClaimedCommand,
   ClaimedSessionPrompt,
@@ -31,6 +35,31 @@ function failedCompletion(error: unknown): CommandCompletion {
     stdoutTruncated: false,
     stderrTruncated: false,
   };
+}
+
+const SCHEDULED_CWD_ROOT_LIMITATION =
+  "the scheduler schema stores no workspace root, so containment against the original workspace cannot be verified";
+
+/**
+ * Validate the launch directory again after a claim is acquired. Command
+ * jobs currently persist only an absolute cwd, not the workspace that owned
+ * it, so resolveWorkspacePath can only provide the existing path model's
+ * lexical/realpath checks against that cwd. The limitation is deliberately
+ * included in failures rather than silently implying workspace containment.
+ */
+function revalidateScheduledCwd(cwd: string): string {
+  if (cwd.includes("\0")) throw new Error(`Scheduled command cwd contains a NUL byte; ${SCHEDULED_CWD_ROOT_LIMITATION}`);
+  if (!isAbsolute(cwd)) throw new Error(`Scheduled command cwd is no longer absolute: ${cwd}; ${SCHEDULED_CWD_ROOT_LIMITATION}`);
+  try {
+    const resolved = resolveWorkspacePath(cwd, ".");
+    if (!statSync(resolved).isDirectory()) {
+      throw new Error(`Scheduled command cwd is not a directory: ${cwd}`);
+    }
+    return resolved;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`Scheduled command cwd is not a usable directory: ${cwd}; ${detail}; ${SCHEDULED_CWD_ROOT_LIMITATION}`);
+  }
 }
 
 export class CommandRunner {
@@ -67,8 +96,12 @@ export class CommandRunner {
       };
     } else {
       try {
-        const result = await runProcess("/bin/bash", ["--noprofile", "--norc", "-c", job.command], {
-          cwd: job.cwd,
+        const shell = shellDefinition();
+        // Keep this immediately before the one spawn performed by
+        // runProcess. A cwd can disappear or be replaced after scheduling.
+        const cwd = revalidateScheduledCwd(job.cwd);
+        const result = await runProcess(shell.executable, shell.args(job.command), {
+          cwd,
           env: shellEnvironment({ ...process.env, ...job.env }, this.sensitiveEnvKeys),
           timeoutMs: job.timeoutMs ?? 1,
           captureBytes: job.outputBytes ?? 0,

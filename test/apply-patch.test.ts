@@ -4,15 +4,18 @@ import {
   existsSync,
   mkdtempSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import test, { type TestContext } from "node:test";
-import { applyPatchTool } from "../src/tools/apply-patch.js";
+import { applyPatchForPlatform, applyPatchTool, replaceStagedFile, validatePatchPath } from "../src/tools/apply-patch.js";
 import type { ToolContext } from "../src/tools/types.js";
 
 function workspace(t: TestContext): string {
@@ -24,6 +27,10 @@ function workspace(t: TestContext): string {
 async function apply(root: string, lines: string[]): Promise<string> {
   const result = await applyPatchTool.execute({ patch: lines.join("\n") }, { workspace: root } as ToolContext);
   return result.output;
+}
+
+function applyOnPlatform(root: string, lines: string[], platform: NodeJS.Platform): string {
+  return applyPatchForPlatform(lines.join("\n"), root, platform);
 }
 
 test("adds a file and creates missing parent directories", async (t) => {
@@ -61,7 +68,8 @@ test("updates a file with multiple exact hunks and preserves mode and final newl
   ]);
 
   assert.equal(readFileSync(path, "utf8"), "alpha\nBETA\ngamma\nDELTA\n");
-  assert.equal(statSync(path).mode & 0o7777, 0o751);
+  if (process.platform === "win32") assert.equal(existsSync(path), true);
+  else assert.equal(statSync(path).mode & 0o7777, 0o751);
   assert.equal(output, "Updated update.txt");
 });
 
@@ -100,8 +108,59 @@ test("updates and moves a file while preserving its mode", async (t) => {
 
   assert.equal(existsSync(source), false);
   assert.equal(readFileSync(target, "utf8"), "after\nkeep\n");
-  assert.equal(statSync(target).mode & 0o7777, 0o640);
+  if (process.platform === "win32") assert.equal(existsSync(target), true);
+  else assert.equal(statSync(target).mode & 0o7777, 0o640);
   assert.equal(output, "Updated and moved old.txt -> moved/new.txt");
+});
+
+test("rolls back a Windows-style replacement when installing the staged file fails", (t) => {
+  const root = workspace(t);
+  const target = join(root, "target.txt");
+  const temp = join(root, "staged.tmp");
+  writeFileSync(target, "before\n");
+  writeFileSync(temp, "after\n");
+
+  const fileSystem = {
+    renameSync(source: Parameters<typeof renameSync>[0], destination: Parameters<typeof renameSync>[1]): void {
+      if (source.toString() === temp && destination.toString() === target) {
+        const error = new Error("simulated Windows rename collision") as NodeJS.ErrnoException;
+        error.code = "EPERM";
+        throw error;
+      }
+      renameSync(source, destination);
+    },
+    unlinkSync,
+  };
+
+  assert.throws(() => replaceStagedFile(temp, target, "win32", fileSystem), /simulated Windows rename collision/);
+  assert.equal(readFileSync(target, "utf8"), "before\n");
+  assert.equal(existsSync(temp), true);
+  rmSync(temp, { force: true });
+});
+
+test("replaces an existing target with a Windows-style collision-safe rename", (t) => {
+  const root = workspace(t);
+  const target = join(root, "target.txt");
+  const temp = join(root, "staged.tmp");
+  writeFileSync(target, "before\n");
+  writeFileSync(temp, "after\n");
+
+  const fileSystem = {
+    renameSync(source: Parameters<typeof renameSync>[0], destination: Parameters<typeof renameSync>[1]): void {
+      if (existsSync(destination.toString())) {
+        const error = new Error("simulated Windows rename collision") as NodeJS.ErrnoException;
+        error.code = "EPERM";
+        throw error;
+      }
+      renameSync(source, destination);
+    },
+    unlinkSync,
+  };
+
+  replaceStagedFile(temp, target, "win32", fileSystem);
+  assert.equal(readFileSync(target, "utf8"), "after\n");
+  assert.equal(existsSync(temp), false);
+  assert.deepEqual(readdirSync(root).filter((entry) => entry.endsWith(".bak")), []);
 });
 
 test("rejects malformed patches and non-matching hunks", async (t) => {
@@ -188,4 +247,50 @@ test("preflights all operations before changing any file", async (t) => {
 
   assert.equal(readFileSync(path, "utf8"), "before\n");
   assert.equal(existsSync(join(root, "created")), false);
+});
+
+test("preflights case-insensitive path conflicts on simulated Windows", (t) => {
+  const root = workspace(t);
+
+  assert.throws(
+    () => applyOnPlatform(root, [
+      "*** Begin Patch",
+      "*** Add File: Foo.txt",
+      "+first",
+      "*** Add File: foo.txt",
+      "+second",
+      "*** End Patch",
+    ], "win32"),
+    /Conflicting paths in patch/,
+  );
+  assert.equal(existsSync(join(root, "Foo.txt")), false);
+  assert.equal(existsSync(join(root, "foo.txt")), false);
+});
+
+test("rejects Windows stream, device, and reserved path forms when simulated on Linux", (t) => {
+  const root = workspace(t);
+  const paths = [
+    "notes.txt:secret",
+    "NUL.txt",
+    "nested/CON.log",
+    "\\\\?\\C:\\unexpected",
+    "trailing.",
+  ];
+
+  for (const path of paths) {
+    assert.throws(
+      () => applyOnPlatform(root, [
+        "*** Begin Patch",
+        `*** Add File: ${path}`,
+        "+blocked",
+        "*** End Patch",
+      ], "win32"),
+      /Windows path/,
+    );
+  }
+  assert.deepEqual(readdirSync(root), []);
+});
+
+test("leaves Linux path validation unchanged", () => {
+  assert.doesNotThrow(() => validatePatchPath("notes.txt:metadata", "linux"));
 });

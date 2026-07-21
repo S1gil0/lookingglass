@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -48,6 +48,23 @@ const agentModel: GatewayModel = {
   supportsFast: false,
   priority: 1,
 };
+
+function toolCallResponse(id: string, name: string, args: unknown): Response {
+  return {
+    id: `response-${id}`,
+    status: "completed",
+    output: [{
+      id: `function-${id}`,
+      type: "function_call",
+      status: "completed",
+      name,
+      arguments: JSON.stringify(args),
+      call_id: `call-${id}`,
+    }],
+    output_text: "",
+    usage: { input_tokens: 10, output_tokens: 4, total_tokens: 14 },
+  } as unknown as Response;
+}
 
 test("agent coordinator runs isolated tasks concurrently with configured model metadata", async (t) => {
   const root = mkdtempSync(join(tmpdir(), "looking-glass-agents-"));
@@ -142,6 +159,74 @@ test("agent coordinator runs isolated tasks concurrently with configured model m
   assert.equal(children.length, 3);
   assert.ok(children.every((child) => child.session_kind === "agent"));
   assert.ok(children.every((child) => child.model === "gpt-luna" && child.reasoning_effort === "high"));
+});
+
+test("agent coordinator propagates read-only context to code-mode child turns", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "looking-glass-agents-readonly-"));
+  const artifactDir = join(root, "artifacts");
+  mkdirSync(artifactDir);
+  const db = openDatabase(join(root, "state.db"));
+  t.after(() => {
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+  const sessions = new SessionStore(db);
+  const artifacts = new ArtifactStore(db, artifactDir);
+  const parent = sessions.create({
+    workspace: root,
+    provider: "codex-lb",
+    model: "gpt-sol",
+    reasoningEffort: "medium",
+    agentProvider: "codex-lb",
+    agentModel: "gpt-luna",
+    agentReasoningEffort: "high",
+    verbosity: "low",
+    fast: false,
+    approvalMode: "code",
+  });
+  let requests = 0;
+  const client = {
+    supportsResponseContinuity: () => true,
+    async stream() {
+      requests += 1;
+      return requests === 1
+        ? toolCallResponse("write", "apply_patch", {
+          patch: "*** Begin Patch\n*** Add File: delegated-write.txt\n+should not be written\n*** End Patch",
+        })
+        : response("done", "done");
+    },
+  } as unknown as CodexLbClient;
+  const coordinator = new AgentCoordinator(
+    structuredClone(DEFAULT_CONFIG),
+    root,
+    sessions,
+    artifacts,
+    () => client,
+    createWorkerToolRegistry(),
+    "main instructions",
+    async () => agentModel,
+  );
+  const context: ToolContext = {
+    workspace: root,
+    sessionId: parent.id,
+    config: structuredClone(DEFAULT_CONFIG),
+    approvalMode: "code",
+    artifacts,
+    sessions,
+    signal: new AbortController().signal,
+    readOnly: true,
+    approve: async () => "deny",
+    ask: async () => "",
+  };
+
+  const result = await coordinator.run({
+    tasks: [{ id: "readonly", prompt: "Attempt the delegated write." }],
+    concurrency: 1,
+  }, context);
+
+  assert.match(result.output, /succeeded/);
+  assert.equal(requests, 2);
+  assert.equal(existsSync(join(root, "delegated-write.txt")), false);
 });
 
 test("main registry exposes agents while leaf registry prevents recursive delegation", async () => {

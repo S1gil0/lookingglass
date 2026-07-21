@@ -17,6 +17,16 @@ import type {
   CreateSessionPromptInput,
 } from "../src/scheduler/index.js";
 import { openDatabase, type GlassDatabase } from "../src/storage/database.js";
+import {
+  checkEnvironmentUnsetCommand,
+  failureCommand,
+  outputCommand,
+  outputEnvironmentCommand,
+  sleepCommand,
+  successCommand,
+  truncatedOutputCommand,
+  writeMarkerCommand,
+} from "./helpers.js";
 
 interface Fixture {
   db: GlassDatabase;
@@ -133,20 +143,20 @@ test("installs current migrations and validates scheduler definitions", (t) => {
     schedule: "2026-02-30T10:00:00Z",
     timezone: "UTC",
   }, now), /Invalid one-shot schedule/);
-  assert.throws(() => store.createCommand(commandInput(root, "pwd", "2026-01-02T00:00:00Z", {
+  assert.throws(() => store.createCommand(commandInput(root, successCommand(), "2026-01-02T00:00:00Z", {
     cwd: "relative",
   }), now), /cwd must be absolute/);
-  assert.throws(() => store.createCommand(commandInput(root, "pwd", "2026-01-02T00:00:00Z", {
+  assert.throws(() => store.createCommand(commandInput(root, successCommand(), "2026-01-02T00:00:00Z", {
     cwd: join(root, "missing"),
   }), now), /does not exist/);
   assert.throws(() => store.createCommand(commandInput(root, "bad\0command", "2026-01-02T00:00:00Z"), now), /NUL/);
-  assert.throws(() => store.createCommand(commandInput(root, "true", "2026-01-02T00:00:00Z", {
+  assert.throws(() => store.createCommand(commandInput(root, successCommand(), "2026-01-02T00:00:00Z", {
     env: { BAD: "value\0tail" },
   }), now), /NUL/);
-  assert.throws(() => store.createCommand(commandInput(root, "true", "2026-01-02T00:00:00Z", {
+  assert.throws(() => store.createCommand(commandInput(root, successCommand(), "2026-01-02T00:00:00Z", {
     timeoutMs: Number.POSITIVE_INFINITY,
   }), now), /timeoutMs/);
-  assert.throws(() => store.createCommand(commandInput(root, "true", "2026-01-02T00:00:00Z", {
+  assert.throws(() => store.createCommand(commandInput(root, successCommand(), "2026-01-02T00:00:00Z", {
     outputBytes: -1,
   }), now), /outputBytes/);
 
@@ -524,7 +534,7 @@ test("daemon invokes the session prompt handler and shares its worker budget", a
     "Run the scheduled turn",
     new Date(due).toISOString(),
   ), due - 1);
-  const command = store.createCommand(commandInput(root, "true", new Date(due).toISOString()), due - 1);
+  const command = store.createCommand(commandInput(root, successCommand(), new Date(due).toISOString()), due - 1);
   assert.equal(store.acquireLease("session-daemon", "session-boot", due, 60_000), true);
   const handled: string[] = [];
   const daemon = new SchedulerDaemon(store, {
@@ -600,7 +610,7 @@ test("missed commands are skipped after their start grace", (t) => {
   const { root, store } = fixture(t);
   const scheduledAt = Date.parse("2026-01-01T00:00:00Z");
   const now = scheduledAt + 60_001;
-  const job = store.createCommand(commandInput(root, "exit 0", new Date(scheduledAt).toISOString(), {
+  const job = store.createCommand(commandInput(root, successCommand(), new Date(scheduledAt).toISOString(), {
     startGraceMs: 60_000,
   }), scheduledAt - 1);
 
@@ -615,7 +625,7 @@ test("commands never overlap and scheduled occurrences remain unique", (t) => {
   const { root, store } = fixture(t);
   const createdAt = Date.parse("2026-01-01T00:00:30Z");
   const through = Date.parse("2026-01-01T00:02:00Z");
-  const job = store.createCommand(commandInput(root, "sleep 1", "* * * * *", {
+  const job = store.createCommand(commandInput(root, sleepCommand(1), "* * * * *", {
     scheduleKind: "cron",
     startGraceMs: 10 * 60_000,
   }), createdAt);
@@ -634,10 +644,10 @@ test("commands never overlap and scheduled occurrences remain unique", (t) => {
 test("claiming skips overdue pending commands and ignores disabled jobs", (t) => {
   const { db, root, store } = fixture(t);
   const due = Date.parse("2026-01-01T00:00:00Z");
-  const overdue = store.createCommand(commandInput(root, "true", new Date(due).toISOString(), {
+  const overdue = store.createCommand(commandInput(root, successCommand(), new Date(due).toISOString(), {
     startGraceMs: 10,
   }), due - 1);
-  const disabled = store.createCommand(commandInput(root, "true", new Date(due).toISOString(), {
+  const disabled = store.createCommand(commandInput(root, successCommand(), new Date(due).toISOString(), {
     startGraceMs: 1_000,
   }), due - 1);
   assert.equal(store.materialize(due).length, 2);
@@ -665,7 +675,7 @@ test("daemon refreshes claim time after materialization", async (t) => {
   }
   const store = new DelayedMaterializationStore(db);
   const due = Date.now();
-  store.createCommand(commandInput(root, "true", new Date(due).toISOString(), {
+  store.createCommand(commandInput(root, successCommand(), new Date(due).toISOString(), {
     startGraceMs: 60_000,
   }), due - 1);
   const leaseAt = Date.now();
@@ -688,7 +698,7 @@ test("daemon refreshes claim time after materialization", async (t) => {
 test("command start uses actual grace and returns the persisted skip", (t) => {
   const { root, store } = fixture(t);
   const due = Date.parse("2026-01-01T00:00:00Z");
-  const job = store.createCommand(commandInput(root, "true", new Date(due).toISOString(), {
+  const job = store.createCommand(commandInput(root, successCommand(), new Date(due).toISOString(), {
     startGraceMs: 10,
   }), due - 1);
   assert.equal(store.materialize(due).length, 1);
@@ -717,7 +727,7 @@ test("pause after claim cancels without launching the command", async (t) => {
   const { root, store } = fixture(t);
   const due = Date.now();
   const marker = join(root, "launched");
-  const job = store.createCommand(commandInput(root, `touch '${marker}'`, new Date(due).toISOString(), {
+  const job = store.createCommand(commandInput(root, writeMarkerCommand(marker), new Date(due).toISOString(), {
     startGraceMs: 60_000,
   }), due - 1);
   assert.equal(store.materialize(due).length, 1);
@@ -736,7 +746,7 @@ test("pause after claim cancels without launching the command", async (t) => {
 test("command finish is fenced after lease expiry and takeover", (t) => {
   const { root, store } = fixture(t);
   const due = Date.parse("2026-01-01T00:00:00Z");
-  store.createCommand(commandInput(root, "true", new Date(due).toISOString()), due - 1);
+  store.createCommand(commandInput(root, successCommand(), new Date(due).toISOString()), due - 1);
   assert.equal(store.materialize(due).length, 1);
   assert.equal(store.acquireLease("finish-daemon", "finish-boot", due, 20), true);
   const claim = store.claimCommands("finish-daemon", "finish-boot", due, 20, 1)[0];
@@ -774,7 +784,7 @@ test("lease takeover marks claimed and running commands unknown and blocks recur
   const { root, store } = fixture(t);
   const createdAt = Date.parse("2026-01-01T00:00:30Z");
   const due = Date.parse("2026-01-01T00:01:00Z");
-  const jobs = ["first", "second"].map((name) => store.createCommand(commandInput(root, `printf '${name}'`, "* * * * *", {
+  const jobs = ["first", "second"].map((name) => store.createCommand(commandInput(root, outputCommand(name), "* * * * *", {
     scheduleKind: "cron",
   }), createdAt));
   assert.equal(store.materialize(due).length, 2);
@@ -831,7 +841,7 @@ test("command runner records success, nonzero exit, timeout, and bounded output"
     return { job, result };
   }
 
-  const success = await execute("printf '%s' \"$SCHED_VALUE\"; printf 'warning' >&2", {
+  const success = await execute(`${outputEnvironmentCommand("SCHED_VALUE")}; ${outputCommand("warning", "stderr")}`, {
     env: { SCHED_VALUE: "from-env" },
   });
   assert.equal(success.result.state, "succeeded");
@@ -839,21 +849,21 @@ test("command runner records success, nonzero exit, timeout, and bounded output"
   assert.equal(success.result.stderr.toString(), "warning");
   assert.equal(success.result.exitCode, 0);
 
-  const strippedSecret = await execute("if [ -z \"$TEST_SCHEDULER_API_KEY\" ]; then printf 'stripped'; else printf '%s' \"$TEST_SCHEDULER_API_KEY\"; fi", {
+  const strippedSecret = await execute(checkEnvironmentUnsetCommand("TEST_SCHEDULER_API_KEY", "stripped"), {
     env: { TEST_SCHEDULER_API_KEY: "job-override-secret" },
   });
   assert.equal(strippedSecret.result.stdout.toString(), "stripped");
 
-  const nonzero = await execute("printf 'bad' >&2; exit 7");
+  const nonzero = await execute(failureCommand(7, "bad"));
   assert.equal(nonzero.result.state, "failed");
   assert.equal(nonzero.result.exitCode, 7);
   assert.match(nonzero.result.reason ?? "", /code 7/);
 
-  const timeout = await execute("sleep 2", { timeoutMs: 50 });
+  const timeout = await execute(sleepCommand(2), { timeoutMs: 50 });
   assert.equal(timeout.result.state, "timed_out");
   assert.match(timeout.result.reason ?? "", /50ms timeout/);
 
-  const truncated = await execute("printf 'abcdefgh'; printf '123456' >&2", { outputBytes: 4 });
+  const truncated = await execute(truncatedOutputCommand("abcdefgh", "123456"), { outputBytes: 4 });
   assert.equal(truncated.result.state, "succeeded");
   assert.equal(truncated.result.stdout.toString(), "abcd");
   assert.equal(truncated.result.stderr.toString(), "1234");
@@ -866,10 +876,30 @@ test("command runner records success, nonzero exit, timeout, and bounded output"
   assert.equal(commandInbox.length, 5);
 });
 
+test("command runner revalidates cwd immediately before spawning", async (t) => {
+  const { root, store } = fixture(t);
+  const cwd = mkdtempSync(join(root, "scheduled-cwd-"));
+  const due = Date.now();
+  const job = store.createCommand(commandInput(cwd, successCommand(), new Date(due).toISOString()), due);
+  assert.equal(store.materialize(due).length, 1);
+  assert.equal(store.acquireLease("cwd-daemon", "cwd-boot", due, 60_000), true);
+  const claim = store.claimCommands("cwd-daemon", "cwd-boot", due, 60_000, 1)[0];
+  assert.ok(claim);
+
+  // Creation validates the directory, but a scheduled run may happen much
+  // later after the path has been removed or replaced.
+  rmSync(cwd, { recursive: true, force: true });
+  const result = await new CommandRunner(store).run(claim);
+  assert.equal(result.state, "failed");
+  assert.equal(result.exitCode, null);
+  assert.match(result.reason ?? "", /workspace root.*cannot be verified/);
+  assert.equal(store.getJob(job.id)?.blockedReason, null);
+});
+
 test("interrupted running commands become unknown and block recurrence", async (t) => {
   const { root, store } = fixture(t);
   const now = Date.now();
-  const job = store.createCommand(commandInput(root, "sleep 5", "* * * * *", {
+  const job = store.createCommand(commandInput(root, sleepCommand(5), "* * * * *", {
     scheduleKind: "cron",
   }), now);
   const due = job.nextDue!;
@@ -890,7 +920,7 @@ test("interrupted running commands become unknown and block recurrence", async (
 test("daemon rejects when a runner result cannot be persisted", async (t) => {
   const { root, store } = fixture(t);
   const due = Date.now();
-  store.createCommand(commandInput(root, "true", new Date(due).toISOString(), {
+  store.createCommand(commandInput(root, successCommand(), new Date(due).toISOString(), {
     startGraceMs: 60_000,
   }), due - 1);
   store.finishCommand = () => null;
@@ -950,7 +980,7 @@ test("deleted unknown jobs cannot be resolved and disabled jobs cannot run now",
   assert.throws(() => store.runNow(reminder.id, due), /enabled/);
 
   const recurring = store.createCommand({
-    ...commandInput(root, "sleep 1", "* * * * *"),
+    ...commandInput(root, sleepCommand(1), "* * * * *"),
     scheduleKind: "cron",
   }, due - 60_000);
   store.materialize(due);

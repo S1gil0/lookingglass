@@ -37,6 +37,7 @@ import type { InboxRecord, SchedulerJob } from "../scheduler/types.js";
 import { initialDue } from "../scheduler/schedule.js";
 import type { ApprovalDecision, ApprovalRequest, QuestionRequest } from "../tools/types.js";
 import { isWithin } from "../tools/paths.js";
+import { windowsSystemExecutable } from "../tools/shell.js";
 import type {
   ApprovalMode,
   GatewayModel,
@@ -233,6 +234,45 @@ function jsonPreview(value: unknown): string {
   }
 }
 
+export interface CommandApprovalDisplay {
+  label: string;
+  description: string;
+}
+
+function approvalShellName(value: unknown): "Bash" | "PowerShell" | null {
+  if (value === "bash") return "Bash";
+  if (value === "powershell") return "PowerShell";
+  return null;
+}
+
+/** Render persisted approval signatures without exposing their JSON encoding in the TUI. */
+export function formatCommandApproval(signature: string, approvedAt: number): CommandApprovalDisplay {
+  let label = signature;
+  let description = new Date(approvedAt).toISOString();
+  try {
+    const parsed = JSON.parse(signature) as unknown;
+    if (Array.isArray(parsed) && parsed[0] === "shell-executable" && typeof parsed[3] === "string") {
+      const shell = approvalShellName(parsed[2]);
+      if (shell) label = `All ${shell} commands starting with '${parsed[3]}'`;
+    } else if (Array.isArray(parsed) && parsed[0] === "shell-exec" && typeof parsed[3] === "string") {
+      label = parsed[3];
+      description = `${String(parsed[4])} | ${String(parsed[5])}ms | ${description}`;
+    } else if (Array.isArray(parsed) && parsed[0] === "bash-exec" && typeof parsed[2] === "string") {
+      // Keep the legacy Bash signature display stable while supporting the new encoding above.
+      label = parsed[2];
+      description = `${String(parsed[3])} | ${String(parsed[4])}ms | ${description}`;
+    } else if (Array.isArray(parsed) && parsed[0] === "tool-action" && typeof parsed[2] === "string") {
+      const args = parsed[3] as Record<string, unknown> | undefined;
+      label = parsed[2] === "bash" && typeof args?.command === "string"
+        ? args.command
+        : `${parsed[2]}: ${JSON.stringify(args ?? {})}`;
+    }
+  } catch {
+    // Retain the raw signature for forward-compatible records.
+  }
+  return { label, description };
+}
+
 function fit(line: string, width: number): string {
   return truncateToWidth(line, Math.max(1, width), "");
 }
@@ -278,7 +318,7 @@ class AlternateScreenTerminal extends ProcessTerminal {
     let command: string | undefined;
     let args: string[] = [];
     if (platform() === "darwin") command = "pbcopy";
-    else if (platform() === "win32") command = "clip.exe";
+    else if (platform() === "win32") command = windowsSystemExecutable("clip.exe");
     else if (process.env.WAYLAND_DISPLAY) command = "wl-copy";
     else if (process.env.DISPLAY) {
       command = "xclip";
@@ -1676,26 +1716,11 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
         return;
       }
       const selected = await selectValue("Always-approved actions", approvals.map((approval) => {
-        let command = approval.signature;
-        let detail = new Date(approval.approvedAt).toISOString();
-        try {
-          const parsed = JSON.parse(approval.signature) as unknown;
-          if (Array.isArray(parsed) && parsed[0] === "bash-exec" && typeof parsed[2] === "string") {
-            command = parsed[2];
-            detail = `${String(parsed[3])} | ${String(parsed[4])}ms | ${detail}`;
-          } else if (Array.isArray(parsed) && parsed[0] === "tool-action" && typeof parsed[2] === "string") {
-            const args = parsed[3] as Record<string, unknown> | undefined;
-            command = parsed[2] === "bash" && typeof args?.command === "string"
-              ? args.command
-              : `${parsed[2]}: ${JSON.stringify(args ?? {})}`;
-          }
-        } catch {
-          // Retain the raw signature for forward-compatible records.
-        }
+        const display = formatCommandApproval(approval.signature, approval.approvedAt);
         return {
           value: approval.signature,
-          label: oneLine(command, 240),
-          description: detail,
+          label: oneLine(display.label, 240),
+          description: display.description,
         };
       }), "Delete/Supr revokes the highlighted action approval.", { deletable: true });
       if (!selected || stopping) return;

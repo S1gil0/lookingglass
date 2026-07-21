@@ -1,6 +1,7 @@
 import Database from "better-sqlite3";
 import { dirname } from "node:path";
 import { chmodSync, existsSync, mkdirSync } from "node:fs";
+import { shouldEnforcePosixPermissions } from "../paths.js";
 import { bashApprovalExecutable } from "../tools/safety.js";
 
 const SESSION_SCHEMA = `
@@ -305,23 +306,24 @@ function migrateBashApprovalScopes(db: GlassDatabase): void {
 
 export type GlassDatabase = Database.Database;
 
-export function openDatabase(path: string): GlassDatabase {
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  const previousUmask = process.umask(0o077);
+export function openDatabase(path: string, platform: NodeJS.Platform = process.platform): GlassDatabase {
+  const enforcePermissions = shouldEnforcePosixPermissions(platform);
+  mkdirSync(dirname(path), { recursive: true, ...(enforcePermissions ? { mode: 0o700 } : {}) });
+  const previousUmask = enforcePermissions ? process.umask(0o077) : null;
   let db: GlassDatabase;
   try {
     db = new Database(path, { timeout: 5_000 });
-    chmodSync(path, 0o600);
+    if (enforcePermissions) chmodSync(path, 0o600);
     db.pragma("journal_mode = WAL");
     db.pragma("synchronous = FULL");
     db.pragma("foreign_keys = ON");
     db.pragma("busy_timeout = 5000");
     db.pragma("wal_autocheckpoint = 1000");
     for (const sidecar of [`${path}-wal`, `${path}-shm`]) {
-      if (existsSync(sidecar)) chmodSync(sidecar, 0o600);
+      if (enforcePermissions && existsSync(sidecar)) chmodSync(sidecar, 0o600);
     }
   } finally {
-    process.umask(previousUmask);
+    if (previousUmask !== null) process.umask(previousUmask);
   }
 
   const migrate = db.transaction(() => {

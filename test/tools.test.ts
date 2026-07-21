@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 import { DEFAULT_CONFIG } from "../src/config.js";
 import { ArtifactStore } from "../src/storage/artifact-store.js";
@@ -9,13 +9,22 @@ import { openDatabase } from "../src/storage/database.js";
 import { SessionStore } from "../src/storage/session-store.js";
 import { SchedulerStore } from "../src/scheduler/store.js";
 import { applyPatchTool } from "../src/tools/apply-patch.js";
-import { bashTool } from "../src/tools/bash.js";
+import { bashTool, powershellApprovalExecutable } from "../src/tools/bash.js";
 import { readTool } from "../src/tools/read.js";
 import { ToolRegistry, toolApprovalSignature } from "../src/tools/registry.js";
 import { createScheduleTools } from "../src/tools/schedule.js";
-import { bashApprovalExecutable, bashCommandRisk, patchRisk, shellEnvironment, workspacePatchRisk } from "../src/tools/safety.js";
+import { bashApprovalExecutable, bashCommandRisk, isSensitiveMutationPath, patchRisk, powershellCommandRisk, shellEnvironment, workspacePatchRisk } from "../src/tools/safety.js";
+import { powershellArguments, powershellExecutable, shellCommand, shellDefinition, shellKind, taskkillExecutable, windowsSystemRoot } from "../src/tools/shell.js";
 import { globTool, grepTool } from "../src/tools/search.js";
 import type { GlassTool, ToolContext } from "../src/tools/types.js";
+import {
+  compoundWriteCommand,
+  largeOutputCommand,
+  outputCommand,
+  removeDirectoryCommand,
+  sleepCommand,
+  transformInputCommand,
+} from "./helpers.js";
 
 function fixture(t: TestContext) {
   const base = mkdtempSync(join(tmpdir(), "looking-glass-tools-"));
@@ -52,9 +61,10 @@ function fixture(t: TestContext) {
   return { base, workspace, context, db };
 }
 
-test("read handles files, directories, artifacts, and symlink boundaries", async (t) => {
+test("read handles files, directories, and artifacts", async (t) => {
   const { base, workspace, context } = fixture(t);
-  assert.equal(statSync(join(base, "state.db")).mode & 0o077, 0);
+  if (process.platform === "win32") assert.equal(existsSync(join(base, "state.db")), true);
+  else assert.equal(statSync(join(base, "state.db")).mode & 0o077, 0);
   mkdirSync(join(workspace, "src"));
   writeFileSync(join(workspace, "src", "file.txt"), "alpha\nbeta\ngamma\n");
   const file = await readTool.execute({ path: "src/file.txt", offset: 2, limit: 1 }, context);
@@ -66,14 +76,26 @@ test("read handles files, directories, artifacts, and symlink boundaries", async
   const range = await readTool.execute({ path: artifact.uri, offset: 3, limit: 4 }, context);
   assert.match(range.output, /^3456/);
 
+});
+
+test("read rejects symlink escapes when the host permits symlink creation", async (t) => {
+  const { base, workspace, context } = fixture(t);
   const outside = join(base, "outside.txt");
   writeFileSync(outside, "secret");
-  symlinkSync(outside, join(workspace, "escape.txt"));
+  try {
+    symlinkSync(outside, join(workspace, "escape.txt"));
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (process.platform === "win32" && (code === "EPERM" || code === "EACCES")) {
+      t.skip("symlink creation requires elevated Windows privileges");
+      return;
+    }
+    throw error;
+  }
   await assert.rejects(
     readTool.execute({ path: "escape.txt", offset: null, limit: null }, context),
     /outside the workspace/,
   );
-  assert.equal(dirname(outside), base);
 });
 
 test("registry centrally bounds UTF-8 tool output and preserves the full artifact", async (t) => {
@@ -152,10 +174,38 @@ test("glob and grep use bounded ripgrep searches", async (t) => {
   );
 });
 
+test("glob and grep sanitize ripgrep credentials", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("test helper uses a POSIX executable");
+    return;
+  }
+  const { base, context } = fixture(t);
+  const bin = join(base, "bin");
+  const executable = join(bin, "rg");
+  const credentialName = "LOOKING_GLASS_SEARCH_SECRET";
+  const previousPath = process.env.PATH;
+  const previousCredential = process.env[credentialName];
+  mkdirSync(bin);
+  writeFileSync(executable, `#!/bin/sh\nprintf '%s' "\${${credentialName}:-unset}"\n`);
+  chmodSync(executable, 0o755);
+  process.env.PATH = bin;
+  process.env[credentialName] = "search-secret-value";
+  context.config.gateway.apiKeyEnv = credentialName;
+  t.after(() => {
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+    if (previousCredential === undefined) delete process.env[credentialName];
+    else process.env[credentialName] = previousCredential;
+  });
+
+  assert.equal((await globTool.execute({ pattern: "*", path: null, limit: 10 }, context)).output, "unset");
+  assert.equal((await grepTool.execute({ pattern: "*", path: null, include: null, limit: 10 }, context)).output, "unset");
+});
+
 test("bash bounds model output, stores an artifact, and cancels process groups", async (t) => {
   const { context } = fixture(t);
   const large = await bashTool.execute({
-    command: "node -e \"process.stdout.write('x'.repeat(3000))\"",
+    command: largeOutputCommand("x", 3_000),
     workdir: null,
     timeout_ms: 10_000,
   }, context);
@@ -166,11 +216,12 @@ test("bash bounds model output, stores an artifact, and cancels process groups",
   const controller = new AbortController();
   const cancelledContext = { ...context, signal: controller.signal };
   const started = Date.now();
-  const running = bashTool.execute({ command: "sleep 5", workdir: null, timeout_ms: 10_000 }, cancelledContext);
+  const running = bashTool.execute({ command: sleepCommand(5), workdir: null, timeout_ms: 10_000 }, cancelledContext);
   setTimeout(() => controller.abort(), 30);
   const cancelled = await running;
   assert.ok(Date.now() - started < 2_000);
-  assert.match(cancelled.output, /exit: SIGTERM|exit: SIGKILL/);
+  if (process.platform === "win32") assert.match(cancelled.output, /exit: (?:\d+|unknown)/);
+  else assert.match(cancelled.output, /exit: SIGTERM|exit: SIGKILL/);
 });
 
 test("registry lets unrestricted persistent actions run without approval", async (t) => {
@@ -218,7 +269,7 @@ test("unrestricted mode runs critical shell and patch operations without approva
   const registry = new ToolRegistry().register(bashTool).register(applyPatchTool);
 
   const deletionCommand = registry.parseArguments("bash", JSON.stringify({
-    command: "rm -rf disposable",
+    command: removeDirectoryCommand("disposable"),
     workdir: null,
     timeout_ms: null,
   }));
@@ -234,14 +285,14 @@ test("unrestricted mode runs critical shell and patch operations without approva
   assert.equal(approvals.length, 0);
 
   const safeShell = registry.parseArguments("bash", JSON.stringify({
-    command: "printf safe",
+    command: outputCommand("safe"),
     workdir: null,
     timeout_ms: null,
   }));
   assert.match((await registry.execute("bash", safeShell, context)).output, /safe/);
   writeFileSync(join(workspace, "input.txt"), "before\n");
   const ordinaryShellWrite = registry.parseArguments("bash", JSON.stringify({
-    command: "cat input.txt > output.txt && sed -i 's/before/after/' output.txt",
+    command: transformInputCommand(),
     workdir: workspace,
     timeout_ms: 5_000,
   }));
@@ -253,20 +304,6 @@ test("unrestricted mode runs critical shell and patch operations without approva
   }));
   assert.match((await registry.execute("apply_patch", ordinaryPatch, context)).output, /Updated ordinary.txt/);
   assert.equal(approvals.length, 0);
-
-  mkdirSync(join(workspace, ".ssh"));
-  writeFileSync(join(workspace, ".ssh", "config"), "safe=true\n");
-  symlinkSync(join(workspace, ".ssh", "config"), join(workspace, "config-link"));
-  const sensitiveSymlink = registry.parseArguments("apply_patch", JSON.stringify({
-    patch: "*** Begin Patch\n*** Update File: config-link\n@@\n-safe=true\n+safe=false\n*** End Patch",
-  }));
-  context.config.tools.approval = "code";
-  context.approve = async (request) => {
-    approvals.push(`${request.risk}:${request.summary}`);
-    return "deny";
-  };
-  await assert.rejects(registry.execute("apply_patch", sensitiveSymlink, context), /denied/);
-  assert.equal(approvals.at(-1)?.startsWith("critical:"), true);
 
   assert.equal(bashCommandRisk("git status"), "shell");
   assert.equal(bashCommandRisk("systemctl status example-service"), "shell");
@@ -330,15 +367,61 @@ test("unrestricted mode runs critical shell and patch operations without approva
   assert.equal(withoutCredential.TEST_API_KEY, undefined);
 });
 
-test("Bash approval signatures scope commands by leading executable", (t) => {
+test("sensitive mutation paths use POSIX slash semantics for Windows-style paths", () => {
+  const windowsSeparator = String.fromCharCode(92);
+  for (const path of [
+    ".ssh/config",
+    `.ssh${windowsSeparator}config`,
+    "etc/passwd",
+    `etc${windowsSeparator}passwd`,
+    `${windowsSeparator}etc${windowsSeparator}passwd`,
+  ]) {
+    assert.equal(isSensitiveMutationPath(path), true, path);
+    assert.equal(patchRisk(`*** Update File: ${path}`), "critical", path);
+  }
+  assert.equal(isSensitiveMutationPath("etc/passwd.backup"), false);
+});
+
+test("apply_patch requires approval for sensitive symlink targets when links are available", async (t) => {
+  const { context, workspace } = fixture(t);
+  mkdirSync(join(workspace, ".ssh"));
+  writeFileSync(join(workspace, ".ssh", "config"), "safe=true\n");
+  try {
+    symlinkSync(join(workspace, ".ssh", "config"), join(workspace, "config-link"));
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (process.platform === "win32" && (code === "EPERM" || code === "EACCES")) {
+      t.skip("symlink creation requires elevated Windows privileges");
+      return;
+    }
+    throw error;
+  }
+  const registry = new ToolRegistry().register(applyPatchTool);
+  const sensitiveSymlink = registry.parseArguments("apply_patch", JSON.stringify({
+    patch: "*** Begin Patch\n*** Update File: config-link\n@@\n-safe=true\n+safe=false\n*** End Patch",
+  }));
+  context.config.tools.approval = "code";
+  context.approve = async () => "deny";
+  await assert.rejects(registry.execute("apply_patch", sensitiveSymlink, context), /denied/);
+});
+
+test("Bash keeps executable approval scope while PowerShell stays exact-command scoped", (t) => {
   const { context, workspace } = fixture(t);
   mkdirSync(join(workspace, "subdir"));
-  const first = bashTool.approvalSignature?.({ command: "cat one.txt", workdir: null, timeout_ms: null }, context);
-  assert.equal(first, JSON.stringify(["bash-executable", 2, "cat"]));
-  assert.equal(
-    bashTool.approvalSignature?.({ command: "/usr/bin/cat two.txt", workdir: "subdir", timeout_ms: 5_000 }, context),
-    first,
-  );
+  const windows = process.platform === "win32";
+  const shell = windows ? "powershell" : "bash";
+  const executable = "cat";
+  const firstCommand = windows ? "Get-Content one.txt" : "cat one.txt";
+  const secondCommand = windows ? "Get-Content two.txt" : "/usr/bin/cat two.txt";
+  const first = bashTool.approvalSignature?.({ command: firstCommand, workdir: null, timeout_ms: null }, context);
+  const second = bashTool.approvalSignature?.({ command: secondCommand, workdir: "subdir", timeout_ms: 5_000 }, context);
+  if (windows) {
+    assert.match(first ?? "", /"shell-exec",1,"powershell","Get-Content one\.txt"/);
+    assert.notEqual(second, first);
+  } else {
+    assert.equal(first, JSON.stringify(["shell-executable", 1, shell, executable]));
+    assert.equal(second, first);
+  }
   assert.equal(bashApprovalExecutable("VALUE='hello world' cat file"), "cat");
   assert.equal(bashApprovalExecutable("'cat' file"), "cat");
   assert.equal(bashApprovalExecutable("cat file | grep value"), "cat");
@@ -349,19 +432,171 @@ test("Bash approval signatures scope commands by leading executable", (t) => {
   assert.equal(bashApprovalExecutable("FOO+=x cat file"), "cat");
   const ordinaryGit = bashTool.approvalSignature?.({ command: "git status", workdir: null, timeout_ms: null }, context);
   const criticalGit = bashTool.approvalSignature?.({ command: "git push --force origin main", workdir: null, timeout_ms: null }, context);
-  assert.equal(ordinaryGit, criticalGit);
-  assert.match(ordinaryGit ?? "", /"bash-executable",2,"git"/);
+  if (windows) {
+    assert.notEqual(ordinaryGit, criticalGit);
+    assert.match(ordinaryGit ?? "", /"shell-exec",1,"powershell","git status"/);
+  } else {
+    assert.equal(ordinaryGit, criticalGit);
+    assert.match(ordinaryGit ?? "", new RegExp(`"shell-executable",1,"${shell}","git"`));
+  }
 
-  const relative = bashTool.approvalSignature?.({ command: "./task one", workdir: null, timeout_ms: null }, context);
-  const movedRelative = bashTool.approvalSignature?.({ command: "./task two", workdir: "subdir", timeout_ms: null }, context);
-  assert.equal(relative, movedRelative);
-  assert.match(relative ?? "", /"\.\/task"/);
+  const relativeCommand = process.platform === "win32" ? ".\\task one" : "./task one";
+  const movedRelativeCommand = process.platform === "win32" ? ".\\task two" : "./task two";
+  const relative = bashTool.approvalSignature?.({ command: relativeCommand, workdir: null, timeout_ms: null }, context);
+  const movedRelative = bashTool.approvalSignature?.({ command: movedRelativeCommand, workdir: "subdir", timeout_ms: null }, context);
+  if (windows) {
+    assert.notEqual(relative, movedRelative);
+    assert.match(relative ?? "", /"shell-exec",1,"powershell","\.\\task one"/);
+  } else {
+    assert.equal(relative, movedRelative);
+    assert.match(relative ?? "", /"\.\/task"/);
+  }
 
-  const compound = { command: "cd subdir && npm test", workdir: null, timeout_ms: null };
+  const compound = {
+    command: process.platform === "win32" ? "Set-Location subdir; npm test" : "cd subdir && npm test",
+    workdir: null,
+    timeout_ms: null,
+  };
   const scoped = bashTool.approvalSignature?.(compound, context);
-  assert.equal(scoped, JSON.stringify(["bash-executable", 2, "cd"]));
-  assert.equal(bashTool.approvalSignature?.({ ...compound, workdir: "subdir" }, context), scoped);
-  assert.equal(bashTool.approvalSignature?.({ ...compound, timeout_ms: 5_000 }, context), scoped);
+  if (windows) {
+    assert.match(scoped ?? "", /"shell-exec",1,"powershell","Set-Location subdir; npm test"/);
+    assert.notEqual(bashTool.approvalSignature?.({ ...compound, workdir: "subdir" }, context), scoped);
+    assert.notEqual(bashTool.approvalSignature?.({ ...compound, timeout_ms: 5_000 }, context), scoped);
+  } else {
+    assert.equal(scoped, JSON.stringify(["shell-executable", 1, shell, "cd"]));
+    assert.equal(bashTool.approvalSignature?.({ ...compound, workdir: "subdir" }, context), scoped);
+    assert.equal(bashTool.approvalSignature?.({ ...compound, timeout_ms: 5_000 }, context), scoped);
+  }
+});
+
+test("shell selection, Windows safety classification, and environment filtering are platform-aware", () => {
+  assert.equal(shellKind("linux"), "bash");
+  assert.equal(shellKind("win32"), "powershell");
+  assert.deepEqual(shellCommand("linux", "printf ok"), {
+    executable: "/bin/bash",
+    args: ["--noprofile", "--norc", "-c", "printf ok"],
+  });
+  assert.deepEqual(shellCommand("win32", "Write-Output ok"), {
+    executable: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+    args: powershellArguments("Write-Output ok"),
+  });
+  assert.equal(windowsSystemRoot(undefined), "C:\\Windows");
+  assert.equal(windowsSystemRoot("relative\\Windows"), "C:\\Windows");
+  assert.equal(windowsSystemRoot("C:relative\\Windows"), "C:\\Windows");
+  assert.equal(windowsSystemRoot("\\\\server\\share\\Windows"), "C:\\Windows");
+  assert.equal(windowsSystemRoot("\\\\?\\C:\\Windows"), "C:\\Windows");
+  assert.equal(windowsSystemRoot("\\\\.\\C:\\Windows"), "C:\\Windows");
+  assert.equal(windowsSystemRoot("D:/Windows"), "D:\\Windows");
+  assert.equal(powershellExecutable("D:\\Windows"), "D:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+  assert.equal(taskkillExecutable("D:\\Windows"), "D:\\Windows\\System32\\taskkill.exe");
+  assert.deepEqual(powershellArguments("Write-Output café"), [
+    "-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+    "$OutputEncoding = [System.Text.UTF8Encoding]::new($false); [Console]::OutputEncoding = $OutputEncoding; Write-Output café",
+  ]);
+  assert.match(shellDefinition("win32").description, /PowerShell/);
+
+  for (const command of [
+    "Remove-Item -Recurse target",
+    "& 'Remove-Item' -Recurse target",
+    "del target",
+    "Stop-Service sshd",
+    "Restart-Service sshd",
+    "Stop-Process -Name node",
+    "taskkill.exe /PID 42 /T /F",
+    "shutdown /s /t 0",
+    "& \"shutdown.exe\" /s /t 0",
+    "format.exe E:",
+    "diskpart /s wipe.txt",
+    "Set-Acl target $acl",
+    "takeown.exe /f target",
+    "icacls target /grant everyone:F",
+    "netsh advfirewall set allprofiles state off",
+    "New-NetIPAddress -InterfaceAlias Ethernet -IPAddress 192.0.2.1",
+    "cmd.exe /c Remove-Item target",
+    "powershell.exe -NoProfile -Command Remove-Item target",
+    "pwsh -EncodedCommand ZABlAGwA",
+    "[Diagnostics.Process]::Start('cmd.exe')",
+    "[System.Diagnostics.Process]::Start('cmd.exe')",
+    "sc.exe delete ExampleService",
+    "reg delete HKLM\\Software\\Example /f",
+    "Set-ItemProperty -Path HKLM:\\Software\\Example -Name Enabled -Value 0",
+    "bcdedit.exe /deletevalue {current} safeboot",
+    "Remove-LocalUser test-user",
+    "Add-LocalGroupMember Administrators test-user",
+    "net localgroup Administrators test-user /delete",
+  ]) assert.equal(powershellCommandRisk(command), "critical", command);
+  assert.equal(powershellCommandRisk("Get-Service sshd"), "shell");
+  for (const command of [
+    "Write-Output value > C:\\Windows\\System32\\drivers\\etc\\hosts",
+    "Write-Output value >> \"$env:SystemRoot\\System32\\drivers\\etc\\hosts\"",
+    "[System.IO.File]::WriteAllText('C:\\Windows\\System32\\drivers\\etc\\hosts', 'value')",
+    "[System.IO.File]::AppendAllText($env:SystemRoot + '\\System32\\drivers\\etc\\hosts', 'value')",
+    "[System.IO.File]::Delete('target.txt')",
+    "File.Delete('target.txt')",
+  ]) assert.equal(powershellCommandRisk(command), "critical", command);
+  for (const command of [
+    "Write-Output value > output.txt",
+    "[System.IO.File]::WriteAllText('output.txt', 'value')",
+  ]) assert.equal(powershellCommandRisk(command), "shell", command);
+  for (const command of [
+    "Invoke-Expression $command",
+    "iex $command",
+    "& $command",
+    "Start-Process $command",
+    "Set-Content C:\\Windows\\System32\\drivers\\etc\\hosts value",
+    "Set-Content output.txt value -Force",
+    "Clear-Content output.txt",
+    "Move-Item input.txt output.txt -Force",
+  ]) assert.equal(powershellCommandRisk(command), "critical", command);
+  assert.equal(powershellCommandRisk("Set-Content output.txt value"), "shell");
+  assert.equal(powershellCommandRisk("Copy-Item input.txt backup.txt"), "shell");
+  assert.equal(powershellApprovalExecutable("Get-Content file.txt"), null);
+  assert.equal(powershellApprovalExecutable("& Get-Content file.txt"), null);
+  for (const command of [
+    "Invoke-Expression $command",
+    "iex $command",
+    "Start-Process $command",
+    "& $command",
+    "& (Get-Command $command)",
+    "{ Get-Content file.txt }",
+    "if ($true) { Get-Content file.txt }",
+    "function Invoke-Something { Get-Content file.txt }",
+    "foreach ($item in $items) { Get-Content $item }",
+    "while ($true) { Get-Content file.txt }",
+    "for ($i = 0; $i -lt 1; $i++) { Get-Content file.txt }",
+    "switch ($value) { default { Get-Content file.txt } }",
+    "try { Get-Content file.txt } catch { }",
+    ". .\\script.ps1",
+  ]) assert.equal(powershellApprovalExecutable(command), null, command);
+  assert.equal(bashCommandRisk("rm -rf target"), "critical");
+
+  const windowsEnv = shellEnvironment({
+    path: "C:\\Windows",
+    Mixed_Api_Key: "secret",
+    pSmOdUlEpAtH: "injected",
+    PSExecutionPolicyPreference: "Bypass",
+    PROFILE: "profile.ps1",
+    Bash_Env: "injected.sh",
+    SAFE: "yes",
+  }, ["MIXED_API_KEY"], "win32");
+  assert.equal(windowsEnv.Mixed_Api_Key, undefined);
+  assert.equal(windowsEnv.pSmOdUlEpAtH, undefined);
+  assert.equal(windowsEnv.PSExecutionPolicyPreference, undefined);
+  assert.equal(windowsEnv.PROFILE, undefined);
+  assert.equal(windowsEnv.Bash_Env, undefined);
+  assert.equal(windowsEnv.SAFE, "yes");
+  const duplicateWindowsEnv = shellEnvironment({
+    ENV: "one",
+    env: "two",
+    PSModulePath: "one",
+    pSmOdUlEpAtH: "two",
+    SAFE: "yes",
+  }, [], "win32");
+  assert.equal(duplicateWindowsEnv.ENV, undefined);
+  assert.equal(duplicateWindowsEnv.env, undefined);
+  assert.equal(duplicateWindowsEnv.PSModulePath, undefined);
+  assert.equal(duplicateWindowsEnv.pSmOdUlEpAtH, undefined);
+  assert.equal(duplicateWindowsEnv.SAFE, "yes");
 });
 
 test("default code mode asks before every shell command", async (t) => {
@@ -387,7 +622,7 @@ test("always approval remembers Bash executables for main and automated work", a
   context.approvalMode = "review";
   const registry = new ToolRegistry().register(bashTool);
   const args = registry.parseArguments("bash", JSON.stringify({
-    command: "printf remembered",
+    command: outputCommand("remembered"),
     workdir: null,
     timeout_ms: null,
   }));
@@ -400,7 +635,11 @@ test("always approval remembers Bash executables for main and automated work", a
   assert.match((await registry.execute("bash", args, context)).output, /remembered/);
   assert.equal(requests.length, 1);
   assert.equal(requests[0]?.canAlwaysApprove, true);
-  assert.match(requests[0]?.details ?? "", /All Bash commands starting with 'printf'/);
+  if (process.platform === "win32") {
+    assert.ok((requests[0]?.details ?? "").includes("Only this exact PowerShell command"));
+  } else {
+    assert.ok((requests[0]?.details ?? "").includes("All Bash commands starting with 'printf'"));
+  }
   assert.equal(context.sessions.listCommandApprovals(context.sessionId).length, 1);
 
   context.approve = async () => {
@@ -424,7 +663,7 @@ test("always approval remembers Bash executables for main and automated work", a
     return "always";
   };
   const aborted = registry.parseArguments("bash", JSON.stringify({
-    command: "uname",
+    command: process.platform === "win32" ? "Get-Location" : "uname",
     workdir: null,
     timeout_ms: null,
   }));
@@ -439,34 +678,46 @@ test("always approval remembers Bash executables for main and automated work", a
     return "deny";
   };
   const changedTimeout = registry.parseArguments("bash", JSON.stringify({
-    command: "printf another-value",
+    command: outputCommand("another-value"),
     workdir: null,
     timeout_ms: 5_000,
   }));
-  assert.match((await registry.execute("bash", changedTimeout, context)).output, /another-value/);
+  if (process.platform === "win32") {
+    await assert.rejects(registry.execute("bash", changedTimeout, context), /denied/);
+  } else {
+    assert.match((await registry.execute("bash", changedTimeout, context)).output, /another-value/);
+  }
   mkdirSync(join(workspace, "subdir"));
   const changedWorkdir = registry.parseArguments("bash", JSON.stringify({
-    command: "printf from-subdir",
+    command: outputCommand("from-subdir"),
     workdir: "subdir",
     timeout_ms: null,
   }));
-  assert.match((await registry.execute("bash", changedWorkdir, context)).output, /from-subdir/);
+  if (process.platform === "win32") {
+    await assert.rejects(registry.execute("bash", changedWorkdir, context), /denied/);
+  } else {
+    assert.match((await registry.execute("bash", changedWorkdir, context)).output, /from-subdir/);
+  }
   const compound = registry.parseArguments("bash", JSON.stringify({
-    command: "printf compound > compound.txt && true",
+    command: compoundWriteCommand("compound.txt", "compound"),
     workdir: "subdir",
     timeout_ms: 5_000,
   }));
-  assert.match((await registry.execute("bash", compound, context)).output, /exit: 0/);
-  assert.equal(readFileSync(join(workspace, "subdir", "compound.txt"), "utf8"), "compound");
-  assert.equal(changedPrompts, 0);
+  if (process.platform === "win32") {
+    await assert.rejects(registry.execute("bash", compound, context), /denied/);
+  } else {
+    assert.match((await registry.execute("bash", compound, context)).output, /exit: 0/);
+    assert.equal(readFileSync(join(workspace, "subdir", "compound.txt"), "utf8"), "compound");
+  }
+  assert.equal(changedPrompts, process.platform === "win32" ? 3 : 0);
 
   const otherExecutable = registry.parseArguments("bash", JSON.stringify({
-    command: "pwd",
+    command: process.platform === "win32" ? "Get-Location" : "pwd",
     workdir: null,
     timeout_ms: null,
   }));
   await assert.rejects(registry.execute("bash", otherExecutable, context), /denied/);
-  assert.equal(changedPrompts, 1);
+  assert.equal(changedPrompts, process.platform === "win32" ? 4 : 1);
 
   const other = context.sessions.create({
     workspace,
@@ -477,7 +728,7 @@ test("always approval remembers Bash executables for main and automated work", a
   });
   context.sessionId = other.id;
   await assert.rejects(registry.execute("bash", args, context), /denied/);
-  assert.equal(changedPrompts, 2);
+  assert.equal(changedPrompts, process.platform === "win32" ? 5 : 2);
 
   context.sessionId = context.sessions.list(workspace).find((session) => session.id !== other.id)!.id;
   context.approvalMode = "unrestricted";
@@ -485,7 +736,7 @@ test("always approval remembers Bash executables for main and automated work", a
     throw new Error("unrestricted critical command prompted");
   };
   const critical = registry.parseArguments("bash", JSON.stringify({
-    command: "rm -rf disposable",
+    command: removeDirectoryCommand("disposable"),
     workdir: null,
     timeout_ms: null,
   }));
@@ -670,6 +921,11 @@ test("unrestricted schedule actions never prompt for destructive commands", asyn
     throw new Error("unrestricted schedule action requested approval");
   };
   const store = new SchedulerStore(db);
+  const scheduledCommand = process.platform === "win32" ? "& 'Remove-Item' -Recurse data" : "rm -rf data";
+  assert.equal(
+    createScheduleTools(store)[0]?.classifyRisk?.({ kind: "command", command: scheduledCommand }, context),
+    "critical",
+  );
   const registry = new ToolRegistry();
   for (const tool of createScheduleTools(store)) registry.register(tool);
   const input = (command: string) => registry.parseArguments("schedule_create", JSON.stringify({

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { chmodSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { shouldEnforcePosixPermissions } from "../paths.js";
 import type { GlassDatabase } from "./database.js";
 
 export interface ArtifactRecord {
@@ -26,14 +27,16 @@ export class ArtifactStore {
   constructor(
     private readonly db: GlassDatabase,
     private readonly directory: string,
+    private readonly platform: NodeJS.Platform = process.platform,
   ) {}
 
   save(sessionId: string | null, kind: string, content: string | Buffer, metadata: Record<string, unknown> = {}): ArtifactRecord {
     const id = randomUUID();
     const path = join(this.directory, id);
     const data = typeof content === "string" ? Buffer.from(content) : content;
-    writeFileSync(path, data, { mode: 0o600, flag: "wx" });
-    chmodSync(path, 0o600);
+    const enforcePermissions = shouldEnforcePosixPermissions(this.platform);
+    writeFileSync(path, data, { flag: "wx", ...(enforcePermissions ? { mode: 0o600 } : {}) });
+    if (enforcePermissions) chmodSync(path, 0o600);
     const createdAt = Date.now();
     this.db.prepare(`
       INSERT INTO artifacts(id, session_id, kind, file_path, byte_count, metadata_json, created_at)

@@ -1,5 +1,6 @@
 import type { ToolRisk } from "./types.js";
-import { resolve } from "node:path";
+import type { ShellKind } from "./shell.js";
+import { posix as posixPath } from "node:path";
 
 const SHELL_ACCESS_PATH = String.raw`(?:(?:~|\$(?:HOME|\{HOME\})|\/root|\/home\/[^\/\s]+|\.)?\/?\.ssh(?:\/\S*)?|\/?etc\/(?:ssh|sudoers(?:\.d)?|pam\.d|network|netplan|NetworkManager\/system-connections)(?:\/\S*)?|\/?etc\/(?:passwd|shadow|group|gshadow))`;
 
@@ -55,6 +56,48 @@ const CRITICAL_SHELL_PATTERNS: RegExp[] = [
   new RegExp(String.raw`(^|[;&|()\s])(?:cp|mv|install)\b[^\n;&|]*(?:--target-directory(?:=|\s+)|-t\s+)["']?${SHELL_ACCESS_PATH}`, "i"),
 ];
 
+// Native PowerShell cmdlets and common Windows command aliases. Keep these
+// separate from the Bash patterns so Windows coverage cannot weaken POSIX
+// classification.
+const CRITICAL_POWERSHELL_PATTERNS: RegExp[] = [
+  // Wrappers and dynamic launchers can execute a different command from the
+  // visible leading token. Keep this lexical classification conservative; it
+  // is not intended to replace PowerShell parsing.
+  /(^|[\s;&|()])cmd(?:\.exe)?\s+\/c(?:\s|$)/i,
+  /(^|[\s;&|()])(?:powershell|pwsh)(?:\.exe)?\b/i,
+  /(^|[\s;&|()])(?:-|\/)EncodedCommand(?:\s|$)/i,
+  /\b(?:Process\s*\.\s*Start|(?:System\.)?Diagnostics\.Process\s*\]?\s*::\s*Start)\b/i,
+  /(^|[\s;&|()])(?:Invoke-Expression|Invoke-Command|iex)\b/i,
+  /(^|[\s;&|()])Start-Process\b/i,
+  /(^|[\s;&|()])&\s*(?:[$({]|(?:"[^"]*(?:[$`]\(|[$`])|\S*[$`]))/i,
+  /(^|[\s;&|()])(?:Remove-Item|del|erase|rmdir|rd|rm|ri)(?:\.exe)?\b/i,
+  /(^|[\s;&|()])(?:Stop|Restart)-Service\b/i,
+  /(^|[\s;&|()])(?:Remove|Set|New)-Service\b/i,
+  /(^|[\s;&|()])sc(?:\.exe)?\s+(?:delete|stop|config|failure|failureflag)\b/i,
+  /(^|[\s;&|()])(?:Stop-Process|taskkill|kill)(?:\.exe)?\b/i,
+  /(^|[\s;&|()])shutdown(?:\.exe)?\b/i,
+  /(^|[\s;&|()])(?:format|diskpart)(?:\.exe|\.com)?\b/i,
+  /(^|[\s;&|()])(?:Set-Acl|takeown|icacls)(?:\.exe)?\b/i,
+  /(^|[\s;&|()])(?:Clear-RecycleBin|(?:New|Remove|Set)-(?:SmbShare|ScheduledTask))\b/i,
+  /(^|[\s;&|()])(?:New|Remove|Set|Disable|Enable|Restart)-Net(?:Firewall(?:Rule|Profile)?|Adapter|IPAddress|IPInterface|Route|Nat)\b/i,
+  /(^|[\s;&|()])Set-DnsClientServerAddress\b/i,
+  /(^|[\s;&|()])reg(?:\.exe)?\s+delete\b/i,
+  /(^|[\s;&|()])(?:New|Remove|Set)-Item(?:Property)?\b[^\n;&|]*(?:Registry::|(?:HKLM|HKCU|HKCR|HKU|HKCC):|HKEY_(?:LOCAL_MACHINE|CURRENT_USER|CLASSES_ROOT|USERS|CURRENT_CONFIG))/i,
+  /(^|[\s;&|()])bcdedit(?:\.exe)?\s+\/(?:delete(?:value)?|set|remove|timeout|bootsequence|default)\b/i,
+  /(^|[\s;&|()])(?:New|Remove|Set|Rename|Disable|Enable)-(?:LocalUser|LocalGroup)(?:Member)?\b/i,
+  /(^|[\s;&|()])(?:Add|Remove)-(?:LocalGroupMember)\b/i,
+  /(^|[\s;&|()])net(?:\.exe)?\s+(?:user|localgroup)\b/i,
+  /(^|[\s;&|()])netsh(?:\.exe)?\b[^\n;&|]*(?:firewall|advfirewall|interface|ipsec|winsock|portproxy)\b/i,
+  /(^|[\s;&|()])(?:route|netsh)(?:\.exe)?\b[^\n;&|]*(?:\b(?:add|change|delete|del|remove|set|reset|flush)\b)/i,
+];
+
+const POWERSHELL_SENSITIVE_DESTINATION = /(?:\$\{?env:(?:SystemRoot|WinDir|ProgramData|ProgramFiles(?:X86)?)\b\}?|(?:^|[\\/])(?:Windows|ProgramData|Program Files(?: \(x86\))?)(?:[\\/]|$)|(?:^|[\\/])(?:\.ssh|authorized_keys|hosts|SAM|SECURITY|SYSTEM)(?:[\\/]|$))/i;
+const POWERSHELL_MUTATING_FILE_CMDLET = /(^|[\s;&|()])(?:Set-Content|Add-Content|Out-File|Clear-Content|(?:Move|Copy|Rename)-Item)\b/i;
+const POWERSHELL_DESTRUCTIVE_FILE_OPERATION = /(^|[\s;&|()])(?:Clear-Content\b|(?:(?:Set|Add)-Content|Out-File|(?:Move|Copy|Rename)-Item)\b[^\n;&|]*(?:-Force\b|-Recurse\b|-Confirm\s*:\s*\$(?:false|0)\b))/i;
+const POWERSHELL_SENSITIVE_REDIRECTION = /(?:^|[\s;&|()])(?:\d+|\*)?>{1,2}\s*(?:"([^"]*)"|'([^']*)'|([^\s;&|()]+))/g;
+const POWERSHELL_DOTNET_FILE_WRITE = /\[(?:System\.)?IO\.File\]::(?:WriteAll(?:Text|Lines|Bytes)|AppendAll(?:Text|Lines)|Create(?:Text)?|Open(?:Write)?)(?:Async)?\s*\(\s*(?:"([^"]*)"|'([^']*)'|([^,\s)]+))/gi;
+const POWERSHELL_DOTNET_FILE_DELETE = /\b(?:System\.)?IO\.File\]?\s*::\s*Delete\b|\b(?:System\.)?IO\.File\s*\.\s*Delete\b|\bFile\s*\.\s*Delete\b/i;
+
 const ACCESS_LOCKOUT_PATCH_PATH = /(?:^|\/)(?:\.ssh|authorized_keys|etc\/(?:ssh|sudoers(?:\.d)?|pam\.d|network|netplan|NetworkManager\/system-connections))(?:\/|$)/i;
 
 const NON_EXECUTABLE_SHELL_WORDS = new Set([
@@ -70,6 +113,32 @@ function normalizedShellText(command: string): string {
     .replace(/(^|[;&|()\s])\/(?:usr\/)?s?bin\/(?=[\w.-])/g, "$1");
 }
 
+function normalizedPowerShellText(command: string): string {
+  // A quoted command name is still executable when invoked through `&`. Turn
+  // only literal names into the form covered by the native command patterns;
+  // interpolated names remain dynamic and retain their critical classification.
+  return command.replace(/(^|[\s;&|()])&\s*(["'])([^"'`$]+)\2/g, (_match, boundary: string, _quote: string, executable: string) => {
+    const basename = executable.replace(/^.*[\\/]/, "");
+    return `${boundary}${basename}`;
+  });
+}
+
+function hasSensitivePowerShellRedirection(command: string): boolean {
+  for (const match of command.matchAll(POWERSHELL_SENSITIVE_REDIRECTION)) {
+    const destination = match[1] ?? match[2] ?? match[3] ?? "";
+    if (POWERSHELL_SENSITIVE_DESTINATION.test(destination)) return true;
+  }
+  return false;
+}
+
+function hasSensitiveDotNetFileWrite(command: string): boolean {
+  for (const match of command.matchAll(POWERSHELL_DOTNET_FILE_WRITE)) {
+    const destination = match[1] ?? match[2] ?? match[3] ?? "";
+    if (POWERSHELL_SENSITIVE_DESTINATION.test(destination)) return true;
+  }
+  return false;
+}
+
 export function bashCommandRisk(command: string): ToolRisk {
   const normalized = normalizedShellText(command);
   return CRITICAL_SHELL_PATTERNS.some((pattern) => pattern.test(normalized)) ? "critical" : "shell";
@@ -77,6 +146,27 @@ export function bashCommandRisk(command: string): ToolRisk {
 
 export function bashExecutionRisk(command: string): ToolRisk {
   return bashCommandRisk(command);
+}
+
+export function powershellCommandRisk(command: string): ToolRisk {
+  const normalized = normalizedPowerShellText(command);
+  if (CRITICAL_POWERSHELL_PATTERNS.some((pattern) => pattern.test(normalized))) return "critical";
+  if (hasSensitivePowerShellRedirection(normalized)
+    || hasSensitiveDotNetFileWrite(normalized)
+    || POWERSHELL_DOTNET_FILE_DELETE.test(normalized)) return "critical";
+  if (POWERSHELL_MUTATING_FILE_CMDLET.test(normalized)
+    && (POWERSHELL_SENSITIVE_DESTINATION.test(normalized) || POWERSHELL_DESTRUCTIVE_FILE_OPERATION.test(normalized))) {
+    return "critical";
+  }
+  return "shell";
+}
+
+export function powershellExecutionRisk(command: string): ToolRisk {
+  return powershellCommandRisk(command);
+}
+
+export function shellCommandRisk(command: string, kind: ShellKind): ToolRisk {
+  return kind === "powershell" ? powershellCommandRisk(command) : bashCommandRisk(command);
 }
 
 export function bashApprovalExecutable(command: string): string | null {
@@ -159,7 +249,7 @@ export function bashApprovalExecutable(command: string): string | null {
 }
 
 export function isSensitiveMutationPath(path: string): boolean {
-  const normalized = resolve("/", path.replaceAll("\\", "/")).slice(1);
+  const normalized = posixPath.resolve("/", path.replaceAll("\\", "/")).slice(1);
   if (ACCESS_LOCKOUT_PATCH_PATH.test(normalized)) return true;
   return /(?:^|\/)etc\/(?:passwd|shadow|group|gshadow)$/.test(normalized);
 }
@@ -183,14 +273,45 @@ export function workspacePatchRisk(workspace: string, patch: string): ToolRisk {
 export function shellEnvironment(
   base: NodeJS.ProcessEnv = process.env,
   excludedKeys: Iterable<string> = [],
+  platform: NodeJS.Platform = process.platform,
 ): NodeJS.ProcessEnv {
   const env = { ...base };
+  const windows = platform === "win32";
   for (const key of Object.keys(env)) {
-    if (key.startsWith("BASH_FUNC_")) delete env[key];
+    if (windows ? key.toLowerCase().startsWith("bash_func_") : key.startsWith("BASH_FUNC_")) delete env[key];
   }
   for (const key of ["BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS", "CDPATH", "GLOBIGNORE", "PROMPT_COMMAND", "RIPGREP_CONFIG_PATH"]) {
-    delete env[key];
+    if (windows) {
+      for (const candidate of Object.keys(env)) {
+        if (candidate.toLowerCase() === key.toLowerCase()) delete env[candidate];
+      }
+    } else {
+      delete env[key];
+    }
   }
-  for (const key of excludedKeys) delete env[key];
+  if (windows) {
+    // -NoProfile prevents profile scripts, while these environment values can
+    // still affect module loading, execution policy, or profile discovery.
+    for (const key of [
+      "PSModulePath",
+      "PSExecutionPolicyPreference",
+      "__PSLockDownPolicy",
+      "PROFILE",
+      "PSProfile",
+      "PowerShellProfile",
+      "POWERSHELL_PROFILE",
+      "POWERSHELL_PROFILE_PATH",
+    ]) {
+      for (const candidate of Object.keys(env)) {
+        if (candidate.toLowerCase() === key.toLowerCase()) delete env[candidate];
+      }
+    }
+  }
+  const excluded = windows
+    ? new Set([...excludedKeys].map((key) => key.toLowerCase()))
+    : new Set(excludedKeys);
+  for (const key of Object.keys(env)) {
+    if (excluded.has(windows ? key.toLowerCase() : key)) delete env[key];
+  }
   return env;
 }

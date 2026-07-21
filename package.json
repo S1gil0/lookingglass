@@ -1,6 +1,6 @@
 {
   "name": "@sigil0/looking-glass",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A lean local coding harness for OpenAI-compatible gateways and LM Studio",
   "license": "MIT",
   "repository": {
@@ -19,11 +19,12 @@
     "glass": "dist/cli.js"
   },
   "files": [
-    "dist"
+    "dist",
+    "looking-glass-title.svg"
   ],
   "scripts": {
     "clean": "node --input-type=module -e \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true })\"",
-    "build": "npm run clean && tsc -p tsconfig.build.json && chmod +x dist/cli.js",
+    "build": "npm run clean && tsc -p tsconfig.build.json && node -e \"if (process.platform !== 'win32') require('node:fs').chmodSync('dist/cli.js', 0o755)\"",
     "dev": "tsx src/cli.ts",
     "start": "node dist/cli.js",
     "prepublishOnly": "npm run build",
@@ -31,10 +32,11 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=22.19.0"
   },
   "os": [
-    "linux"
+    "linux",
+    "win32"
   ],
   "dependencies": {
     "@earendil-works/pi-tui": "0.80.10",

@@ -1,7 +1,8 @@
 import type { GlassTool } from "./types.js";
 import { resolveWorkspacePath } from "./paths.js";
 import { runProcess } from "./process.js";
-import { bashApprovalExecutable, bashExecutionRisk, shellEnvironment } from "./safety.js";
+import { bashApprovalExecutable, bashExecutionRisk, shellCommandRisk, shellEnvironment } from "./safety.js";
+import { shellDefinition, shellKind } from "./shell.js";
 import { configuredCredentialValues, credentialEnvironmentNames, redactSensitiveText } from "../security.js";
 
 interface BashArgs {
@@ -12,7 +13,40 @@ interface BashArgs {
 
 function exactApprovalSignature(args: BashArgs, context: Parameters<NonNullable<GlassTool<BashArgs>["execute"]>>[1]): string {
   const { cwd, timeoutMs } = prepareExecution(args, context);
-  return JSON.stringify(["bash-exec", 3, args.command, cwd, timeoutMs]);
+  return JSON.stringify(["shell-exec", 1, shellKind(), args.command, cwd, timeoutMs]);
+}
+
+/** PowerShell approvals are intentionally never reduced to a leading token. */
+export function powershellApprovalExecutable(_command: string): string | null {
+  return null;
+}
+
+function shellApprovalExecutable(command: string): string | null {
+  // PowerShell commands are never scoped by their leading token: wrappers,
+  // aliases, and suffixes can change what actually executes. Bash retains its
+  // established executable-scoped approval behavior.
+  return shellKind() === "powershell" ? null : bashApprovalExecutable(command);
+}
+
+function legacyBashSignatures(
+  args: BashArgs,
+  context: Parameters<NonNullable<GlassTool<BashArgs>["execute"]>>[1],
+): string[] {
+  const { cwd, timeoutMs } = prepareExecution(args, context);
+  const executable = bashApprovalExecutable(args.command);
+  return [
+    JSON.stringify(["bash-exec", 3, args.command, cwd, timeoutMs]),
+    ...(executable ? [
+      JSON.stringify(["bash-executable", 2, executable]),
+      JSON.stringify([
+        "bash-executable",
+        1,
+        bashExecutionRisk(args.command),
+        executable,
+        ...(!executable.startsWith("/") && executable.includes("/") ? [cwd] : []),
+      ]),
+    ] : []),
+  ];
 }
 
 function prepareExecution(args: BashArgs, context: Parameters<NonNullable<GlassTool<BashArgs>["execute"]>>[1]): {
@@ -27,35 +61,27 @@ function prepareExecution(args: BashArgs, context: Parameters<NonNullable<GlassT
 
 export const bashTool: GlassTool<BashArgs> = {
   name: "bash",
-  description: "Run one noninteractive Bash command in the workspace. Do not start background jobs or commands requiring a TTY.",
+  description: shellDefinition().description,
   risk: "shell",
-  classifyRisk: (args) => bashExecutionRisk(args.command),
+  classifyRisk: (args) => shellCommandRisk(args.command, shellKind()),
   approvalSignature: (args, context) => {
     prepareExecution(args, context);
-    const executable = bashApprovalExecutable(args.command);
+    const executable = shellApprovalExecutable(args.command);
     return executable
-      ? JSON.stringify(["bash-executable", 2, executable])
+      ? JSON.stringify(["shell-executable", 1, shellKind(), executable])
       : exactApprovalSignature(args, context);
   },
   legacyApprovalSignatures: (args, context) => {
-    const { cwd } = prepareExecution(args, context);
-    const executable = bashApprovalExecutable(args.command);
-    return [
-      exactApprovalSignature(args, context),
-      ...(executable ? [JSON.stringify([
-        "bash-executable",
-        1,
-        bashExecutionRisk(args.command),
-        executable,
-        ...(!executable.startsWith("/") && executable.includes("/") ? [cwd] : []),
-      ])] : []),
-    ];
+    // Old signatures predate the shell kind and are only safe on POSIX, where
+    // this tool still launches Bash. Never let them authorize PowerShell.
+    return shellKind() === "bash" ? legacyBashSignatures(args, context) : [];
   },
   approvalDescription: (args) => {
-    const executable = bashApprovalExecutable(args.command);
+    const shell = shellDefinition();
+    const executable = shellApprovalExecutable(args.command);
     return executable
-      ? `All Bash commands starting with '${executable}' in this session, regardless of arguments, risk, working directory, timeout, redirects, or compound suffix. This includes main turns, agents, and scheduled turns.`
-      : "Only this exact dynamic Bash command, working directory, and timeout in this session.";
+      ? `All ${shell.kind === "bash" ? "Bash" : "PowerShell"} commands starting with '${executable}' in this session, regardless of arguments, risk, working directory, timeout, redirects, or compound suffix. This includes main turns, agents, and scheduled turns.`
+      : `Only this exact ${shell.kind === "bash" ? "Bash" : "PowerShell"} command, working directory, and timeout in this session.`;
   },
   parameters: {
     type: "object",
@@ -70,9 +96,10 @@ export const bashTool: GlassTool<BashArgs> = {
   summarize: (args) => `Run: ${args.command.slice(0, 160)}`,
   async execute(args, context) {
     const { cwd, timeoutMs } = prepareExecution(args, context);
+    const shell = shellDefinition();
     const captureBytes = Math.max(context.config.tools.maxOutputBytes * 8, 512 * 1024);
     const secrets = configuredCredentialValues(context.config);
-    const result = await runProcess("/bin/bash", ["--noprofile", "--norc", "-c", args.command], {
+    const result = await runProcess(shell.executable, shell.args(args.command), {
       cwd,
       env: shellEnvironment(process.env, credentialEnvironmentNames(context.config)),
       timeoutMs,
