@@ -50,7 +50,7 @@ export function largeOutputCommand(character: string, count: number): string {
 export function removeDirectoryCommand(path: string): string {
   return shellCommand(
     `rm -rf ${posixLiteral(path)}`,
-    `Remove-Item -LiteralPath ${powershellLiteral(path)} -Recurse -Force`,
+    `if (Test-Path -LiteralPath ${powershellLiteral(path)}) { Remove-Item -LiteralPath ${powershellLiteral(path)} -Recurse -Force }`,
   );
 }
 
