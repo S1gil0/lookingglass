@@ -2,35 +2,40 @@
 
 ![Looking Glass title graphic](./looking-glass-title.svg)
 
-Looking Glass is a local AI coding CLI that turns a terminal workspace into a durable, context-aware working session. It connects to an OpenAI-compatible gateway such as LM Studio, gives the model workspace tools, stores the conversation and tool history in SQLite, and can wake the same session later to continue a task automatically.
+Looking Glass is an open-source local AI coding CLI for persistent, automatable sessions. It combines interactive terminal chat and one-shot prompts with workspace tools, configurable OpenAI-compatible gateways, durable SQLite state, and a scheduler for future model turns.
 
-The important idea is **a session is more than a chat window**. A session remembers:
+## Persistent Sessions and Scheduled Turns
 
-- The conversation, tool calls, response continuity, and compaction checkpoints.
-- The workspace where the work happened.
-- The selected provider, model, reasoning effort, permissions, agent settings, and persistence state.
-- Schedules attached to that session.
-- Durable tool output artifacts and scheduler inbox records.
+The key idea is **a session is more than a chat window**. A persistent session can survive after the terminal closes. The scheduler can later reopen the original workspace and trigger another AI turn inside that same session, retaining its:
 
-That makes it possible to start a task in the morning, schedule the session to inspect the result in the afternoon, and have the next model turn resume with the same context and files instead of starting from a blank prompt.
+- Conversation, tool history, response continuity, and compaction checkpoints.
+- Workspace, provider, primary model, reasoning settings, and persistence state.
+- Approval mode, remembered approvals, worker-agent configuration, and schedules.
+- Scheduler results, inbox records, and durable tool-output artifacts.
+
+Scheduled prompts are not separate stateless jobs or fresh chats. Future turns can inspect files and logs that changed in the meantime, run tests or other commands, modify code, and write their results back into the session. This enables workflows such as:
+
+- Start a deployment or long-running task, then schedule the same session to check the result.
+- Follow up on test output and fix failures automatically.
+- Run recurring project reviews that read the current codebase, execute tests, and report or resolve issues.
+- Continue debugging after external processes produce new logs or artifacts.
+- Keep a session working through scheduled turns while the interactive terminal is closed.
+- Combine exact scheduled shell commands with context-aware AI follow-ups.
+
+The main model and worker-agent model are configured independently, including separate reasoning levels. A stronger model can coordinate the task while faster or cheaper models handle parallel discovery, implementation, or review work.
+
+## What It Provides
+
+- **Interactive TUI and one-shot CLI prompts** for complete day-to-day development work.
+- **Workspace tools** for reading, searching, patching, and bounded Bash execution.
+- **Persistent approval modes** for interactive and automated turns, including remembered approvals.
+- **Scheduled AI prompts, reminders, and deterministic shell commands.**
+- **Concurrent worker agents** with independently selected models and reasoning settings.
+- **OpenAI-compatible local or hosted gateways**, including LM Studio and codex-lb.
+- **SQLite-backed sessions, scheduler state, and artifacts** with context recovery and compaction.
+- **A user-level systemd scheduler** that runs independently of the interactive terminal.
 
 Looking Glass is designed for one local operator. It is not a hosted service, multi-user system, or replacement for operating-system isolation.
-
-## Why Use It
-
-Looking Glass combines a coding assistant, durable project memory, and a local automation loop:
-
-- **Interactive terminal chat** with scrollback, copy selection, approvals, and live tool progress.
-- **One-shot CLI prompts** for scripts, quick questions, CI-adjacent tasks, and shell pipelines.
-- **Durable sessions** that preserve context across restarts and explicit resumes.
-- **Workspace-aware tools** for reading, searching, patching, and running bounded Bash commands.
-- **Scheduled session prompts** that run a future AI turn in an existing persistent session.
-- **Deterministic schedules** for reminders and exact shell commands.
-- **Concurrent agents** for independent discovery, implementation, and review tasks.
-- **Context recovery and compaction** when a provider loses response continuity or the context grows large.
-- **SQLite-backed state and artifacts** instead of ephemeral terminal-only history.
-- **Provider selection** across configured OpenAI-compatible gateways.
-- **Approval modes** that let you choose review, coding, or fully noninteractive unrestricted operation.
 
 ## Requirements
 
@@ -59,7 +64,7 @@ The package is Linux-only for now. Windows users can run it through WSL2.
 
 ## Install From Source
 
-The package is not published to npm. Install it from the public source repository:
+For development or to work from the source tree, clone the public repository:
 
 ```bash
 git clone https://github.com/S1gil0/lookingglass.git
