@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 2000 600" role="img" aria-labelledby="title desc">
+  <title id="title">Looking Glass</title>
+  <desc id="desc">Looking Glass — Persistent AI Automation</desc>
+  <defs>
+    <linearGradient id="edge" x1="40" y1="60" x2="500" y2="540" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#20DFFF"/>
+      <stop offset="0.52" stop-color="#5792FF"/>
+      <stop offset="1" stop-color="#A33BFF"/>
+    </linearGradient>
+    <linearGradient id="panel" x1="120" y1="100" x2="430" y2="500" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0A225B"/>
+      <stop offset="1" stop-color="#030C2D"/>
+    </linearGradient>
+    <linearGradient id="subtitle" x1="570" y1="0" x2="1870" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#21CFF4"/>
+      <stop offset="0.52" stop-color="#5592FF"/>
+      <stop offset="1" stop-color="#9D46F5"/>
+    </linearGradient>
+    <linearGradient id="titleDark" x1="570" y1="0" x2="1830" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="0.55" stop-color="#DCEBFF"/>
+      <stop offset="1" stop-color="#CBBEFF"/>
+    </linearGradient>
+  </defs>
+
+  <!-- No background rectangle: the canvas is genuinely transparent. -->
+
+  <g>
+    <path d="M270 45 L492 173 L492 427 L270 555 L48 427 L48 173 Z"
+          fill="url(#panel)" stroke="url(#edge)" stroke-width="22" stroke-linejoin="round"/>
+    <path d="M270 88 L454 194 L454 406 L270 512 L86 406 L86 194 Z"
+          fill="none" stroke="url(#edge)" stroke-width="5" stroke-linejoin="round"/>
+    <path d="M184 214 L292 300 L184 386"
+          fill="none" stroke="#FFFFFF" stroke-width="42"
+          stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M314 386 H396"
+          fill="none" stroke="#FFFFFF" stroke-width="38" stroke-linecap="round"/>
+  </g>
+
+  <g font-family="Inter, 'Inter Display', 'Segoe UI', Arial, sans-serif">
+    <text x="560" y="262" font-size="128" font-weight="800" letter-spacing="1"
+          fill="url(#titleDark)">LOOKING GLASS</text>
+    <text x="570" y="355" font-size="43" font-weight="500" letter-spacing="13"
+          fill="url(#subtitle)">PERSISTENT AI AUTOMATION</text>
+    <path d="M570 400 H1880" stroke="url(#subtitle)" stroke-width="4" stroke-linecap="round"/>
+    <text x="570" y="472" font-size="31" font-weight="400" letter-spacing="0.4"
+          fill="#C8DBFF">schedule the next turn · close the terminal · keep the session working</text>
+  </g>
+</svg>
