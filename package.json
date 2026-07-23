@@ -1,6 +1,6 @@
 {
   "name": "@sigil0/looking-glass",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "A lean local coding harness for OpenAI-compatible gateways and LM Studio",
   "license": "MIT",
   "repository": {
@@ -20,7 +20,8 @@
   },
   "files": [
     "dist",
-    "looking-glass.png"
+    "looking-glass-light.png",
+    "looking-glass-dark.png"
   ],
   "scripts": {
     "clean": "node --input-type=module -e \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true })\"",

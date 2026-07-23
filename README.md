@@ -1,6 +1,10 @@
 # Looking Glass
 
-![Looking Glass title graphic](./looking-glass.png)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="./looking-glass-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="./looking-glass-light.png">
+  <img src="./looking-glass-light.png" alt="Looking Glass title graphic">
+</picture>
 
 Looking Glass is an open-source local AI coding CLI for persistent, automatable sessions. It combines interactive terminal chat and one-shot prompts with workspace tools, configurable OpenAI-compatible gateways, durable SQLite state, and a scheduler for future model turns.
 
@@ -650,5 +654,6 @@ src/
   tools/                 Coding tools, schemas, approvals, and safety policy
   ui/                    TUI and stdio interfaces
 test/                    Unit and integration coverage
-looking-glass.png  README title graphic
+looking-glass-light.png  README title graphic (light)
+looking-glass-dark.png   README title graphic (dark)
 ```
