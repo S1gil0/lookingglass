@@ -35,7 +35,7 @@ The main model and worker-agent model are configured independently, including se
 - **Persistent approval modes** for interactive and automated turns, including remembered approvals.
 - **Scheduled AI prompts, reminders, and deterministic shell commands.**
 - **Concurrent worker agents** with independently selected models and reasoning settings.
-- **OpenAI-compatible local or hosted gateways**, including LM Studio and codex-lb.
+- **OpenAI-compatible local or hosted gateways**, including LM Studio, codex-lb, and OpenRouter.
 - **SQLite-backed sessions, scheduler state, and artifacts** with context recovery and compaction.
 - **A user-level scheduler** that runs independently of the interactive terminal (systemd on Linux and Task Scheduler on Windows).
 
@@ -47,7 +47,7 @@ Looking Glass is designed for one local operator. It is not a hosted service, mu
 - Node.js 22.19.0 or newer
 - npm
 - `ripgrep` (`rg` on Linux, `rg.exe` on Windows) on `PATH`
-- A running LM Studio or other OpenAI-compatible server exposing a Responses API
+- A running LM Studio or other OpenAI-compatible server exposing a Responses API, or an OpenRouter account
 
 The npm package targets Linux and native Windows (`win32`); macOS is not a
 supported install target.
@@ -97,7 +97,7 @@ You can run directly from TypeScript during development with `npm run dev`, but 
 
 ## Configure a Gateway
 
-Looking Glass expects an OpenAI-compatible Responses API and `/v1/models`. The optional API key is read from the environment variable named by `gateway.apiKeyEnv`:
+Looking Glass supports Responses-compatible gateways and OpenRouter's Chat Completions API. The optional API key is read from the environment variable named by `gateway.apiKeyEnv`:
 
 ```bash
 export LM_STUDIO_API_KEY=replace-with-your-token
@@ -158,18 +158,19 @@ Example configuration:
 
 The default approval mode is `code`.
 
-### LM Studio and OpenAI-Compatible Gateways
+### LM Studio, OpenRouter, and OpenAI-Compatible Gateways
 
 LM Studio is one local option, but Looking Glass works with any gateway that
-exposes the OpenAI-compatible Responses API and `/v1/models`. This includes
+exposes the OpenAI-compatible Responses API and `/v1/models`. OpenRouter uses
+`/v1/models` and `/v1/chat/completions` with stateless local history replay. This includes
 `codex-lb` and compatible deployments of vLLM, LiteLLM, LocalAI, llama.cpp,
 Ollama, or hosted OpenAI-compatible endpoints. The exact feature set depends
 on the gateway's support for Responses API streaming, tools, and model
 metadata.
 
 For an authenticated gateway, set the environment variable named by
-`apiKeyEnv`. If authentication is disabled, omit `apiKeyEnv` from the gateway
-configuration:
+`apiKeyEnv`. Unauthenticated local endpoints receive a harmless fallback
+token when that variable is unset:
 
 ```bash
 export LM_STUDIO_API_KEY=replace-with-your-token
@@ -186,6 +187,22 @@ export LM_STUDIO_API_KEY=replace-with-your-token
 ```
 
 On Windows PowerShell, set it with `$env:LM_STUDIO_API_KEY = 'your-token'`.
+
+For OpenRouter, use `https://openrouter.ai/api/v1`; selecting the provider
+defaults `apiKeyEnv` to `OPENROUTER_API_KEY`:
+
+```jsonc
+{
+  "gateway": {
+    "provider": "openrouter",
+    "baseURL": "https://openrouter.ai/api/v1"
+  }
+}
+```
+
+Additional gateways can be listed in `gateways`; each provider must be unique.
+Models ending in `:free` or with zero catalog pricing are marked `[free]` by
+`glass models` and selected by `glass models --free`.
 
 Inspect the configured model catalog and gateway health:
 
@@ -209,6 +226,7 @@ Run `glass help` for the built-in synopsis:
 glass                         Start the interactive chat
 glass run [--yes] [--session ID] PROMPT
 glass models                  List provider, model, context, and display name
+glass models --free           List only free models
 glass sessions                List durable interactive sessions
 glass sessions persist ID on|off
 glass config                  Print paths, instruction files, and effective config

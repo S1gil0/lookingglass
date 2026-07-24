@@ -12,7 +12,7 @@ import { resolveExecutableFromPath } from "./tools/executable.js";
 import { credentialEnvironmentNames } from "./security.js";
 import { schedulerDoctorCheck, type DoctorCheck } from "./doctor.js";
 
-const VERSION = "0.2.5";
+const VERSION = "0.3.0";
 
 function usage(): string {
   return `Looking Glass ${VERSION}
@@ -20,7 +20,7 @@ function usage(): string {
 Usage:
   glass                         Start the interactive chat
   glass run [--yes] [--session ID] PROMPT
-  glass models
+  glass models [--free]
   glass sessions
   glass sessions persist ID on|off
   glass config
@@ -36,7 +36,9 @@ Usage:
 Safety: --yes never approves critical/destructive or persistent actions.
 
 Environment:
-  LM_STUDIO_API_KEY             Optional local gateway API key
+  CODEX_LB_API_KEY              Optional local gateway API key
+  LM_STUDIO_API_KEY             Recommended LM Studio API token variable
+  OPENROUTER_API_KEY            OpenRouter API key
   LOOKING_GLASS_CONFIG          Explicit JSON/JSONC config path
   LOOKING_GLASS_DB              Explicit SQLite state path
 `;
@@ -342,8 +344,12 @@ async function main(): Promise<void> {
   const app = new LookingGlassApp();
   try {
     if (command === "models") {
+      const modelArgs = args.slice(1);
+      const freeOnly = modelArgs.length > 0;
+      if (modelArgs.some((arg) => arg !== "--free")) throw new Error("models accepts only --free");
       for (const model of await app.models()) {
-        process.stdout.write(`${model.provider}\t${model.id}\t${model.contextWindow}\t${model.name}\n`);
+        if (freeOnly && model.isFree !== true) continue;
+        process.stdout.write(`${model.provider}\t${model.id}${model.isFree ? "\t[free]" : ""}\t${model.contextWindow}\t${model.name}\n`);
       }
       return;
     }

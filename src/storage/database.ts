@@ -274,6 +274,47 @@ ALTER TABLE sessions ADD COLUMN agents_enabled INTEGER NOT NULL DEFAULT 1
 CHECK (agents_enabled IN (0, 1));
 `;
 
+// SQLite cannot alter a CHECK expression in place. Rebuild sessions while
+// keeping the existing column order, data, indexes, and FK targets intact.
+const SESSION_PROVIDER_OPENROUTER_SCHEMA = `
+DROP INDEX IF EXISTS sessions_workspace_updated;
+DROP INDEX IF EXISTS sessions_workspace_provider_updated;
+DROP INDEX IF EXISTS sessions_parent_kind;
+ALTER TABLE sessions RENAME TO sessions_before_openrouter;
+CREATE TABLE sessions (
+  id TEXT PRIMARY KEY,
+  workspace TEXT NOT NULL,
+  title TEXT NOT NULL,
+  model TEXT NOT NULL,
+  reasoning_effort TEXT NOT NULL,
+  verbosity TEXT NOT NULL,
+  fast INTEGER NOT NULL CHECK (fast IN (0, 1)),
+  prompt_cache_key TEXT NOT NULL UNIQUE,
+  last_response_id TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  show_reasoning INTEGER NOT NULL DEFAULT 0 CHECK (show_reasoning IN (0, 1)),
+  persistent INTEGER NOT NULL DEFAULT 0 CHECK (persistent IN (0, 1)),
+  provider TEXT NOT NULL DEFAULT 'codex-lb'
+    CHECK (provider IN ('codex-lb', 'lm-studio', 'openrouter')),
+  approval_mode TEXT NOT NULL DEFAULT 'review'
+    CHECK (approval_mode IN ('review', 'code', 'unrestricted')),
+  agent_provider TEXT
+    CHECK (agent_provider IS NULL OR agent_provider IN ('codex-lb', 'lm-studio', 'openrouter')),
+  agent_model TEXT CHECK (agent_model IS NULL OR length(agent_model) > 0),
+  agent_reasoning_effort TEXT,
+  session_kind TEXT NOT NULL DEFAULT 'interactive'
+    CHECK (session_kind IN ('interactive', 'agent')),
+  parent_session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,
+  agents_enabled INTEGER NOT NULL DEFAULT 1 CHECK (agents_enabled IN (0, 1))
+) STRICT;
+INSERT INTO sessions SELECT * FROM sessions_before_openrouter;
+DROP TABLE sessions_before_openrouter;
+CREATE INDEX sessions_workspace_updated ON sessions(workspace, updated_at DESC);
+CREATE INDEX sessions_workspace_provider_updated ON sessions(workspace, provider, updated_at DESC);
+CREATE INDEX sessions_parent_kind ON sessions(parent_session_id, session_kind, created_at);
+`;
+
 function migrateBashApprovalScopes(db: GlassDatabase): void {
   const rows = db.prepare(`
     SELECT session_id, signature, approved_at
@@ -399,8 +440,21 @@ export function openDatabase(path: string, platform: NodeJS.Platform = process.p
       migrateBashApprovalScopes(db);
       db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (13, ?)").run(Date.now());
     }
+    const sessionProviderOpenRouterMigration = db.prepare("SELECT 1 FROM schema_migrations WHERE version = 14").get();
+    if (!sessionProviderOpenRouterMigration) {
+      db.exec(SESSION_PROVIDER_OPENROUTER_SCHEMA);
+      db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (14, ?)").run(Date.now());
+    }
   });
-  migrate.immediate();
+  const providerMigrationPending = !db.prepare(
+    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations' AND sql LIKE '%version%'",
+  ).get() || !db.prepare("SELECT 1 FROM schema_migrations WHERE version = 14").get();
+  if (providerMigrationPending) db.exec("PRAGMA foreign_keys = OFF; PRAGMA legacy_alter_table = ON;");
+  try {
+    migrate.immediate();
+  } finally {
+    if (providerMigrationPending) db.exec("PRAGMA legacy_alter_table = OFF; PRAGMA foreign_keys = ON;");
+  }
   return db;
 }
 

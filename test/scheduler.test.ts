@@ -112,7 +112,7 @@ test("installs current migrations and validates scheduler definitions", (t) => {
   const { db, root, store } = fixture(t);
   const now = Date.parse("2026-01-01T00:00:30Z");
   const versions = db.prepare("SELECT version FROM schema_migrations ORDER BY version").all() as { version: number }[];
-  assert.deepEqual(versions.map((row) => row.version), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+  assert.deepEqual(versions.map((row) => row.version), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
   const sessionId = createSession(db, root, true);
   const approval = db.prepare("SELECT approval_mode FROM sessions WHERE id = ?").get(sessionId) as { approval_mode: string };
   assert.equal(approval.approval_mode, "review");
@@ -195,6 +195,121 @@ test("migration 13 promotes existing Bash approvals to leading executables", (t)
   `).all(sessionId) as { signature: string }[];
   assert.ok(signatures.some((row) => row.signature === JSON.stringify(["bash-executable", 2, "cat"])));
   assert.ok(signatures.some((row) => row.signature === JSON.stringify(["bash-executable", 2, "git"])));
+});
+
+test("migration 14 preserves parent sessions and referencing conversation and scheduler data", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "looking-glass-openrouter-migration-"));
+  const path = join(root, "glass.db");
+  let db = openDatabase(path);
+  t.after(() => {
+    if (db.open) db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  const parentId = createSession(db, root, true);
+  const childId = randomUUID();
+  const now = Date.now();
+  db.prepare(`
+    INSERT INTO sessions(
+      id, workspace, title, model, reasoning_effort, verbosity, fast,
+      prompt_cache_key, created_at, updated_at, persistent, agent_provider,
+      agent_model, agent_reasoning_effort, session_kind, parent_session_id
+    ) VALUES (?, ?, 'Child session', 'child-model', 'low', 'low', 0, ?, ?, ?, 1,
+      'codex-lb', 'child-model', 'low', 'agent', ?)
+  `).run(childId, root, randomUUID(), now, now, parentId);
+  db.prepare(`
+    INSERT INTO session_events(id, session_id, sequence, kind, payload_json, created_at)
+    VALUES (1, ?, 1, 'note', '{"message":"preserve me"}', ?)
+  `).run(childId, now);
+  db.prepare(`
+    INSERT INTO tool_calls(
+      session_id, call_id, name, arguments_json, state, output_text, started_at
+    ) VALUES (?, 'call-migration', 'lookup', '{}', 'completed', 'tool result', ?)
+  `).run(childId, now);
+  const jobId = randomUUID();
+  db.prepare(`
+    INSERT INTO scheduler_jobs(
+      id, kind, schedule_kind, schedule, timezone, command_text, cwd, env_json,
+      start_grace_ms, timeout_ms, output_bytes, enabled, next_due, session_id,
+      prompt, created_at
+    ) VALUES (?, 'command', 'once', ?, 'UTC', 'printf migration', ?, '{}',
+      1000, 5000, 1024, 1, ?, ?, 'scheduled prompt', ?)
+  `).run(jobId, new Date(now + 60_000).toISOString(), root, now + 60_000, childId, now);
+  db.prepare(`
+    INSERT INTO scheduler_occurrences(id, job_id, scheduled_at, state, created_at)
+    VALUES (1, ?, ?, 'pending', ?)
+  `).run(jobId, now + 60_000, now);
+  db.prepare(`
+    INSERT INTO scheduler_inbox(
+      id, kind, job_id, occurrence_id, message, created_at
+    ) VALUES (1, 'command_result', ?, 1, 'preserve scheduler record', ?)
+  `).run(jobId, now);
+
+  // Rebuild the sessions table into the v13 shape, retaining all records that
+  // depend on it, then let openDatabase run migration 14 as a real upgrade.
+  db.pragma("foreign_keys = OFF");
+  db.pragma("legacy_alter_table = ON");
+  db.exec(`
+    DROP INDEX IF EXISTS sessions_workspace_updated;
+    DROP INDEX IF EXISTS sessions_workspace_provider_updated;
+    DROP INDEX IF EXISTS sessions_parent_kind;
+    ALTER TABLE sessions RENAME TO sessions_before_openrouter_test;
+    CREATE TABLE sessions (
+      id TEXT PRIMARY KEY,
+      workspace TEXT NOT NULL,
+      title TEXT NOT NULL,
+      model TEXT NOT NULL,
+      reasoning_effort TEXT NOT NULL,
+      verbosity TEXT NOT NULL,
+      fast INTEGER NOT NULL CHECK (fast IN (0, 1)),
+      prompt_cache_key TEXT NOT NULL UNIQUE,
+      last_response_id TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      show_reasoning INTEGER NOT NULL DEFAULT 0 CHECK (show_reasoning IN (0, 1)),
+      persistent INTEGER NOT NULL DEFAULT 0 CHECK (persistent IN (0, 1)),
+      provider TEXT NOT NULL DEFAULT 'codex-lb'
+        CHECK (provider IN ('codex-lb', 'lm-studio')),
+      approval_mode TEXT NOT NULL DEFAULT 'review'
+        CHECK (approval_mode IN ('review', 'code', 'unrestricted')),
+      agent_provider TEXT
+        CHECK (agent_provider IS NULL OR agent_provider IN ('codex-lb', 'lm-studio')),
+      agent_model TEXT CHECK (agent_model IS NULL OR length(agent_model) > 0),
+      agent_reasoning_effort TEXT,
+      session_kind TEXT NOT NULL DEFAULT 'interactive'
+        CHECK (session_kind IN ('interactive', 'agent')),
+      parent_session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,
+      agents_enabled INTEGER NOT NULL DEFAULT 1 CHECK (agents_enabled IN (0, 1))
+    ) STRICT;
+    INSERT INTO sessions SELECT * FROM sessions_before_openrouter_test;
+    DROP TABLE sessions_before_openrouter_test;
+    CREATE INDEX sessions_workspace_updated ON sessions(workspace, updated_at DESC);
+    CREATE INDEX sessions_workspace_provider_updated ON sessions(workspace, provider, updated_at DESC);
+    CREATE INDEX sessions_parent_kind ON sessions(parent_session_id, session_kind, created_at);
+    DELETE FROM schema_migrations WHERE version = 14;
+  `);
+  db.pragma("legacy_alter_table = OFF");
+  db.pragma("foreign_keys = ON");
+  db.close();
+
+  db = openDatabase(path);
+  const child = db.prepare("SELECT parent_session_id FROM sessions WHERE id = ?").get(childId) as { parent_session_id: string };
+  assert.equal(child.parent_session_id, parentId);
+  assert.deepEqual(db.prepare("SELECT message FROM scheduler_inbox WHERE id = 1").get(), {
+    message: "preserve scheduler record",
+  });
+  assert.deepEqual(db.prepare("SELECT payload_json FROM session_events WHERE id = 1").get(), {
+    payload_json: '{"message":"preserve me"}',
+  });
+  assert.deepEqual(db.prepare("SELECT output_text FROM tool_calls WHERE call_id = 'call-migration'").get(), {
+    output_text: "tool result",
+  });
+  assert.deepEqual(db.prepare("PRAGMA foreign_key_check").all(), []);
+  const indexes = new Set((db.prepare("PRAGMA index_list('sessions')").all() as { name: string }[]).map((row) => row.name));
+  assert.ok(indexes.has("sessions_workspace_updated"));
+  assert.ok(indexes.has("sessions_workspace_provider_updated"));
+  assert.ok(indexes.has("sessions_parent_kind"));
+  assert.deepEqual(db.prepare("SELECT version FROM schema_migrations WHERE version = 14").get(), { version: 14 });
 });
 
 test("migration 10 upgrades an existing database with command approvals", (t) => {

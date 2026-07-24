@@ -1,7 +1,7 @@
 {
   "name": "@sigil0/looking-glass",
-  "version": "0.2.5",
-  "description": "A lean local coding harness for OpenAI-compatible gateways and LM Studio",
+  "version": "0.3.0",
+  "description": "A local coding CLI with persistent automation, agents, LM Studio, and OpenRouter",
   "license": "MIT",
   "repository": {
     "type": "git",

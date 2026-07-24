@@ -55,6 +55,12 @@ type PartialConfig = {
 
 type GatewayConfigInput = Partial<GlassConfig["gateway"]> & Pick<GlassConfig["gateway"], "provider" | "baseURL">;
 
+function defaultApiKeyEnv(provider: GlassConfig["gateway"]["provider"]): string {
+  if (provider === "lm-studio") return "LM_STUDIO_API_KEY";
+  if (provider === "openrouter") return "OPENROUTER_API_KEY";
+  return "CODEX_LB_API_KEY";
+}
+
 function parseConfigFile(path: string): PartialConfig {
   const errors: ParseError[] = [];
   const value = parse(readFileSync(path, "utf8"), errors, { allowTrailingComma: true }) as unknown;
@@ -69,13 +75,23 @@ function parseConfigFile(path: string): PartialConfig {
 }
 
 function merge(base: GlassConfig, override: PartialConfig): GlassConfig {
+  const gatewayOverride = override.gateway;
+  const mergedGateway = gatewayOverride
+    ? {
+        ...base.gateway,
+        ...gatewayOverride,
+        ...(gatewayOverride.apiKeyEnv === undefined
+          ? { apiKeyEnv: defaultApiKeyEnv(gatewayOverride.provider ?? base.gateway.provider) }
+          : {}),
+      }
+    : base.gateway;
   return {
     ...base,
     ...override,
-    gateway: { ...base.gateway, ...override.gateway },
+    gateway: mergedGateway,
     gateways: override.gateways
       ? override.gateways.map((gateway) => ({
-          apiKeyEnv: gateway.provider === "lm-studio" ? "LM_STUDIO_API_KEY" : "CODEX_LB_API_KEY",
+          apiKeyEnv: defaultApiKeyEnv(gateway.provider),
           timeoutMs: base.gateway.timeoutMs,
           ...gateway,
         }))
@@ -89,8 +105,8 @@ function validate(config: GlassConfig): void {
   const gateways = [config.gateway, ...config.gateways];
   const providers = new Set<string>();
   for (const gateway of gateways) {
-    if (!["codex-lb", "lm-studio"].includes(gateway.provider)) {
-      throw new Error("gateway provider must be codex-lb or lm-studio");
+    if (!["codex-lb", "lm-studio", "openrouter"].includes(gateway.provider)) {
+      throw new Error("gateway provider must be codex-lb, lm-studio, or openrouter");
     }
     if (!/^https?:\/\//.test(gateway.baseURL)) throw new Error("gateway baseURL must be HTTP or HTTPS");
     const url = new URL(gateway.baseURL);

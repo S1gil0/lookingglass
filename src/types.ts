@@ -3,7 +3,7 @@ export const REASONING_EFFORTS = ["none", "low", "medium", "high", "xhigh", "max
 export type ReasoningEffort = (typeof REASONING_EFFORTS)[number];
 export type ApprovalMode = "review" | "code" | "unrestricted";
 export type Verbosity = "low" | "medium" | "high";
-export type GatewayProvider = "codex-lb" | "lm-studio";
+export type GatewayProvider = "codex-lb" | "lm-studio" | "openrouter";
 export type SessionKind = "interactive" | "agent";
 
 export interface GatewayConfig {
@@ -57,6 +57,7 @@ export interface ModelInfo {
   supportsParallelToolCalls: boolean;
   supportsFast: boolean;
   priority: number;
+  isFree?: boolean;
 }
 
 export interface GatewayModel extends ModelInfo {
