@@ -12,7 +12,7 @@ import { resolveExecutableFromPath } from "./tools/executable.js";
 import { credentialEnvironmentNames } from "./security.js";
 import { schedulerDoctorCheck, type DoctorCheck } from "./doctor.js";
 
-const VERSION = "0.2.4";
+const VERSION = "0.2.5";
 
 function usage(): string {
   return `Looking Glass ${VERSION}

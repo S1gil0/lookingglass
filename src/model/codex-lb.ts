@@ -104,6 +104,34 @@ export interface CompactRequest {
   signal?: AbortSignal;
 }
 
+// Current llama.cpp grammar generation can emit invalid GBNF for nested string
+// maxLength constraints at or above 2000. Keep the original schemas for local
+// validation and only relax the cloned schema sent to LM Studio.
+function omitLmStudioLongMaxLengths(value: unknown): void {
+  if (Array.isArray(value)) {
+    for (const item of value) omitLmStudioLongMaxLengths(item);
+    return;
+  }
+  if (!value || typeof value !== "object") return;
+
+  const object = value as Record<string, unknown>;
+  for (const [key, child] of Object.entries(object)) {
+    if (key === "maxLength" && typeof child === "number" && child >= 2_000) {
+      delete object[key];
+      continue;
+    }
+    omitLmStudioLongMaxLengths(child);
+  }
+}
+
+function lmStudioTools(tools: FunctionTool[]): FunctionTool[] {
+  return tools.map((tool) => {
+    const parameters = tool.parameters === null ? null : structuredClone(tool.parameters);
+    if (parameters !== null) omitLmStudioLongMaxLengths(parameters);
+    return { ...tool, parameters };
+  });
+}
+
 export function buildResponseParams(provider: GatewayProvider, request: ResponseRequest) {
   const common = {
     model: request.model,
@@ -111,7 +139,7 @@ export function buildResponseParams(provider: GatewayProvider, request: Response
     input: provider === "lm-studio"
       ? request.input.filter((item) => item.type !== "reasoning")
       : request.input,
-    tools: request.tools,
+    tools: provider === "lm-studio" ? lmStudioTools(request.tools) : request.tools,
     parallel_tool_calls: true,
     ...(request.supportsReasoning ? {
       reasoning: {

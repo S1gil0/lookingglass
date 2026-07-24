@@ -50,6 +50,54 @@ test("LM Studio response profile uses stateless replay and omits codex-only fiel
   assert.equal((codex.input as ResponseInputItem[]).some((item) => item.type === "reasoning"), true);
 });
 
+test("LM Studio tool schemas omit long maxLength bounds without changing source tools", () => {
+  const parameters = {
+    type: "object",
+    properties: {
+      tasks: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            id: { type: "string", maxLength: 64 },
+            prompt: { type: "string", minLength: 1, maxLength: 32_000 },
+            boundary: { type: "string", maxLength: 2_000 },
+          },
+        },
+      },
+    },
+  };
+  const tool: ResponseRequest["tools"][number] = {
+    type: "function",
+    name: "run_agents",
+    description: "Run agents",
+    parameters,
+    strict: true,
+  };
+  const tools = [tool];
+  const before = structuredClone(tools);
+
+  const lmStudio = buildResponseParams("lm-studio", { ...request, tools });
+  assert.deepEqual(tools, before);
+  const lmStudioParameters = lmStudio.tools[0]?.parameters;
+  assert.ok(lmStudioParameters);
+  const tasks = (lmStudioParameters.properties as Record<string, Record<string, unknown>>).tasks;
+  const items = tasks?.items as Record<string, unknown>;
+  const properties = items.properties as Record<string, Record<string, unknown>>;
+  assert.equal(properties.id?.maxLength, 64);
+  const prompt = properties.prompt as Record<string, unknown>;
+  assert.equal("maxLength" in prompt, false);
+  assert.equal("maxLength" in properties.boundary!, false);
+
+  const codex = buildResponseParams("codex-lb", { ...request, tools });
+  const codexParameters = codex.tools[0]?.parameters;
+  assert.ok(codexParameters);
+  const codexTasks = (codexParameters.properties as Record<string, Record<string, unknown>>).tasks;
+  const codexItems = codexTasks?.items as Record<string, unknown>;
+  const codexProperties = codexItems.properties as Record<string, Record<string, unknown>>;
+  assert.equal(codexProperties.prompt?.maxLength, 32_000);
+});
+
 test("maps LM Studio native model metadata", () => {
   const model = lmStudioModelInfo({
     type: "llm",
