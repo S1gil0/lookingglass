@@ -2,7 +2,7 @@ import type { CodexLbClient } from "../model/codex-lb.js";
 import type { ArtifactStore } from "../storage/artifact-store.js";
 import type { SessionStore } from "../storage/session-store.js";
 import type { GatewayModel, GatewayProvider, GlassConfig } from "../types.js";
-import type { ToolRegistry } from "../tools/registry.js";
+import { ToolPreflightError, type ToolRegistry } from "../tools/registry.js";
 import type { AgentBatchRunner, AgentTaskInput, RunAgentsArgs } from "../tools/agents.js";
 import type { ToolContext, ToolResult } from "../tools/types.js";
 import { ConversationEngine } from "../engine/engine.js";
@@ -78,12 +78,18 @@ export class AgentCoordinator implements AgentBatchRunner {
   async run(args: RunAgentsArgs, context: ToolContext): Promise<ToolResult> {
     const ids = new Set<string>();
     for (const task of args.tasks) {
-      if (ids.has(task.id)) throw new Error(`Duplicate agent task id: ${task.id}`);
+      if (ids.has(task.id)) throw new ToolPreflightError(`Duplicate agent task id: ${task.id}`);
       ids.add(task.id);
     }
     const parent = this.sessions.get(context.sessionId);
-    if (!parent) throw new Error(`Parent session not found: ${context.sessionId}`);
-    const model = await this.modelFor(parent.agentModel, parent.agentProvider, context.signal);
+    if (!parent) throw new ToolPreflightError(`Parent session not found: ${context.sessionId}`);
+    let model: GatewayModel;
+    try {
+      model = await this.modelFor(parent.agentModel, parent.agentProvider, context.signal);
+    } catch (error) {
+      if (context.signal.aborted) throw error;
+      throw new ToolPreflightError(`Agent model could not be resolved: ${errorMessage(error)}`);
+    }
     const concurrency = Math.min(args.concurrency ?? 4, args.tasks.length);
     const results = new Array<AgentTaskResult>(args.tasks.length);
     let cursor = 0;

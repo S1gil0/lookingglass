@@ -12,6 +12,7 @@ import { ArtifactStore } from "../src/storage/artifact-store.js";
 import { openDatabase } from "../src/storage/database.js";
 import { SessionStore } from "../src/storage/session-store.js";
 import { createCoreToolRegistry, createWorkerToolRegistry } from "../src/tools/index.js";
+import { ToolPreflightError } from "../src/tools/registry.js";
 import type { AgentBatchRunner } from "../src/tools/agents.js";
 import type { ToolContext } from "../src/tools/types.js";
 import type { GatewayModel } from "../src/types.js";
@@ -229,6 +230,61 @@ test("agent coordinator propagates read-only context to code-mode child turns", 
   assert.equal(existsSync(join(root, "delegated-write.txt")), false);
 });
 
+test("agent model lookup failures are safe preflight failures", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "looking-glass-agent-model-preflight-"));
+  const artifactDir = join(root, "artifacts");
+  mkdirSync(artifactDir);
+  const db = openDatabase(join(root, "state.db"));
+  t.after(() => {
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+  const sessions = new SessionStore(db);
+  const artifacts = new ArtifactStore(db, artifactDir);
+  const parent = sessions.create({
+    workspace: root,
+    provider: "codex-lb",
+    model: "gpt-sol",
+    reasoningEffort: "medium",
+    agentProvider: "codex-lb",
+    agentModel: "gpt-luna",
+    agentReasoningEffort: "high",
+    verbosity: "low",
+    fast: false,
+  });
+  const coordinator = new AgentCoordinator(
+    structuredClone(DEFAULT_CONFIG),
+    root,
+    sessions,
+    artifacts,
+    () => ({}) as CodexLbClient,
+    createWorkerToolRegistry(),
+    "instructions",
+    async () => { throw new Error("catalog unavailable"); },
+  );
+
+  await assert.rejects(coordinator.run({
+    tasks: [{ id: "lookup", prompt: "Inspect the project." }],
+    concurrency: 1,
+  }, {
+    workspace: root,
+    sessionId: parent.id,
+    config: structuredClone(DEFAULT_CONFIG),
+    approvalMode: "review",
+    artifacts,
+    sessions,
+    signal: new AbortController().signal,
+    approve: async () => "deny",
+    ask: async () => "",
+  }), (error: unknown) => {
+    assert.ok(error instanceof ToolPreflightError);
+    assert.match(error.message, /Agent model could not be resolved: catalog unavailable/);
+    return true;
+  });
+  const children = db.prepare("SELECT COUNT(*) count FROM sessions WHERE parent_session_id = ?").get(parent.id) as { count: number };
+  assert.equal(children.count, 0);
+});
+
 test("main registry exposes agents while leaf registry prevents recursive delegation", async () => {
   const runner: AgentBatchRunner = {
     async run() {
@@ -243,12 +299,14 @@ test("main registry exposes agents while leaf registry prevents recursive delega
 
 test("model catalog bounds failed gateways and cools them down", async () => {
   let codexCalls = 0;
+  let codexOnline = true;
   let studioCalls = 0;
   let studioOnline = false;
   const { provider: _provider, ...catalogModel } = agentModel;
   const codex = {
     async models() {
       codexCalls += 1;
+      if (!codexOnline) throw new Error("codex catalog timeout");
       return [catalogModel];
     },
   };
@@ -296,6 +354,21 @@ test("model catalog bounds failed gateways and cools them down", async () => {
   assert.equal(codexCalls, 1);
   assert.equal(studioCalls, 1);
 
+  codexOnline = false;
+  const catalogInternals = app as unknown as {
+    modelCacheTimes: Map<string, number>;
+  };
+  catalogInternals.modelCacheTimes.set("codex-lb", Date.now() - 31_000);
+  const stale = await app.catalogModel("gpt-luna", "codex-lb");
+  assert.equal(stale.id, "gpt-luna");
+  assert.equal(codexCalls, 2);
+  const cooledStale = await app.catalogModel("gpt-luna", "codex-lb");
+  assert.equal(cooledStale.id, "gpt-luna");
+  assert.equal(codexCalls, 2);
+  const stopped = new AbortController();
+  stopped.abort(new Error("caller stopped"));
+  await assert.rejects(app.catalogModel("gpt-luna", "codex-lb", stopped.signal), /caller stopped/);
+
   await assert.rejects(app.catalogModel("gpt-luna", "lm-studio"), /temporarily unavailable/);
   studioOnline = true;
   const internals = app as unknown as { modelFailures: Map<string, number> };
@@ -303,4 +376,32 @@ test("model catalog bounds failed gateways and cools them down", async () => {
   const recovered = await app.catalogModel("gpt-luna", "lm-studio");
   assert.equal(recovered.provider, "lm-studio");
   assert.equal(studioCalls, 2);
+});
+
+test("model catalog timeout bounds an existing shared request", async () => {
+  const app = Object.create(LookingGlassApp.prototype) as LookingGlassApp;
+  Object.assign(app as unknown as Record<string, unknown>, {
+    clients: new Map([["codex-lb", {}]]),
+    modelCache: new Map(),
+    modelCacheTimes: new Map(),
+    modelRequests: new Map([["codex-lb", new Promise(() => {})]]),
+    modelFailures: new Map(),
+    modelCatalogTimeoutMs: 20,
+    modelCacheTtlMs: 30_000,
+    probeGateway: async () => {},
+  });
+
+  const started = Date.now();
+  const keepAlive = setTimeout(() => {}, 1_000);
+  try {
+    await assert.rejects(
+      app.catalogModel("gpt-luna", "codex-lb"),
+      /Gateway model catalog timed out after 20ms: codex-lb/,
+    );
+  } finally {
+    clearTimeout(keepAlive);
+  }
+  assert.ok(Date.now() - started < 500);
+  const internals = app as unknown as { modelRequests: Map<string, Promise<unknown>> };
+  assert.equal(internals.modelRequests.has("codex-lb"), false);
 });

@@ -13,10 +13,26 @@ import { AgentCoordinator } from "./agents/coordinator.js";
 import type { GatewayModel, GatewayProvider, GlassConfig, ModelInfo, SessionRecord } from "./types.js";
 import { SchedulerStore } from "./scheduler/store.js";
 
-const MODEL_CATALOG_TIMEOUT_MS = 2_000;
+const MODEL_CATALOG_TIMEOUT_MS = 10_000;
 const MODEL_FAILURE_COOLDOWN_MS = 30_000;
 const MODEL_CACHE_TTL_MS = 30_000;
 const GATEWAY_PROBE_TIMEOUT_MS = 500;
+
+async function waitWithSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  signal?.throwIfAborted();
+  if (!signal) return promise;
+  let abort: (() => void) | undefined;
+  const aborted = new Promise<never>((_resolve, reject) => {
+    abort = () => reject(signal.reason ?? new Error("Aborted"));
+    signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) abort();
+  });
+  try {
+    return await Promise.race([promise, aborted]);
+  } finally {
+    if (abort) signal.removeEventListener("abort", abort);
+  }
+}
 
 export class LookingGlassApp {
   readonly workspace: string;
@@ -119,10 +135,11 @@ export class LookingGlassApp {
   }
 
   async modelsForProvider(provider: GatewayProvider, refresh = false, signal?: AbortSignal): Promise<ModelInfo[]> {
+    signal?.throwIfAborted();
     const cached = this.modelCache.get(provider);
     if (cached && !refresh) return cached;
     const pending = this.modelRequests.get(provider);
-    if (pending) return pending;
+    if (pending) return waitWithSignal(pending, signal);
     const request = this.clientForProvider(provider).models(signal).then((models) => {
       this.modelCache.set(provider, models);
       this.modelCacheTimes.set(provider, Date.now());
@@ -132,7 +149,7 @@ export class LookingGlassApp {
       if (this.modelRequests.get(provider) === request) this.modelRequests.delete(provider);
     });
     this.modelRequests.set(provider, request);
-    return request;
+    return waitWithSignal(request, signal);
   }
 
   private async catalogModelsForProvider(
@@ -140,11 +157,14 @@ export class LookingGlassApp {
     refresh = false,
     signal?: AbortSignal,
   ): Promise<GatewayModel[]> {
+    signal?.throwIfAborted();
+    const cached = this.modelCache.get(provider);
     const cacheTime = this.modelCacheTimes.get(provider) ?? 0;
-    const stale = !this.modelCache.has(provider) || Date.now() - cacheTime >= this.modelCacheTtlMs;
+    const stale = !cached || Date.now() - cacheTime >= this.modelCacheTtlMs;
     const failedAt = this.modelFailures.get(provider);
     if (!refresh && stale && failedAt !== undefined
       && Date.now() - failedAt < MODEL_FAILURE_COOLDOWN_MS) {
+      if (cached) return cached.map((model) => ({ ...model, provider }));
       throw new Error(`Gateway model catalog is temporarily unavailable: ${provider}`);
     }
     const timeout = AbortSignal.timeout(this.modelCatalogTimeoutMs);
@@ -156,10 +176,20 @@ export class LookingGlassApp {
       return (await this.modelsForProvider(provider, refresh || stale, requestSignal))
         .map((model) => ({ ...model, provider }));
     } catch (error) {
+      if (timeout.aborted && !signal?.aborted) this.modelRequests.delete(provider);
+      if (!refresh && cached && !signal?.aborted) {
+        this.modelFailures.set(provider, Date.now());
+        return cached.map((model) => ({ ...model, provider }));
+      }
       if (!signal?.aborted) {
         this.modelCache.delete(provider);
         this.modelCacheTimes.delete(provider);
         this.modelFailures.set(provider, Date.now());
+      }
+      if (timeout.aborted && !signal?.aborted) {
+        throw new Error(`Gateway model catalog timed out after ${this.modelCatalogTimeoutMs}ms: ${provider}`, {
+          cause: error,
+        });
       }
       throw error;
     }
@@ -169,6 +199,7 @@ export class LookingGlassApp {
     const results = await Promise.allSettled(this.configuredProviders().map((provider) => {
       return this.catalogModelsForProvider(provider, refresh, signal);
     }));
+    signal?.throwIfAborted();
     const models = results.flatMap((result) => result.status === "fulfilled" ? result.value : []);
     if (models.length === 0) {
       const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
@@ -186,7 +217,7 @@ export class LookingGlassApp {
 
   async model(id: string, signal?: AbortSignal, provider?: GatewayProvider): Promise<GatewayModel> {
     const candidates = provider
-      ? (await this.modelsForProvider(provider, false, signal)).map((model) => ({ ...model, provider }))
+      ? await this.catalogModelsForProvider(provider, false, signal)
       : await this.models(false, signal);
     const matches = candidates.filter((model) => model.id === id);
     if (matches.length > 1) throw new Error(`Model id is ambiguous across gateways: ${id}`);
@@ -197,7 +228,7 @@ export class LookingGlassApp {
 
   async createSession(signal?: AbortSignal): Promise<SessionRecord> {
     const model = chooseModel(
-      await this.modelsForProvider(this.config.gateway.provider, false, signal),
+      await this.catalogModelsForProvider(this.config.gateway.provider, false, signal),
       this.config.model,
     );
     const effort = model.reasoningEfforts.includes(this.config.reasoningEffort)
