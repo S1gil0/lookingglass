@@ -923,9 +923,20 @@ export class CodexLbClient {
 
   async compact(request: CompactRequest): Promise<Record<string, unknown>> {
     if (this.config.gateway.provider === "openrouter") {
-      const transcript = compactTranscript(request.input);
-      if (!transcript) throw providerError({ code: "malformed_response", message: "compaction received no semantic transcript" }, {
+      const semanticInput = request.input.filter((item) => item.type !== "reasoning" && item.type !== "compaction");
+      if (semanticInput.length === 0) throw providerError({ code: "malformed_response", message: "compaction received no semantic transcript" }, {
         ...requestContext("openrouter", "compact", this.apiKey, request.signal), protocol: true,
+      });
+      const checkpointInstructions = [
+        request.instructions,
+        "Create a dense, durable checkpoint of the supplied conversation.",
+        "Preserve user requirements, decisions, relevant facts, file paths, code changes, tool outcomes, unresolved work, and safety constraints.",
+        "Do not continue the task, call tools, or add commentary. Return only the checkpoint text.",
+      ].filter((part) => part.trim()).join(" ");
+      const messages = openRouterMessages(checkpointInstructions, request.input);
+      messages.push({
+        role: "user",
+        content: "Create the durable conversation checkpoint now. Return only the checkpoint text.",
       });
       const timeout = AbortSignal.timeout(this.config.gateway.timeoutMs);
       const signal = request.signal ? AbortSignal.any([request.signal, timeout]) : timeout;
@@ -937,12 +948,9 @@ export class CodexLbClient {
           headers: { authorization: `Bearer ${this.apiKey}`, "content-type": "application/json" },
           body: JSON.stringify({
             model: request.model,
-            messages: openRouterMessages([
-              request.instructions,
-              "Create a dense, durable checkpoint of the supplied conversation.",
-              "Preserve user requirements, decisions, relevant facts, file paths, code changes, tool outcomes, unresolved work, and safety constraints.",
-              "Do not continue the task, call tools, or add commentary. Return only the checkpoint text.",
-            ].filter((part) => part.trim()).join(" "), [{ role: "user", content: [{ type: "input_text", text: `Conversation transcript:\n\n${transcript}` }] }]),
+            messages,
+            transforms: ["middle-out"],
+            max_tokens: 8_192,
             stream: false,
           }),
           signal,

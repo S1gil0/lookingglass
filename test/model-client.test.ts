@@ -343,10 +343,25 @@ test("OpenRouter compaction requests a durable checkpoint and normalizes usage",
   config.gateway.provider = "openrouter";
   config.gateway.baseURL = `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1`;
   const result = await new CodexLbClient(config).compact({
-    model: "demo", instructions: "Keep context", input: request.input, promptCacheKey: "k", fast: false,
+    model: "demo",
+    instructions: "Keep context",
+    input: [
+      ...request.input,
+      { type: "function_call", call_id: "compact_call", name: "inspect", arguments: "{}" },
+      { type: "function_call_output", call_id: "compact_call", output: "inspection result" },
+    ] as ResponseInputItem[],
+    promptCacheKey: "k",
+    fast: false,
   });
-  const system = (body?.messages as Array<Record<string, unknown>>)?.[0];
+  const messages = body?.messages as Array<Record<string, unknown>>;
+  const system = messages[0];
   assert.match(String(system?.content), /durable checkpoint/);
+  assert.deepEqual(body?.transforms, ["middle-out"]);
+  assert.equal(body?.max_tokens, 8_192);
+  assert.equal(JSON.stringify(messages).includes("Conversation transcript:"), false);
+  assert.equal(messages.some((message) => message.role === "assistant" && Array.isArray(message.tool_calls)), true);
+  assert.equal(messages.some((message) => message.role === "tool" && message.tool_call_id === "compact_call"), true);
+  assert.match(String(messages.at(-1)?.content), /checkpoint now/);
   assert.deepEqual(result.usage, { input_tokens: 7, output_tokens: 3, total_tokens: 10 });
   assert.match(JSON.stringify(result.output), /checkpoint/);
 });

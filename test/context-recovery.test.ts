@@ -242,6 +242,42 @@ test("stateless providers replay full context after tool calls", async (t) => {
   assert.match(JSON.stringify(requests[1]?.input), /TOOL_OK/);
 });
 
+test("OpenRouter compacts oversized local replay even when provider usage was truncated", async (t) => {
+  const { root, sessions, session, artifacts } = fixture(t);
+  sessions.updateSettings(session.id, { provider: "openrouter" });
+  let compactions = 0;
+  const client = {
+    supportsResponseContinuity: () => false,
+    async stream() {
+      return {
+        ...response("truncated-provider-view", "OK"),
+        usage: { input_tokens: 100, output_tokens: 2, total_tokens: 102 },
+      } as unknown as Response;
+    },
+    async compact() {
+      compactions += 1;
+      return {
+        id: "compact_local_replay",
+        output: [{ type: "compaction_summary", encrypted_content: "bounded local replay" }],
+        usage: { input_tokens: 100 },
+      };
+    },
+  } as unknown as CodexLbClient;
+  const engine = new ConversationEngine(
+    structuredClone(DEFAULT_CONFIG), root, sessions, artifacts, client, new ToolRegistry(), "instructions",
+  );
+
+  const result = await engine.turn(session.id, "x".repeat(330_000), {
+    signal: new AbortController().signal,
+    interaction: { approve: async () => "once", ask: async () => "" },
+    modelInfo,
+  });
+
+  assert.equal(result.compacted, true);
+  assert.equal(compactions, 1);
+  assert.match(JSON.stringify(sessions.latestCheckpoint(session.id)?.compact), /bounded local replay/);
+});
+
 test("high-usage tool rounds compact before the next model request", async (t) => {
   const { root, sessions, session, artifacts } = fixture(t);
   const read: GlassTool<Record<string, never>> = {

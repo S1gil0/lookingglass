@@ -1249,7 +1249,10 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
     const latestUsage = app.sessions.latestResponseUsage(session.id);
     const checkpoint = app.sessions.latestCheckpoint(session.id);
     if (latestUsage && (!checkpoint || latestUsage.sequence > checkpoint.throughSequence)) {
-      contextInputTokens = latestUsage.inputTokens;
+      const projectedTokens = session.provider === "openrouter"
+        ? Math.ceil(JSON.stringify(projectContext(app.sessions, session.id).input).length / 4)
+        : 0;
+      contextInputTokens = Math.max(latestUsage.inputTokens, projectedTokens);
       return;
     }
     contextInputTokens = Math.ceil(JSON.stringify(projectContext(app.sessions, session.id).input).length / 4);

@@ -671,13 +671,17 @@ export class ConversationEngine {
     const usableTokens = Math.max(1, model.contextWindow - reserve);
     const threshold = usableTokens * 0.8;
     const providerTokens = response.usage?.input_tokens ?? 0;
-    if (providerTokens > 0) return semanticGrowth >= 2 && providerTokens >= threshold;
     const context = projectContext(this.store, sessionId).input;
     const estimatedTokens = Math.ceil((
       this.instructions.length
       + JSON.stringify(this.toolDefinitions(this.requireSession(sessionId))).length
       + JSON.stringify(context).length
     ) / 4) + 2_000;
+    if (providerTokens > 0) {
+      const providerTruncatedReplay = this.requireSession(sessionId).provider === "openrouter"
+        && estimatedTokens >= usableTokens;
+      return semanticGrowth >= 2 && (providerTokens >= threshold || providerTruncatedReplay);
+    }
     return estimatedTokens >= usableTokens;
   }
 
