@@ -315,6 +315,11 @@ CREATE INDEX sessions_workspace_provider_updated ON sessions(workspace, provider
 CREATE INDEX sessions_parent_kind ON sessions(parent_session_id, session_kind, created_at);
 `;
 
+const SESSION_FORK_SCHEMA = `
+ALTER TABLE sessions ADD COLUMN fork_count INTEGER NOT NULL DEFAULT 0
+CHECK (fork_count >= 0);
+`;
+
 function migrateBashApprovalScopes(db: GlassDatabase): void {
   const rows = db.prepare(`
     SELECT session_id, signature, approved_at
@@ -444,6 +449,11 @@ export function openDatabase(path: string, platform: NodeJS.Platform = process.p
     if (!sessionProviderOpenRouterMigration) {
       db.exec(SESSION_PROVIDER_OPENROUTER_SCHEMA);
       db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (14, ?)").run(Date.now());
+    }
+    const sessionForkMigration = db.prepare("SELECT 1 FROM schema_migrations WHERE version = 15").get();
+    if (!sessionForkMigration) {
+      db.exec(SESSION_FORK_SCHEMA);
+      db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (15, ?)").run(Date.now());
     }
   });
   const providerMigrationPending = !db.prepare(

@@ -31,6 +31,7 @@ interface SessionRow {
   last_response_id: string | null;
   session_kind: SessionKind;
   parent_session_id: string | null;
+  fork_count: number;
   created_at: number;
   updated_at: number;
 }
@@ -225,6 +226,81 @@ export class SessionStore {
       now,
     );
     return session;
+  }
+
+  fork(sourceId: string): SessionRecord {
+    const fork = this.db.transaction(() => {
+      const sourceRow = this.db.prepare("SELECT * FROM sessions WHERE id = ?").get(sourceId) as SessionRow | undefined;
+      if (!sourceRow) throw new Error(`Session not found: ${sourceId}`);
+      const source = sessionFromRow(sourceRow);
+      if (source.kind !== "interactive") {
+        throw new Error("Agent sessions cannot be forked; only interactive sessions may be forked");
+      }
+
+      const now = Date.now();
+      const activeLease = this.db.prepare(`
+        SELECT kind FROM session_operation_leases
+        WHERE session_id = ? AND expires_at > ?
+      `).get(sourceId, now) as { kind: string } | undefined;
+      if (activeLease) throw new Error(`Session is busy with an active ${activeLease.kind}`);
+
+      const forkNumber = sourceRow.fork_count + 1;
+      const forkId = randomUUID();
+      const suffix = `(fork ${forkNumber})`;
+      const title = `${source.title.slice(0, Math.max(1, 120 - suffix.length - 1)).trimEnd()} ${suffix}`;
+      this.db.prepare("UPDATE sessions SET fork_count = ?, updated_at = ? WHERE id = ?")
+        .run(forkNumber, now, sourceId);
+      this.db.prepare(`
+        INSERT INTO sessions(
+          id, workspace, provider, agent_provider, title, model, agent_model,
+          reasoning_effort, agent_reasoning_effort, agents_enabled, verbosity, fast,
+          approval_mode, show_reasoning, persistent, prompt_cache_key, last_response_id,
+          session_kind, parent_session_id, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'interactive', NULL, ?, ?)
+      `).run(
+        forkId,
+        source.workspace,
+        source.provider,
+        source.agentProvider,
+        title,
+        source.model,
+        source.agentModel,
+        source.reasoningEffort,
+        source.agentReasoningEffort,
+        source.agentsEnabled ? 1 : 0,
+        source.verbosity,
+        source.fast ? 1 : 0,
+        source.approvalMode,
+        source.showReasoning ? 1 : 0,
+        source.persistent ? 1 : 0,
+        randomUUID(),
+        now,
+        now,
+      );
+      this.db.prepare(`
+        INSERT INTO session_events(session_id, sequence, kind, payload_json, created_at)
+        SELECT ?, sequence, kind, payload_json, created_at
+        FROM session_events WHERE session_id = ? ORDER BY sequence
+      `).run(forkId, sourceId);
+      this.db.prepare(`
+        INSERT INTO context_checkpoints(
+          session_id, through_sequence, compact_json, input_tokens, created_at
+        )
+        SELECT ?, through_sequence, compact_json, input_tokens, created_at
+        FROM context_checkpoints WHERE session_id = ? ORDER BY through_sequence
+      `).run(forkId, sourceId);
+      this.db.prepare(`
+        INSERT INTO tool_calls(
+          session_id, call_id, name, arguments_json, state, output_text, error_text,
+          started_at, finished_at, execution_token
+        )
+        SELECT ?, call_id, name, arguments_json, state, output_text, error_text,
+          started_at, finished_at, NULL
+        FROM tool_calls WHERE session_id = ? ORDER BY call_id
+      `).run(forkId, sourceId);
+      return this.require(forkId);
+    });
+    return fork.immediate();
   }
 
   get(id: string): SessionRecord | null {

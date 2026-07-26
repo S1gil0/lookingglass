@@ -297,6 +297,8 @@ Inside the TUI:
 
 Use `/new` for a separate task, even in the same folder. This keeps unrelated context from contaminating one another. Use `/sessions` when you want to browse titles, models, approval modes, persistence state, schedule counts, and last activity.
 
+Use `/fork` to create and switch to an independent copy of the active session. The fork keeps the transcript, context checkpoints, model and session settings, and tool history, but receives a new session identity and response continuity. It is named automatically as `Session title (fork 1)`, `Session title (fork 2)`, and so on. Schedules and remembered command approvals are not copied; the original session remains unchanged.
+
 ### What Persists
 
 Looking Glass stores session events and tool state in SQLite. Depending on the provider, it also stores local replay material or response continuity identifiers. Context compaction creates durable checkpoints instead of deleting the session's identity.
@@ -323,6 +325,7 @@ Enter slash commands inside `glass`:
 | Command | Purpose |
 | --- | --- |
 | `/new` | Create and switch to a new session |
+| `/fork` | Fork the current session and switch to the independent copy |
 | `/sessions [ID]` | Browse sessions or switch directly to an ID |
 | `/session` | Open session management, rename, persistence, schedules, or approvals |
 | `/persist [on\|off]` | Enable or disable persistence for this session |

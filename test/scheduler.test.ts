@@ -112,7 +112,7 @@ test("installs current migrations and validates scheduler definitions", (t) => {
   const { db, root, store } = fixture(t);
   const now = Date.parse("2026-01-01T00:00:30Z");
   const versions = db.prepare("SELECT version FROM schema_migrations ORDER BY version").all() as { version: number }[];
-  assert.deepEqual(versions.map((row) => row.version), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
+  assert.deepEqual(versions.map((row) => row.version), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
   const sessionId = createSession(db, root, true);
   const approval = db.prepare("SELECT approval_mode FROM sessions WHERE id = ?").get(sessionId) as { approval_mode: string };
   assert.equal(approval.approval_mode, "review");
@@ -281,12 +281,22 @@ test("migration 14 preserves parent sessions and referencing conversation and sc
       parent_session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,
       agents_enabled INTEGER NOT NULL DEFAULT 1 CHECK (agents_enabled IN (0, 1))
     ) STRICT;
-    INSERT INTO sessions SELECT * FROM sessions_before_openrouter_test;
+    INSERT INTO sessions(
+      id, workspace, title, model, reasoning_effort, verbosity, fast,
+      prompt_cache_key, last_response_id, created_at, updated_at, show_reasoning,
+      persistent, provider, approval_mode, agent_provider, agent_model,
+      agent_reasoning_effort, session_kind, parent_session_id, agents_enabled
+    )
+    SELECT id, workspace, title, model, reasoning_effort, verbosity, fast,
+      prompt_cache_key, last_response_id, created_at, updated_at, show_reasoning,
+      persistent, provider, approval_mode, agent_provider, agent_model,
+      agent_reasoning_effort, session_kind, parent_session_id, agents_enabled
+    FROM sessions_before_openrouter_test;
     DROP TABLE sessions_before_openrouter_test;
     CREATE INDEX sessions_workspace_updated ON sessions(workspace, updated_at DESC);
     CREATE INDEX sessions_workspace_provider_updated ON sessions(workspace, provider, updated_at DESC);
     CREATE INDEX sessions_parent_kind ON sessions(parent_session_id, session_kind, created_at);
-    DELETE FROM schema_migrations WHERE version = 14;
+    DELETE FROM schema_migrations WHERE version IN (14, 15);
   `);
   db.pragma("legacy_alter_table = OFF");
   db.pragma("foreign_keys = ON");
@@ -310,6 +320,7 @@ test("migration 14 preserves parent sessions and referencing conversation and sc
   assert.ok(indexes.has("sessions_workspace_provider_updated"));
   assert.ok(indexes.has("sessions_parent_kind"));
   assert.deepEqual(db.prepare("SELECT version FROM schema_migrations WHERE version = 14").get(), { version: 14 });
+  assert.deepEqual(db.prepare("SELECT version FROM schema_migrations WHERE version = 15").get(), { version: 15 });
 });
 
 test("migration 10 upgrades an existing database with command approvals", (t) => {

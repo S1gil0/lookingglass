@@ -1537,10 +1537,10 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
     }
   };
 
-  const switchSession = async (id: string): Promise<void> => {
+  const switchSession = async (id: string, preservePrevious = false): Promise<void> => {
     const previousSessionId = session.id;
     session = await app.currentOrNewSession(id);
-    if (previousSessionId !== session.id) app.sessions.deleteIfEmpty(previousSessionId);
+    if (previousSessionId !== session.id && !preservePrevious) app.sessions.deleteIfEmpty(previousSessionId);
     for (const [identity, ownerSessionId] of suppressedInbox) {
       if (ownerSessionId === session.id) suppressedInbox.delete(identity);
     }
@@ -1860,6 +1860,17 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
       if (!stopping) await switchSession(created.id);
       return;
     }
+    if (command === "fork") {
+      if (argument) throw new Error("/fork does not accept arguments");
+      signal.throwIfAborted();
+      const sourceTitle = session.title;
+      const created = app.sessions.fork(session.id);
+      if (!stopping) {
+        await switchSession(created.id, true);
+        addNotice("session", `Forked ${sourceTitle} into ${session.title}.`, green);
+      }
+      return;
+    }
     if (command === "sessions") {
       if (argument) {
         await switchSession(argument);
@@ -2051,6 +2062,7 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
 
   const slashCommands: SlashCommand[] = [
     { name: "new", description: "Start a new session" },
+    { name: "fork", description: "Fork current session into an independent copy" },
     { name: "session", description: "Manage current session" },
     {
       name: "persist",
