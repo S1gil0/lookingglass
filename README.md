@@ -35,7 +35,7 @@ The main model and worker-agent model are configured independently, including se
 - **Persistent approval modes** for interactive and automated turns, including remembered approvals.
 - **Scheduled AI prompts, reminders, and deterministic shell commands.**
 - **Concurrent worker agents** with independently selected models and reasoning settings.
-- **OpenAI-compatible local or hosted gateways**, including LM Studio, codex-lb, and OpenRouter.
+- **Configured gateway providers** including codex-lb, LM Studio, OpenRouter, and a custom OpenAI-compatible profile.
 - **SQLite-backed sessions, scheduler state, and artifacts** with context recovery and compaction.
 - **A user-level scheduler** that runs independently of the interactive terminal (systemd on Linux and Task Scheduler on Windows).
 
@@ -47,7 +47,7 @@ Looking Glass is designed for one local operator. It is not a hosted service, mu
 - Node.js 22.19.0 or newer
 - npm
 - `ripgrep` (`rg` on Linux, `rg.exe` on Windows) on `PATH`
-- A running LM Studio or other OpenAI-compatible server exposing a Responses API, or an OpenRouter account
+- A running LM Studio or other configured OpenAI-compatible gateway, or an OpenRouter account
 
 The npm package targets Linux and native Windows (`win32`); macOS is not a
 supported install target.
@@ -97,10 +97,10 @@ You can run directly from TypeScript during development with `npm run dev`, but 
 
 ## Configure a Gateway
 
-Looking Glass supports Responses-compatible gateways and OpenRouter's Chat Completions API. The optional API key is read from the environment variable named by `gateway.apiKeyEnv`:
+Looking Glass supports the built-in codex-lb and LM Studio Responses profiles, OpenRouter's Chat Completions profile, and a custom OpenAI-compatible gateway profile. The optional API key is read from the environment variable named by `gateway.apiKeyEnv`:
 
 ```bash
-export LM_STUDIO_API_KEY=replace-with-your-token
+export LM_STUDIO_API_KEY=your-token
 ```
 
 In Windows PowerShell, use `$env:LM_STUDIO_API_KEY = 'your-token'` instead.
@@ -158,22 +158,21 @@ Example configuration:
 
 The default approval mode is `code`.
 
-### LM Studio, OpenRouter, and OpenAI-Compatible Gateways
+### Built-in and Custom OpenAI-Compatible Gateways
 
-LM Studio is one local option, but Looking Glass works with any gateway that
-exposes the OpenAI-compatible Responses API and `/v1/models`. OpenRouter uses
-`/v1/models` and `/v1/chat/completions` with stateless local history replay. This includes
-`codex-lb` and compatible deployments of vLLM, LiteLLM, LocalAI, llama.cpp,
-Ollama, or hosted OpenAI-compatible endpoints. The exact feature set depends
-on the gateway's support for Responses API streaming, tools, and model
-metadata.
+LM Studio is one local option. OpenRouter uses `/v1/models` and
+`/v1/chat/completions` with stateless local history replay. The `custom` profile
+is an escape hatch for other OpenAI-compatible gateways; it is not a guarantee
+that every API variant, extension, or provider-specific feature is compatible.
+The exact feature set depends on the selected protocol and the gateway's
+support for streaming, tools, and model metadata.
 
 For an authenticated gateway, set the environment variable named by
 `apiKeyEnv`. Unauthenticated local endpoints receive a harmless fallback
 token when that variable is unset:
 
 ```bash
-export LM_STUDIO_API_KEY=replace-with-your-token
+export LM_STUDIO_API_KEY=your-token
 ```
 
 ```jsonc
@@ -187,6 +186,49 @@ export LM_STUDIO_API_KEY=replace-with-your-token
 ```
 
 On Windows PowerShell, set it with `$env:LM_STUDIO_API_KEY = 'your-token'`.
+
+#### Custom gateway: Responses API
+
+Set `provider` to `custom` and use the default (or explicit) Responses
+protocol. The gateway must provide `GET /models` and `POST /responses` relative
+to `baseURL`:
+
+```jsonc
+{
+  "gateway": {
+    "provider": "custom",
+    "protocol": "responses",
+    "baseURL": "https://gateway.example/v1",
+    "apiKeyEnv": "CUSTOM_API_KEY"
+  },
+  "model": "example-model"
+}
+```
+
+#### Custom gateway: Chat Completions API
+
+Select `protocol: "chat"` when the gateway provides `GET /models` and
+`POST /chat/completions` instead:
+
+```jsonc
+{
+  "gateway": {
+    "provider": "custom",
+    "protocol": "chat",
+    "baseURL": "https://gateway.example/v1",
+    "apiKeyEnv": "CUSTOM_API_KEY"
+  },
+  "model": "example-model"
+}
+```
+
+When omitted, a custom gateway defaults to `protocol: "responses"` and
+`apiKeyEnv: "CUSTOM_API_KEY"`. Both custom protocols use standard bearer
+authentication and stateless local replay: Looking Glass sends the durable
+conversation context on each request rather than relying on remote response
+continuity. Custom model catalog entries use conservative capability defaults;
+choose this profile only when the gateway matches the expected OpenAI-compatible
+request and streaming response shapes.
 
 For OpenRouter, use `https://openrouter.ai/api/v1`; selecting the provider
 defaults `apiKeyEnv` to `OPENROUTER_API_KEY`:
@@ -273,7 +315,14 @@ glass config
 glass doctor
 ```
 
-`glass config` is useful when a session is using an unexpected model or gateway. It prints the workspace, state database, loaded instruction files, truncation status, and effective configuration.
+`glass config` is useful when a session is using an unexpected model or gateway. It prints the workspace, state database, loaded instruction files, truncation status, and effective configuration without printing API-key values.
+
+If configuration is missing, malformed, or the configured gateway is offline,
+the CLI still starts with safe defaults. Use `/config` inside the interactive
+session to choose a provider, endpoint, API-key environment variable, and model.
+The wizard stores non-secret settings in the global config, stores the entered
+key in the protected scheduler environment file, reloads the runtime
+immediately, and can recover from a damaged configuration layer.
 
 ## Sessions: Durable Project Memory
 
@@ -328,6 +377,7 @@ Enter slash commands inside `glass`:
 | `/fork` | Fork the current session and switch to the independent copy |
 | `/sessions [ID]` | Browse sessions or switch directly to an ID |
 | `/session` | Open session management, rename, persistence, schedules, or approvals |
+| `/config` | Configure or recover the active gateway and model |
 | `/persist [on\|off]` | Enable or disable persistence for this session |
 | `/model [ID]` | Select a primary model; without an ID, open the model picker |
 | `/reasoning [effort]` | Select primary model reasoning effort |

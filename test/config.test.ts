@@ -35,3 +35,77 @@ test("loads scheduler.env with a leading UTF-8 BOM", () => {
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("custom gateway defaults to Responses and CUSTOM_API_KEY", () => {
+  const root = mkdtempSync(join(tmpdir(), "looking-glass-config-custom-"));
+  try {
+    writeFileSync(join(root, ".looking-glass.json"), JSON.stringify({
+      gateway: { provider: "custom", baseURL: "http://127.0.0.1:9999/v1" },
+    }));
+    const config = loadConfig(root);
+    assert.equal(config.gateway.provider, "custom");
+    assert.equal(config.gateway.protocol, "responses");
+    assert.equal(config.gateway.apiKeyEnv, "CUSTOM_API_KEY");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("skips an invalid custom gateway protocol", () => {
+  const root = mkdtempSync(join(tmpdir(), "looking-glass-config-protocol-"));
+  try {
+    writeFileSync(join(root, ".looking-glass.json"), JSON.stringify({
+      gateway: { provider: "custom", protocol: "invalid", baseURL: "http://127.0.0.1:9999/v1" },
+    }));
+    assert.equal(loadConfig(root).gateway.provider, "codex-lb");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("skips a protocol that does not match a built-in gateway profile", () => {
+  const root = mkdtempSync(join(tmpdir(), "looking-glass-config-built-in-protocol-"));
+  try {
+    writeFileSync(join(root, ".looking-glass.json"), JSON.stringify({
+      gateway: { provider: "openrouter", protocol: "responses", baseURL: "https://gateway.invalid/v1" },
+    }));
+    assert.equal(loadConfig(root).gateway.provider, "codex-lb");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("preserves inherited custom protocol and credentials when a workspace only changes the URL", () => {
+  const root = mkdtempSync(join(tmpdir(), "looking-glass-config-layering-"));
+  const configHome = mkdtempSync(join(tmpdir(), "looking-glass-config-home-"));
+  const previousConfigHome = process.env.XDG_CONFIG_HOME;
+  const previousExplicitConfig = process.env.LOOKING_GLASS_CONFIG;
+  try {
+    mkdirSync(join(configHome, "looking-glass"), { recursive: true });
+    writeFileSync(join(configHome, "looking-glass", "config.json"), JSON.stringify({
+      gateway: {
+        provider: "custom",
+        protocol: "chat",
+        baseURL: "http://127.0.0.1:9999/v1",
+        apiKeyEnv: "MY_CUSTOM_KEY",
+      },
+    }));
+    writeFileSync(join(root, ".looking-glass.json"), JSON.stringify({
+      gateway: { baseURL: "http://127.0.0.1:9998/v1" },
+    }));
+    process.env.XDG_CONFIG_HOME = configHome;
+    delete process.env.LOOKING_GLASS_CONFIG;
+
+    const config = loadConfig(root);
+    assert.equal(config.gateway.protocol, "chat");
+    assert.equal(config.gateway.apiKeyEnv, "MY_CUSTOM_KEY");
+    assert.equal(config.gateway.baseURL, "http://127.0.0.1:9998/v1");
+  } finally {
+    if (previousConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = previousConfigHome;
+    if (previousExplicitConfig === undefined) delete process.env.LOOKING_GLASS_CONFIG;
+    else process.env.LOOKING_GLASS_CONFIG = previousExplicitConfig;
+    rmSync(root, { recursive: true, force: true });
+    rmSync(configHome, { recursive: true, force: true });
+  }
+});

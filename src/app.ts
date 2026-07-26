@@ -4,7 +4,7 @@ import { checkpointDatabase, openDatabase } from "./storage/database.js";
 import { ArtifactStore } from "./storage/artifact-store.js";
 import { SessionStore } from "./storage/session-store.js";
 import { artifactsDir, ensureStateDirectories, findWorkspaceRoot, stateDbPath } from "./paths.js";
-import { loadConfig } from "./config.js";
+import { DEFAULT_CONFIG, loadConfig } from "./config.js";
 import { loadInstructions, type LoadedInstructions } from "./instructions.js";
 import { CodexLbClient, chooseModel } from "./model/codex-lb.js";
 import { createCoreToolRegistry, createWorkerToolRegistry, type ToolRegistry } from "./tools/index.js";
@@ -14,6 +14,7 @@ import type { GatewayModel, GatewayProvider, GlassConfig, ModelInfo, SessionReco
 import { SchedulerStore } from "./scheduler/store.js";
 
 const MODEL_CATALOG_TIMEOUT_MS = 10_000;
+const INITIAL_SESSION_CATALOG_TIMEOUT_MS = 1_500;
 const MODEL_FAILURE_COOLDOWN_MS = 30_000;
 const MODEL_CACHE_TTL_MS = 30_000;
 const GATEWAY_PROBE_TIMEOUT_MS = 500;
@@ -36,17 +37,18 @@ async function waitWithSignal<T>(promise: Promise<T>, signal?: AbortSignal): Pro
 
 export class LookingGlassApp {
   readonly workspace: string;
-  readonly config: GlassConfig;
+  config: GlassConfig;
+  configurationError: Error | null = null;
   readonly db: GlassDatabase;
   readonly sessions: SessionStore;
   readonly artifacts: ArtifactStore;
-  readonly client: CodexLbClient;
-  readonly clients: Map<GatewayProvider, CodexLbClient>;
+  client!: CodexLbClient;
+  clients!: Map<GatewayProvider, CodexLbClient>;
   readonly scheduler: SchedulerStore;
-  readonly tools: ToolRegistry;
-  readonly agents: AgentCoordinator;
-  readonly instructions: LoadedInstructions;
-  readonly engine: ConversationEngine;
+  tools!: ToolRegistry;
+  agents!: AgentCoordinator;
+  instructions!: LoadedInstructions;
+  engine!: ConversationEngine;
   private readonly modelCache = new Map<GatewayProvider, ModelInfo[]>();
   private readonly modelCacheTimes = new Map<GatewayProvider, number>();
   private readonly modelRequests = new Map<GatewayProvider, Promise<ModelInfo[]>>();
@@ -57,37 +59,76 @@ export class LookingGlassApp {
   constructor(cwd = process.cwd()) {
     ensureStateDirectories();
     this.workspace = findWorkspaceRoot(cwd);
-    this.config = loadConfig(this.workspace);
+    try {
+      this.config = loadConfig(this.workspace);
+    } catch (error) {
+      this.config = structuredClone(DEFAULT_CONFIG);
+      this.configurationError = error instanceof Error ? error : new Error(String(error));
+    }
     this.db = openDatabase(stateDbPath());
     this.sessions = new SessionStore(this.db);
     this.artifacts = new ArtifactStore(this.db, artifactsDir());
     this.scheduler = new SchedulerStore(this.db);
-    this.clients = new Map([this.config.gateway, ...this.config.gateways].map((gateway) => {
+    this.rebuildRuntime();
+  }
+
+  private rebuildRuntime(): void {
+    const clients = new Map([this.config.gateway, ...this.config.gateways].map((gateway) => {
       const providerConfig = { ...this.config, gateway };
       return [gateway.provider, new CodexLbClient(providerConfig)] as const;
     }));
-    this.client = this.clientForProvider(this.config.gateway.provider);
-    this.instructions = loadInstructions(this.workspace, this.config);
-    this.agents = new AgentCoordinator(
+    const client = clients.get(this.config.gateway.provider);
+    if (!client) throw new Error(`Gateway provider is not configured: ${this.config.gateway.provider}`);
+    const instructions = loadInstructions(this.workspace, this.config);
+    const agents = new AgentCoordinator(
       this.config,
       this.workspace,
       this.sessions,
       this.artifacts,
       (provider) => this.clientForProvider(provider),
       createWorkerToolRegistry(),
-      () => loadInstructions(this.workspace, this.config).text,
+      () => this.instructions.text,
       (id, provider, signal) => this.catalogModel(id, provider, signal),
     );
-    this.tools = createCoreToolRegistry(this.scheduler, this.agents);
-    this.engine = new ConversationEngine(
+    const tools = createCoreToolRegistry(this.scheduler, agents);
+    const engine = new ConversationEngine(
       this.config,
       this.workspace,
       this.sessions,
       this.artifacts,
       (provider) => this.clientForProvider(provider),
-      this.tools,
-      this.instructions.text,
+      tools,
+      instructions.text,
     );
+    this.clients = clients;
+    this.client = client;
+    this.instructions = instructions;
+    this.agents = agents;
+    this.tools = tools;
+    this.engine = engine;
+    this.modelCache.clear();
+    this.modelCacheTimes.clear();
+    this.modelRequests.clear();
+    this.modelFailures.clear();
+  }
+
+  /** Reload onboarding/config files and replace all config-dependent services. */
+  reloadConfig(): GlassConfig {
+    let next: GlassConfig;
+    try {
+      next = loadConfig(this.workspace);
+      this.configurationError = null;
+    } catch (error) {
+      next = structuredClone(DEFAULT_CONFIG);
+      this.configurationError = error instanceof Error ? error : new Error(String(error));
+    }
+    this.config = next;
+    this.rebuildRuntime();
+    return this.config;
+  }
+
+  reconfigure(): GlassConfig {
+    return this.reloadConfig();
   }
 
   configuredProviders(): GatewayProvider[] {
@@ -156,6 +197,7 @@ export class LookingGlassApp {
     provider: GatewayProvider,
     refresh = false,
     signal?: AbortSignal,
+    timeoutMs = this.modelCatalogTimeoutMs,
   ): Promise<GatewayModel[]> {
     signal?.throwIfAborted();
     const cached = this.modelCache.get(provider);
@@ -167,7 +209,7 @@ export class LookingGlassApp {
       if (cached) return cached.map((model) => ({ ...model, provider }));
       throw new Error(`Gateway model catalog is temporarily unavailable: ${provider}`);
     }
-    const timeout = AbortSignal.timeout(this.modelCatalogTimeoutMs);
+    const timeout = AbortSignal.timeout(timeoutMs);
     const requestSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
     try {
       if (stale && !this.modelRequests.has(provider)) {
@@ -187,7 +229,7 @@ export class LookingGlassApp {
         this.modelFailures.set(provider, Date.now());
       }
       if (timeout.aborted && !signal?.aborted) {
-        throw new Error(`Gateway model catalog timed out after ${this.modelCatalogTimeoutMs}ms: ${provider}`, {
+        throw new Error(`Gateway model catalog timed out after ${timeoutMs}ms: ${provider}`, {
           cause: error,
         });
       }
@@ -227,10 +269,55 @@ export class LookingGlassApp {
   }
 
   async createSession(signal?: AbortSignal): Promise<SessionRecord> {
-    const model = chooseModel(
-      await this.catalogModelsForProvider(this.config.gateway.provider, false, signal),
-      this.config.model,
-    );
+    let model: ModelInfo;
+    try {
+      const models = await this.catalogModelsForProvider(
+        this.config.gateway.provider,
+        false,
+        signal,
+        signal ? MODEL_CATALOG_TIMEOUT_MS : INITIAL_SESSION_CATALOG_TIMEOUT_MS,
+      );
+      if (models.length === 0) throw new Error("Gateway returned no usable models");
+      model = chooseModel(models, this.config.model);
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      if (error instanceof Error && error.message.startsWith("Configured model is not available:")) throw error;
+      // A session is still useful for onboarding and /config when the gateway
+      // is offline. Keep an explicitly selected model when one was supplied.
+      if (this.config.model) {
+        model = {
+          id: this.config.model,
+          name: this.config.model,
+          description: "Configured model (catalog unavailable)",
+          contextWindow: 0,
+          maxOutputTokens: null,
+          reasoningEfforts: [this.config.reasoningEffort],
+          defaultReasoningEffort: this.config.reasoningEffort,
+          defaultVerbosity: this.config.verbosity,
+          supportsReasoning: true,
+          supportsImages: false,
+          supportsParallelToolCalls: false,
+          supportsFast: false,
+          priority: 0,
+        };
+      } else {
+        model = {
+          id: "unconfigured",
+          name: "Unconfigured model",
+          description: "Configure a gateway and model before sending prompts",
+          contextWindow: 0,
+          maxOutputTokens: null,
+          reasoningEfforts: [this.config.reasoningEffort],
+          defaultReasoningEffort: this.config.reasoningEffort,
+          defaultVerbosity: this.config.verbosity,
+          supportsReasoning: false,
+          supportsImages: false,
+          supportsParallelToolCalls: false,
+          supportsFast: false,
+          priority: 0,
+        };
+      }
+    }
     const effort = model.reasoningEfforts.includes(this.config.reasoningEffort)
       ? this.config.reasoningEffort
       : model.defaultReasoningEffort;

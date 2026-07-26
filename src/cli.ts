@@ -11,8 +11,9 @@ import { resolveWorkspacePath } from "./tools/paths.js";
 import { resolveExecutableFromPath } from "./tools/executable.js";
 import { credentialEnvironmentNames } from "./security.js";
 import { schedulerDoctorCheck, type DoctorCheck } from "./doctor.js";
+import { serializeConfig } from "./config.js";
 
-const VERSION = "0.4.0";
+const VERSION = "0.5.0";
 
 function usage(): string {
   return `Looking Glass ${VERSION}
@@ -39,6 +40,7 @@ Environment:
   CODEX_LB_API_KEY              Optional local gateway API key
   LM_STUDIO_API_KEY             Recommended LM Studio API token variable
   OPENROUTER_API_KEY            OpenRouter API key
+  CUSTOM_API_KEY                Custom OpenAI-compatible gateway API key
   LOOKING_GLASS_CONFIG          Explicit JSON/JSONC config path
   LOOKING_GLASS_DB              Explicit SQLite state path
 `;
@@ -294,6 +296,13 @@ function valueAfter(args: string[], flag: string): string | undefined {
   return index >= 0 ? args[index + 1] : undefined;
 }
 
+function configurationDiagnostic(error: Error | null): string | null {
+  if (!error) return null;
+  return error.message
+    .replace(/(api[-_]?key|token|secret)(\s*[:=]\s*)\S+/gi, "$1$2<redacted>")
+    .replace(/https?:\/\/[^\s/@]+:[^\s/@]+@/gi, "https://<redacted>@");
+}
+
 async function runPrompt(app: LookingGlassApp, args: string[]): Promise<void> {
   const assumeYes = args.includes("--yes");
   const sessionId = valueAfter(args, "--session");
@@ -380,7 +389,8 @@ async function main(): Promise<void> {
         stateDatabase: stateDbPath(),
         instructionFiles: app.instructions.files,
         instructionsTruncated: app.instructions.truncated,
-        effective: app.config,
+        configurationError: configurationDiagnostic(app.configurationError),
+        effective: serializeConfig(app.config),
       }, null, 2)}\n`);
       return;
     }

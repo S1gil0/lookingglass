@@ -7,6 +7,7 @@ import { DEFAULT_CONFIG } from "../src/config.js";
 import {
   buildResponseParams,
   CodexLbClient,
+  customModelInfo,
   lmStudioModelInfo,
   openRouterModelInfo,
   openRouterMessages,
@@ -54,6 +55,95 @@ test("LM Studio response profile uses stateless replay and omits codex-only fiel
   assert.equal(codex.prompt_cache_key, "cache-key");
   assert.equal(codex.service_tier, "priority");
   assert.equal((codex.input as ResponseInputItem[]).some((item) => item.type === "reasoning"), true);
+});
+
+test("custom Responses profile is stateless and omits gateway-specific fields", () => {
+  const params = buildResponseParams("custom", {
+    ...request,
+    input: [
+      ...request.input,
+      { type: "reasoning", id: "reasoning", summary: [], content: [] } as unknown as ResponseInputItem,
+    ],
+  });
+  assert.equal(params.store, false);
+  assert.deepEqual(params.text, { format: { type: "text" } });
+  assert.equal("previous_response_id" in params, false);
+  assert.equal("prompt_cache_key" in params, false);
+  assert.equal("include" in params, false);
+  assert.equal("service_tier" in params, false);
+  assert.equal(params.input.some((item) => item.type === "reasoning"), false);
+});
+
+test("custom model metadata is conservative when the catalog omits capabilities", () => {
+  const model = customModelInfo({ id: "custom-model" });
+  assert.equal(model.name, "custom-model");
+  assert.equal(model.contextWindow, 32_768);
+  assert.equal(model.maxOutputTokens, null);
+  assert.equal(model.supportsReasoning, false);
+  assert.equal(model.supportsImages, false);
+  assert.equal(model.supportsParallelToolCalls, false);
+  assert.equal(model.supportsFast, false);
+});
+
+test("custom Responses profile uses the Responses endpoint", async (t) => {
+  let path = "";
+  let body: Record<string, unknown> | undefined;
+  const server = createServer((req, response) => {
+    path = req.url ?? "";
+    let text = "";
+    req.on("data", (chunk) => { text += chunk; });
+    req.on("end", () => {
+      body = JSON.parse(text) as Record<string, unknown>;
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.end([
+        `data: ${JSON.stringify({ type: "response.created", response: { id: "resp_custom", status: "in_progress", model: request.model, output: [] } })}\n\n`,
+        `data: ${JSON.stringify({ type: "response.output_item.done", output_index: 0, item: { id: "msg_custom", type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: "CUSTOM_RESPONSES_OK", annotations: [], logprobs: [] }] } })}\n\n`,
+        `data: ${JSON.stringify({ type: "response.completed", response: { id: "resp_custom", status: "completed", model: request.model, output: [] } })}\n\n`,
+        "data: [DONE]\n\n",
+      ].join(""));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.gateway.provider = "custom";
+  config.gateway.protocol = "responses";
+  config.gateway.baseURL = `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1`;
+  const result = await new CodexLbClient(config).stream(request, {});
+  assert.equal(path, "/v1/responses");
+  assert.equal(result.output_text, "CUSTOM_RESPONSES_OK");
+  assert.equal(body?.store, false);
+  assert.equal("previous_response_id" in (body ?? {}), false);
+  assert.equal("prompt_cache_key" in (body ?? {}), false);
+});
+
+test("custom chat profile uses the Chat Completions path and parses basic SSE", async (t) => {
+  let path = "";
+  let body: Record<string, unknown> | undefined;
+  const server = createServer((req, response) => {
+    path = req.url ?? "";
+    let text = "";
+    req.on("data", (chunk) => { text += chunk; });
+    req.on("end", () => {
+      body = JSON.parse(text) as Record<string, unknown>;
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.end([
+        `data: ${JSON.stringify({ id: "chat_custom", choices: [{ delta: { content: "CUSTOM_OK" } }] })}\n\n`,
+        "data: [DONE]\n\n",
+      ].join(""));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.gateway.provider = "custom";
+  config.gateway.protocol = "chat";
+  config.gateway.baseURL = `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1`;
+  const result = await new CodexLbClient(config).stream(request, {});
+  assert.equal(path, "/v1/chat/completions");
+  assert.equal(result.output_text, "CUSTOM_OK");
+  assert.equal("reasoning" in (body ?? {}), false);
+  assert.equal("stream_options" in (body ?? {}), false);
 });
 
 test("LM Studio tool schemas omit long maxLength bounds without changing source tools", () => {
@@ -128,8 +218,8 @@ test("maps LM Studio native model metadata", () => {
   assert.equal(model.priority, 0);
 });
 
-test("defaults to the LM Studio gateway profile", () => {
-  assert.equal(DEFAULT_CONFIG.gateway.provider, "lm-studio");
+test("defaults to the codex-lb gateway profile", () => {
+  assert.equal(DEFAULT_CONFIG.gateway.provider, "codex-lb");
   assert.deepEqual(DEFAULT_CONFIG.gateways, []);
 });
 

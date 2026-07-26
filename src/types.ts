@@ -3,11 +3,13 @@ export const REASONING_EFFORTS = ["none", "low", "medium", "high", "xhigh", "max
 export type ReasoningEffort = (typeof REASONING_EFFORTS)[number];
 export type ApprovalMode = "review" | "code" | "unrestricted";
 export type Verbosity = "low" | "medium" | "high";
-export type GatewayProvider = "codex-lb" | "lm-studio" | "openrouter";
+export type GatewayProvider = "codex-lb" | "lm-studio" | "openrouter" | "custom";
+export type GatewayProtocol = "responses" | "chat";
 export type SessionKind = "interactive" | "agent";
 
 export interface GatewayConfig {
   provider: GatewayProvider;
+  protocol: GatewayProtocol;
   baseURL: string;
   apiKeyEnv: string;
   timeoutMs: number;

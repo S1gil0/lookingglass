@@ -8,6 +8,7 @@ import {
   UserMessage,
   activityLine,
   contextUsageLabel,
+  defaultGatewayBaseURL,
   formatCommandApproval,
   inboxLine,
   initialTuiSession,
@@ -18,6 +19,7 @@ import {
   selectedScreenText,
   sessionMetadataLine,
   shouldAutoDisplayInbox,
+  restoreApiKeyEnvironment,
 } from "../src/ui/tui.js";
 import { terminalSafe } from "../src/ui/stdio.js";
 import type { InboxRecord, SchedulerJob } from "../src/scheduler/types.js";
@@ -61,6 +63,28 @@ test("bare TUI startup creates a new session while explicit ids resume", async (
   assert.equal((await initialTuiSession(app as never, "existing-session")).id, "existing-session");
   assert.equal(resumedId, "existing-session");
   assert.equal(createCalls, 1);
+});
+
+test("provides sensible gateway onboarding defaults", () => {
+  assert.equal(defaultGatewayBaseURL("codex-lb"), "http://127.0.0.1:2455/v1");
+  assert.equal(defaultGatewayBaseURL("lm-studio"), "http://127.0.0.1:1234/v1");
+  assert.equal(defaultGatewayBaseURL("openrouter"), "https://openrouter.ai/api/v1");
+  assert.equal(defaultGatewayBaseURL("custom"), "http://127.0.0.1:8080/v1");
+});
+
+test("restores or clears the TUI API key environment snapshot", () => {
+  const environmentName = "LOOKING_GLASS_TUI_TEST_API_KEY";
+  const previous = process.env[environmentName];
+  try {
+    process.env[environmentName] = "temporary-value";
+    restoreApiKeyEnvironment(environmentName, undefined);
+    assert.equal(process.env[environmentName], undefined);
+    restoreApiKeyEnvironment(environmentName, "previous-value");
+    assert.equal(process.env[environmentName], "previous-value");
+  } finally {
+    if (previous === undefined) delete process.env[environmentName];
+    else process.env[environmentName] = previous;
+  }
 });
 
 test("recognizes SGR mouse wheel events", () => {

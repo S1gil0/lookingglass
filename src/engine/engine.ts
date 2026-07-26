@@ -678,7 +678,8 @@ export class ConversationEngine {
       + JSON.stringify(context).length
     ) / 4) + 2_000;
     if (providerTokens > 0) {
-      const providerTruncatedReplay = this.requireSession(sessionId).provider === "openrouter"
+      const providerTruncatedReplay = this.clientFor(this.requireSession(sessionId).provider)
+        .supportsResponseContinuity?.() === false
         && estimatedTokens >= usableTokens;
       return semanticGrowth >= 2 && (providerTokens >= threshold || providerTruncatedReplay);
     }

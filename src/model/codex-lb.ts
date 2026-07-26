@@ -5,7 +5,7 @@ import type {
   ResponseInputItem,
   ResponseStreamEvent,
 } from "openai/resources/responses/responses";
-import type { GatewayProvider, GlassConfig, ModelInfo, ReasoningEffort, Verbosity } from "../types.js";
+import type { GatewayProtocol, GatewayProvider, GlassConfig, ModelInfo, ReasoningEffort, Verbosity } from "../types.js";
 
 interface ErrorDetail {
   code?: string;
@@ -33,6 +33,8 @@ interface ModelMetadata {
 
 interface RawModel {
   id: string;
+  name?: string;
+  description?: string | null;
   metadata?: ModelMetadata | null;
   capabilities?: {
     context_length?: number;
@@ -155,12 +157,15 @@ function lmStudioTools(tools: FunctionTool[]): FunctionTool[] {
   });
 }
 
-export function buildResponseParams(provider: GatewayProvider, request: ResponseRequest): ResponseParams {
+export function buildResponseParams(provider: GatewayProvider, request: ResponseRequest, protocol: GatewayProtocol = "responses"): ResponseParams {
   if (provider === "openrouter") return buildOpenRouterParams(request) as unknown as ResponseParams;
+  if (provider === "custom" && protocol === "chat") {
+    return buildCustomChatParams(request) as unknown as ResponseParams;
+  }
   const common = {
     model: request.model,
     instructions: request.instructions,
-    input: provider === "lm-studio"
+    input: provider === "lm-studio" || provider === "custom"
       ? request.input.filter((item) => item.type !== "reasoning")
       : request.input,
     tools: provider === "lm-studio" ? lmStudioTools(request.tools) : request.tools,
@@ -177,6 +182,9 @@ export function buildResponseParams(provider: GatewayProvider, request: Response
       : {}),
   };
   if (provider === "lm-studio") {
+    return { ...common, store: false, text: { format: { type: "text" as const } } } as ResponseParams;
+  }
+  if (provider === "custom") {
     return { ...common, store: false, text: { format: { type: "text" as const } } } as ResponseParams;
   }
   return {
@@ -306,6 +314,37 @@ export function modelInfo(raw: RawModel): ModelInfo {
     supportsParallelToolCalls: metadata.supports_parallel_tool_calls ?? true,
     supportsFast,
     priority: metadata.priority ?? 1_000,
+  };
+}
+
+/** Metadata for providers whose catalog does not advertise capabilities reliably. */
+export function customModelInfo(raw: RawModel): ModelInfo {
+  const name = typeof raw.name === "string" && raw.name.trim()
+    ? raw.name
+    : typeof raw.metadata?.display_name === "string" && raw.metadata.display_name.trim()
+      ? raw.metadata.display_name
+      : raw.id;
+  const description = typeof raw.description === "string"
+    ? raw.description
+    : typeof raw.metadata?.description === "string" ? raw.metadata.description : "";
+  const contextWindow = [raw.context_length, raw.metadata?.context_window, raw.capabilities?.context_length]
+    .find((value): value is number => typeof value === "number" && Number.isFinite(value) && value > 0) ?? 32_768;
+  const maxOutputTokens = [raw.max_output_tokens, raw.metadata?.max_output_tokens, raw.capabilities?.max_output_tokens]
+    .find((value): value is number => typeof value === "number" && Number.isFinite(value) && value > 0) ?? null;
+  return {
+    id: raw.id,
+    name,
+    description,
+    contextWindow,
+    maxOutputTokens,
+    reasoningEfforts: ["none"],
+    defaultReasoningEffort: "none",
+    defaultVerbosity: "low",
+    supportsReasoning: false,
+    supportsImages: false,
+    supportsParallelToolCalls: false,
+    supportsFast: false,
+    priority: 1_000,
   };
 }
 
@@ -490,6 +529,25 @@ export function buildOpenRouterParams(request: ResponseRequest): Record<string, 
       : {}),
     ...(request.supportsReasoning && request.reasoningEffort !== "none"
       ? { reasoning: { effort: request.reasoningEffort } } : {}),
+  };
+}
+
+export function buildCustomChatParams(request: ResponseRequest): Record<string, unknown> {
+  const tools = request.tools.map((tool) => ({
+    type: "function",
+    function: {
+      name: tool.name,
+      description: tool.description,
+      parameters: tool.parameters,
+      ...(tool.strict === undefined ? {} : { strict: tool.strict }),
+    },
+  }));
+  return {
+    model: request.model,
+    messages: openRouterMessages(request.instructions, request.input),
+    ...(tools.length > 0
+      ? { tools, ...(request.supportsParallelToolCalls ? { parallel_tool_calls: true } : {}) }
+      : {}),
   };
 }
 
@@ -705,6 +763,11 @@ export class CodexLbClient {
       throw providerError({ code: "malformed_response", message: "model catalog data was not an array" }, { ...context, protocol: true });
     }
     const models = (payload.data ?? []).filter((model) => model && typeof model === "object" && typeof model.id === "string");
+    if (provider === "custom") {
+      return models
+        .map((model) => customModelInfo(model as unknown as RawModel))
+        .sort((left, right) => left.priority - right.priority || left.name.localeCompare(right.name));
+    }
     if (provider === "openrouter") {
       return models
         .map((model) => openRouterModelInfo(model as unknown as OpenRouterModel))
@@ -716,10 +779,14 @@ export class CodexLbClient {
       .sort((left, right) => left.priority - right.priority || left.name.localeCompare(right.name));
   }
 
-  private async openRouterStream(request: ResponseRequest, callbacks: StreamCallbacks): Promise<Response> {
+  private async openRouterStream(
+    request: ResponseRequest,
+    callbacks: StreamCallbacks,
+    provider: "openrouter" | "custom" = "openrouter",
+  ): Promise<Response> {
     const timeout = AbortSignal.timeout(this.config.gateway.timeoutMs);
     const signal = request.signal ? AbortSignal.any([request.signal, timeout]) : timeout;
-    const context = requestContext("openrouter", "stream", this.apiKey, request.signal, timeout);
+    const context = requestContext(provider, "stream", this.apiKey, request.signal, timeout);
     let http: globalThis.Response;
     try {
       http = await fetch(`${this.config.gateway.baseURL.replace(/\/$/, "")}/chat/completions`, {
@@ -729,7 +796,9 @@ export class CodexLbClient {
           "content-type": "application/json",
           accept: "text/event-stream",
         },
-        body: JSON.stringify({ ...buildOpenRouterParams(request), stream: true, stream_options: { include_usage: true } }),
+        body: JSON.stringify(provider === "custom"
+          ? { ...buildCustomChatParams(request), stream: true }
+          : { ...buildOpenRouterParams(request), stream: true, stream_options: { include_usage: true } }),
         signal,
       });
     } catch (error) {
@@ -834,6 +903,9 @@ export class CodexLbClient {
 
   async stream(request: ResponseRequest, callbacks: StreamCallbacks = {}): Promise<Response> {
     if (this.config.gateway.provider === "openrouter") return this.openRouterStream(request, callbacks);
+    if (this.config.gateway.provider === "custom" && this.config.gateway.protocol === "chat") {
+      return this.openRouterStream(request, callbacks, "custom");
+    }
     const params = buildResponseParams(this.config.gateway.provider, request);
     const timeout = AbortSignal.timeout(this.config.gateway.timeoutMs);
     const signal = request.signal ? AbortSignal.any([request.signal, timeout]) : timeout;
@@ -922,10 +994,12 @@ export class CodexLbClient {
   }
 
   async compact(request: CompactRequest): Promise<Record<string, unknown>> {
-    if (this.config.gateway.provider === "openrouter") {
+    if (this.config.gateway.provider === "openrouter"
+      || (this.config.gateway.provider === "custom" && this.config.gateway.protocol === "chat")) {
+      const chatProvider = this.config.gateway.provider;
       const semanticInput = request.input.filter((item) => item.type !== "reasoning" && item.type !== "compaction");
       if (semanticInput.length === 0) throw providerError({ code: "malformed_response", message: "compaction received no semantic transcript" }, {
-        ...requestContext("openrouter", "compact", this.apiKey, request.signal), protocol: true,
+        ...requestContext(chatProvider, "compact", this.apiKey, request.signal), protocol: true,
       });
       const checkpointInstructions = [
         request.instructions,
@@ -940,7 +1014,7 @@ export class CodexLbClient {
       });
       const timeout = AbortSignal.timeout(this.config.gateway.timeoutMs);
       const signal = request.signal ? AbortSignal.any([request.signal, timeout]) : timeout;
-      const context = requestContext("openrouter", "compact", this.apiKey, request.signal, timeout);
+      const context = requestContext(chatProvider, "compact", this.apiKey, request.signal, timeout);
       let http: globalThis.Response;
       try {
         http = await fetch(`${this.config.gateway.baseURL.replace(/\/$/, "")}/chat/completions`, {
@@ -949,7 +1023,7 @@ export class CodexLbClient {
           body: JSON.stringify({
             model: request.model,
             messages,
-            transforms: ["middle-out"],
+            ...(chatProvider === "openrouter" ? { transforms: ["middle-out"] } : {}),
             max_tokens: 8_192,
             stream: false,
           }),
@@ -982,15 +1056,18 @@ export class CodexLbClient {
         ...(usage ? { usage } : {}),
       };
     }
-    if (this.config.gateway.provider === "lm-studio") {
+    if (this.config.gateway.provider === "lm-studio"
+      || (this.config.gateway.provider === "custom" && this.config.gateway.protocol === "responses")) {
+      const responseProvider = this.config.gateway.provider;
       const transcript = compactTranscript(request.input);
-      const compactContext = requestContext("lm-studio", "compact", this.apiKey, request.signal);
+      const compactContext = requestContext(responseProvider, "compact", this.apiKey, request.signal);
       if (!transcript) throw providerError({ code: "malformed_response", message: "compaction received no semantic transcript" }, {
         ...compactContext, protocol: true,
       });
       const profile: ResponseRequest = {
         model: request.model,
         instructions: [
+          request.instructions,
           "Create a dense, durable checkpoint of the supplied conversation.",
           "Preserve user requirements, decisions, relevant facts, file paths, code changes, tool outcomes, unresolved work, and safety constraints.",
           "Do not continue the task, call tools, or add commentary. Return only the checkpoint text.",
@@ -1005,7 +1082,7 @@ export class CodexLbClient {
         tools: [],
         promptCacheKey: request.promptCacheKey,
         reasoningEffort: "none",
-        supportsReasoning: true,
+        supportsReasoning: responseProvider === "lm-studio",
         supportsParallelToolCalls: false,
         verbosity: "high",
         fast: false,
@@ -1013,7 +1090,7 @@ export class CodexLbClient {
       };
       const timeout = AbortSignal.timeout(this.config.gateway.timeoutMs);
       const signal = request.signal ? AbortSignal.any([request.signal, timeout]) : timeout;
-      const context = requestContext("lm-studio", "compact", this.apiKey, request.signal, timeout);
+      const context = requestContext(responseProvider, "compact", this.apiKey, request.signal, timeout);
       let http: globalThis.Response;
       try {
         http = await fetch(`${this.config.gateway.baseURL.replace(/\/$/, "")}/responses`, {
@@ -1022,7 +1099,7 @@ export class CodexLbClient {
             authorization: `Bearer ${this.apiKey}`,
             "content-type": "application/json",
           },
-          body: JSON.stringify(buildResponseParams("lm-studio", profile)),
+          body: JSON.stringify(buildResponseParams(responseProvider, profile, "responses")),
           signal,
         });
       } catch (error) {

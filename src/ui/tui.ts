@@ -12,6 +12,7 @@ import {
   ProcessTerminal,
   SelectList,
   TUI,
+  CURSOR_MARKER,
   matchesKey,
   sliceByColumn,
   truncateToWidth,
@@ -28,6 +29,8 @@ import {
   type SlashCommand,
 } from "@earendil-works/pi-tui";
 import type { LookingGlassApp } from "../app.js";
+import { defaultApiKeyEnv, defaultProtocol, persistGatewayConfig, writeSchedulerEnv } from "../config.js";
+import { CodexLbClient } from "../model/codex-lb.js";
 import type {
   EngineCallbacks,
   EngineInteraction,
@@ -41,6 +44,7 @@ import { windowsSystemExecutable } from "../tools/shell.js";
 import type {
   ApprovalMode,
   GatewayModel,
+  GatewayProvider,
   SessionEvent,
   SessionRecord,
 } from "../types.js";
@@ -54,6 +58,18 @@ const MAX_TOOL_PREVIEW = 320;
 const ACTIVITY_RENDER_MS = 1_000;
 const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 const DELETE_SELECTION_PREFIX = "\0delete:";
+
+export function defaultGatewayBaseURL(provider: GatewayProvider): string {
+  if (provider === "lm-studio") return "http://127.0.0.1:1234/v1";
+  if (provider === "openrouter") return "https://openrouter.ai/api/v1";
+  if (provider === "custom") return "http://127.0.0.1:8080/v1";
+  return "http://127.0.0.1:2455/v1";
+}
+
+export function restoreApiKeyEnvironment(apiKeyEnv: string, value: string | undefined): void {
+  if (value === undefined) delete process.env[apiKeyEnv];
+  else process.env[apiKeyEnv] = value;
+}
 
 interface ScreenPoint {
   column: number;
@@ -969,6 +985,7 @@ class QuestionInputModal implements Component, Focusable {
   constructor(
     private readonly terminal: AlternateScreenTerminal,
     private readonly question: string,
+    private readonly secret = false,
   ) {
     this.input.onSubmit = (answer) => this.onDone?.(answer);
     this.input.onEscape = () => this.onDone?.("");
@@ -996,9 +1013,30 @@ class QuestionInputModal implements Component, Focusable {
     const maximumQuestionRows = Math.max(1, Math.floor(this.terminal.rows * 0.6) - 6);
     const visibleQuestion = questionLines.slice(0, maximumQuestionRows);
     if (questionLines.length > visibleQuestion.length) visibleQuestion.push(dim("... question continues beyond this viewport"));
-    const inputLine = this.input.render(Math.max(1, contentWidth - 2))[0] ?? "";
-    return renderFrame("Question", [...visibleQuestion, "", `> ${inputLine}`], width);
+    const renderedInput = this.input.render(Math.max(1, contentWidth - 2))[0] ?? "";
+    const inputLine = renderedInput.startsWith("> ") ? renderedInput.slice(2) : renderedInput;
+    return renderFrame(
+      "Question",
+      [...visibleQuestion, "", `> ${this.secret ? maskSecretInput(inputLine) : inputLine}`],
+      width,
+    );
   }
+}
+
+function maskSecretInput(value: string): string {
+  return value.split(CURSOR_MARKER).map((segment) => {
+    let output = "";
+    let offset = 0;
+    const controls = /\x1b\[[0-?]*[ -/]*[@-~]/g;
+    for (const match of segment.matchAll(controls)) {
+      const index = match.index ?? 0;
+      output += [...segment.slice(offset, index)].map((character) => character === " " ? " " : "•").join("");
+      output += match[0];
+      offset = index + match[0].length;
+    }
+    output += [...segment.slice(offset)].map((character) => character === " " ? " " : "•").join("");
+    return output;
+  }).join(CURSOR_MARKER);
 }
 
 interface ActiveModal {
@@ -1234,7 +1272,7 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
         if (unavailableModelKey !== key) {
           addNotice(
             "model unavailable",
-            `${key} could not be reached: ${errorMessage(error)}. Input and session commands remain available; use /model to switch models.`,
+            `${key} could not be reached: ${errorMessage(error)}. Input and session commands remain available; use /config to retry gateway setup.`,
             yellow,
           );
           unavailableModelKey = key;
@@ -1249,7 +1287,8 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
     const latestUsage = app.sessions.latestResponseUsage(session.id);
     const checkpoint = app.sessions.latestCheckpoint(session.id);
     if (latestUsage && (!checkpoint || latestUsage.sequence > checkpoint.throughSequence)) {
-      const projectedTokens = session.provider === "openrouter"
+      const projectedTokens = app.hasProvider(session.provider)
+        && app.clientForProvider(session.provider).supportsResponseContinuity?.() === false
         ? Math.ceil(JSON.stringify(projectContext(app.sessions, session.id).input).length / 4)
         : 0;
       contextInputTokens = Math.max(latestUsage.inputTokens, projectedTokens);
@@ -1356,7 +1395,7 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
       }
       return new Promise((resolve) => {
         let settled = false;
-        const modal = new QuestionInputModal(terminal, request.question);
+        const modal = new QuestionInputModal(terminal, request.question, request.secret);
         const handle = tui.showOverlay(modal, { width: "80%", maxHeight: "80%", margin: 1 });
         const finish = (answer: string): void => {
           if (settled) return;
@@ -1584,6 +1623,202 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
       agentReasoningEffort: effort,
     });
     addNotice("agent model", `Agents will use ${model.name} (${model.provider}:${model.id}) with ${effort} reasoning.`, cyan);
+  };
+
+  const configureGateway = async (signal: AbortSignal): Promise<void> => {
+    const providerValue = await selectValue("Gateway provider", [
+      { value: "codex-lb", label: "codex-lb", description: "Local Looking Glass gateway" },
+      { value: "lm-studio", label: "lm-studio", description: "Local LM Studio server" },
+      { value: "openrouter", label: "openrouter", description: "OpenRouter hosted models" },
+      { value: "custom", label: "custom", description: "An OpenAI-compatible endpoint" },
+    ], "Choose the gateway used by this session.");
+    if (!providerValue || stopping) return;
+    signal.throwIfAborted();
+    const provider = providerValue as GatewayProvider;
+    let protocol = defaultProtocol(provider);
+    if (provider === "custom") {
+      const selectedProtocol = await selectValue("Gateway protocol", [
+        { value: "responses", label: "responses", description: "OpenAI Responses API" },
+        { value: "chat", label: "chat", description: "OpenAI Chat Completions API" },
+      ], "Choose the custom gateway protocol.");
+      if (!selectedProtocol || stopping) return;
+      protocol = selectedProtocol as typeof protocol;
+    }
+    const currentGateway = app.config.gateway.provider === provider ? app.config.gateway : null;
+    const baseURL = (await interaction.ask({
+      question: `Gateway base URL (default: ${currentGateway?.baseURL ?? defaultGatewayBaseURL(provider)})`,
+    })).trim() || currentGateway?.baseURL || defaultGatewayBaseURL(provider);
+    const apiKeyEnv = (await interaction.ask({
+      question: `API-key environment variable (default: ${currentGateway?.apiKeyEnv ?? defaultApiKeyEnv(provider)})`,
+    })).trim() || currentGateway?.apiKeyEnv || defaultApiKeyEnv(provider);
+    const enteredApiKey = (await interaction.ask({
+      question: "API key (optional; blank keeps the current key; stored in the environment file, never in config JSON)",
+      secret: true,
+    })).trim();
+    if (stopping) return;
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(apiKeyEnv)) {
+      throw new Error("API-key environment variable must be a valid name, such as OPENROUTER_API_KEY");
+    }
+    let parsedBaseURL: URL;
+    try {
+      parsedBaseURL = new URL(baseURL);
+    } catch {
+      throw new Error("Gateway base URL must be a valid HTTP or HTTPS URL");
+    }
+    if ((parsedBaseURL.protocol !== "http:" && parsedBaseURL.protocol !== "https:")
+      || parsedBaseURL.username || parsedBaseURL.password) {
+      throw new Error("Gateway base URL must be HTTP or HTTPS and must not contain credentials");
+    }
+
+    const previousApiKey = process.env[apiKeyEnv];
+    const apiKey = enteredApiKey || previousApiKey || "";
+    let models: GatewayModel[] = [];
+    let catalogError: unknown = null;
+    if (apiKey) process.env[apiKeyEnv] = apiKey;
+    try {
+      const gateway = {
+        ...app.config.gateway,
+        provider,
+        protocol,
+        baseURL,
+        apiKeyEnv,
+      };
+      const client = new CodexLbClient({ ...app.config, gateway });
+      const catalogSignal = AbortSignal.any([signal, AbortSignal.timeout(10_000)]);
+      models = (await client.models(catalogSignal)).map((model) => ({ ...model, provider }));
+    } catch (error) {
+      catalogError = error;
+    } finally {
+      restoreApiKeyEnvironment(apiKeyEnv, previousApiKey);
+    }
+    signal.throwIfAborted();
+
+    let modelId = "";
+    let selectedModel: GatewayModel | undefined;
+    if (models.length > 0) {
+      const selected = await selectValue("Model", models.map((model) => ({
+        value: model.id,
+        label: model.name,
+        description: `${model.id} | context ${model.contextWindow.toLocaleString()}`,
+      })), "Select a model for responses and agents.");
+      if (!selected || stopping) return;
+      modelId = selected;
+      selectedModel = models.find((model) => model.id === modelId);
+    } else {
+      const configured = currentGateway ? (app.config.model || session.model) : app.config.model;
+      modelId = (await interaction.ask({
+        question: `Model id (catalog unavailable${catalogError ? `: ${oneLine(errorMessage(catalogError), 100)}` : ""}; blank uses ${configured || "unconfigured"})`,
+      })).trim() || configured || "unconfigured";
+      addNotice("gateway", `Model catalog unavailable. Using ${modelId}; connectivity can be retried after setup.`, yellow);
+    }
+    signal.throwIfAborted();
+
+    persistGatewayConfig({
+      provider,
+      protocol,
+      baseURL,
+      apiKeyEnv,
+      model: modelId === "unconfigured" ? null : modelId,
+      apiKey,
+    });
+    const apiKeyBeforeReload = process.env[apiKeyEnv];
+    const restorePersistedApiKey = (): void => {
+      try {
+        writeSchedulerEnv(apiKeyEnv, apiKeyBeforeReload ?? "");
+      } catch {
+        // Preserve the original configuration error; the next /config retry
+        // can repair the environment file if its write failed.
+      }
+    };
+    // loadEnvironmentFile does not overwrite an already-exported variable.
+    // Update the current process too, so the newly configured client is used
+    // immediately rather than only after restarting the CLI.
+    if (apiKey) process.env[apiKeyEnv] = apiKey;
+    else delete process.env[apiKeyEnv];
+    try {
+      app.reloadConfig();
+      if (app.configurationError) {
+        throw new Error(`Configuration was saved but could not be loaded: ${errorMessage(app.configurationError)}`);
+      }
+    } catch (error) {
+      // The new key is only valid for the configuration that was just saved.
+      // Do not leave it exported when reload failed before that configuration
+      // became effective.
+      restorePersistedApiKey();
+      restoreApiKeyEnvironment(apiKeyEnv, apiKeyBeforeReload);
+      throw error;
+    }
+    const persistedModel = modelId === "unconfigured" ? null : modelId;
+    const effectiveGateway = app.config.gateway;
+    const gatewayMatches = effectiveGateway.provider === provider
+      && effectiveGateway.protocol === protocol
+      && effectiveGateway.baseURL === baseURL.replace(/\/$/, "")
+      && effectiveGateway.apiKeyEnv === apiKeyEnv;
+    if (!gatewayMatches || app.config.model !== persistedModel) {
+      if (!gatewayMatches) {
+        restorePersistedApiKey();
+        restoreApiKeyEnvironment(apiKeyEnv, apiKeyBeforeReload);
+      }
+      // Workspace or explicit config has higher precedence than the global
+      // file written above. Do not attach a model to a provider that the
+      // effective runtime did not actually load.
+      if (!app.hasProvider(session.provider)) {
+        const activeModel = app.config.model ?? "unconfigured";
+        session = app.sessions.updateSettings(session.id, {
+          provider: effectiveGateway.provider,
+          model: activeModel,
+          reasoningEffort: app.config.reasoningEffort,
+          agentProvider: effectiveGateway.provider,
+          agentModel: activeModel,
+          agentReasoningEffort: app.config.reasoningEffort,
+          fast: false,
+        });
+        contextWindow = 0;
+        refreshContextUsage();
+      }
+      addNotice(
+        "configuration",
+        `Global settings saved, but a workspace or explicit config takes precedence; active gateway remains ${effectiveGateway.provider}.`,
+        yellow,
+      );
+      trackTask(refreshContextWindow());
+      return;
+    }
+
+    const model: GatewayModel = selectedModel ?? {
+      id: modelId,
+      name: modelId,
+      description: "Configured model (catalog unavailable)",
+      contextWindow: 0,
+      maxOutputTokens: null,
+      reasoningEfforts: [app.config.reasoningEffort],
+      defaultReasoningEffort: app.config.reasoningEffort,
+      defaultVerbosity: app.config.verbosity,
+      supportsReasoning: true,
+      supportsImages: false,
+      supportsParallelToolCalls: false,
+      supportsFast: false,
+      priority: 0,
+      provider,
+    };
+    const effort = model.reasoningEfforts.includes(session.reasoningEffort)
+      ? session.reasoningEffort
+      : model.defaultReasoningEffort;
+    session = app.sessions.updateSettings(session.id, {
+      provider,
+      model: model.id,
+      reasoningEffort: effort,
+      agentProvider: provider,
+      agentModel: model.id,
+      agentReasoningEffort: effort,
+      fast: session.fast && model.supportsFast,
+    });
+    contextWindow = model.contextWindow;
+    unavailableModelKey = null;
+    nextModelAvailabilityCheckAt = 0;
+    refreshContextUsage();
+    addNotice("gateway", `Configured ${provider} with ${model.id}.`, green);
+    trackTask(refreshContextWindow());
   };
 
   const showInbox = (): void => {
@@ -1883,6 +2118,11 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
       await showSessionMenu();
       return;
     }
+    if (command === "config") {
+      if (argument) throw new Error("/config does not accept arguments");
+      await configureGateway(signal);
+      return;
+    }
     if (command === "persist") {
       let enabled: boolean;
       if (!argument) enabled = !session.persistent;
@@ -2064,6 +2304,7 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
     { name: "new", description: "Start a new session" },
     { name: "fork", description: "Fork current session into an independent copy" },
     { name: "session", description: "Manage current session" },
+    { name: "config", description: "Configure gateway, credentials, and model" },
     {
       name: "persist",
       description: "Enable or disable persistent scheduled turns",
@@ -2304,6 +2545,13 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
   });
 
   loadSessionEvents();
+  if (app.configurationError) {
+    addNotice(
+      "configuration",
+      `Configuration could not be loaded: ${errorMessage(app.configurationError)} Use /config to repair it.`,
+      yellow,
+    );
+  }
   process.once("SIGINT", onSignal);
   process.once("SIGTERM", onSignal);
   let started = false;

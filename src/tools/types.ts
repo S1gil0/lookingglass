@@ -17,6 +17,7 @@ export interface ApprovalRequest {
 export interface QuestionRequest {
   question: string;
   options?: string[];
+  secret?: boolean;
 }
 
 export interface ToolContext {

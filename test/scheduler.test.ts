@@ -112,7 +112,7 @@ test("installs current migrations and validates scheduler definitions", (t) => {
   const { db, root, store } = fixture(t);
   const now = Date.parse("2026-01-01T00:00:30Z");
   const versions = db.prepare("SELECT version FROM schema_migrations ORDER BY version").all() as { version: number }[];
-  assert.deepEqual(versions.map((row) => row.version), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+  assert.deepEqual(versions.map((row) => row.version), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
   const sessionId = createSession(db, root, true);
   const approval = db.prepare("SELECT approval_mode FROM sessions WHERE id = ?").get(sessionId) as { approval_mode: string };
   assert.equal(approval.approval_mode, "review");
@@ -197,7 +197,7 @@ test("migration 13 promotes existing Bash approvals to leading executables", (t)
   assert.ok(signatures.some((row) => row.signature === JSON.stringify(["bash-executable", 2, "git"])));
 });
 
-test("migration 14 preserves parent sessions and referencing conversation and scheduler data", (t) => {
+test("migrations 14-16 preserve sessions and referencing conversation and scheduler data", (t) => {
   const root = mkdtempSync(join(tmpdir(), "looking-glass-openrouter-migration-"));
   const path = join(root, "glass.db");
   let db = openDatabase(path);
@@ -246,7 +246,8 @@ test("migration 14 preserves parent sessions and referencing conversation and sc
   `).run(jobId, now);
 
   // Rebuild the sessions table into the v13 shape, retaining all records that
-  // depend on it, then let openDatabase run migration 14 as a real upgrade.
+  // depend on it, then let openDatabase run migrations 14, 15, and 16 as real
+  // upgrades.
   db.pragma("foreign_keys = OFF");
   db.pragma("legacy_alter_table = ON");
   db.exec(`
@@ -296,15 +297,28 @@ test("migration 14 preserves parent sessions and referencing conversation and sc
     CREATE INDEX sessions_workspace_updated ON sessions(workspace, updated_at DESC);
     CREATE INDEX sessions_workspace_provider_updated ON sessions(workspace, provider, updated_at DESC);
     CREATE INDEX sessions_parent_kind ON sessions(parent_session_id, session_kind, created_at);
-    DELETE FROM schema_migrations WHERE version IN (14, 15);
+    DELETE FROM schema_migrations WHERE version IN (14, 15, 16);
   `);
   db.pragma("legacy_alter_table = OFF");
   db.pragma("foreign_keys = ON");
   db.close();
 
+  // Let v14/v15/v16 run, then exercise v16 once more with a non-default fork
+  // count so the rebuild proves it does not discard the newly-added column.
   db = openDatabase(path);
-  const child = db.prepare("SELECT parent_session_id FROM sessions WHERE id = ?").get(childId) as { parent_session_id: string };
+  db.prepare("UPDATE sessions SET fork_count = 7 WHERE id = ?").run(childId);
+  db.prepare("DELETE FROM schema_migrations WHERE version = 16").run();
+  db.close();
+
+  db = openDatabase(path);
+  const child = db.prepare("SELECT parent_session_id, fork_count FROM sessions WHERE id = ?").get(childId) as { parent_session_id: string; fork_count: number };
   assert.equal(child.parent_session_id, parentId);
+  assert.equal(child.fork_count, 7);
+  db.prepare("UPDATE sessions SET provider = 'custom', agent_provider = 'custom' WHERE id = ?").run(childId);
+  assert.deepEqual(db.prepare("SELECT provider, agent_provider FROM sessions WHERE id = ?").get(childId), {
+    provider: "custom",
+    agent_provider: "custom",
+  });
   assert.deepEqual(db.prepare("SELECT message FROM scheduler_inbox WHERE id = 1").get(), {
     message: "preserve scheduler record",
   });
@@ -321,6 +335,59 @@ test("migration 14 preserves parent sessions and referencing conversation and sc
   assert.ok(indexes.has("sessions_parent_kind"));
   assert.deepEqual(db.prepare("SELECT version FROM schema_migrations WHERE version = 14").get(), { version: 14 });
   assert.deepEqual(db.prepare("SELECT version FROM schema_migrations WHERE version = 15").get(), { version: 15 });
+  assert.deepEqual(db.prepare("SELECT version FROM schema_migrations WHERE version = 16").get(), { version: 16 });
+});
+
+test("migration 16 normalizes legacy textual session flags", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "looking-glass-session-flag-migration-"));
+  const path = join(root, "glass.db");
+  let db = openDatabase(path);
+  t.after(() => {
+    if (db.open) db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  const sessionId = createSession(db, root, true);
+  db.pragma("foreign_keys = OFF");
+  db.pragma("legacy_alter_table = ON");
+  db.exec(`
+    DROP INDEX IF EXISTS sessions_workspace_updated;
+    DROP INDEX IF EXISTS sessions_workspace_provider_updated;
+    DROP INDEX IF EXISTS sessions_parent_kind;
+    ALTER TABLE sessions RENAME TO sessions_before_legacy_flags;
+    CREATE TABLE sessions AS SELECT * FROM sessions_before_legacy_flags;
+    UPDATE sessions
+    SET show_reasoning = 'true', persistent = 'false', fast = 'true', agents_enabled = 'false'
+    WHERE id = '${sessionId}';
+    DROP TABLE sessions_before_legacy_flags;
+    CREATE INDEX sessions_workspace_updated ON sessions(workspace, updated_at DESC);
+    CREATE INDEX sessions_workspace_provider_updated ON sessions(workspace, provider, updated_at DESC);
+    CREATE INDEX sessions_parent_kind ON sessions(parent_session_id, session_kind, created_at);
+    DELETE FROM schema_migrations WHERE version = 16;
+  `);
+  db.pragma("legacy_alter_table = OFF");
+  db.pragma("foreign_keys = ON");
+  db.close();
+
+  db = openDatabase(path);
+  const flags = db.prepare(`
+    SELECT show_reasoning, persistent, fast, agents_enabled,
+      typeof(show_reasoning) AS show_reasoning_type
+    FROM sessions WHERE id = ?
+  `).get(sessionId) as {
+    show_reasoning: number;
+    persistent: number;
+    fast: number;
+    agents_enabled: number;
+    show_reasoning_type: string;
+  };
+  assert.deepEqual(flags, {
+    show_reasoning: 1,
+    persistent: 0,
+    fast: 1,
+    agents_enabled: 0,
+    show_reasoning_type: "integer",
+  });
 });
 
 test("migration 10 upgrades an existing database with command approvals", (t) => {

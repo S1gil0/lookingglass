@@ -21,6 +21,7 @@ test("session forks migrate and copy only independent conversation state", (t) =
   });
 
   assert.equal((db.prepare("SELECT 1 FROM schema_migrations WHERE version = 15").get() as object | undefined) !== undefined, true);
+  assert.equal((db.prepare("SELECT 1 FROM schema_migrations WHERE version = 16").get() as object | undefined) !== undefined, true);
   const forkColumn = (db.prepare("PRAGMA table_info(sessions)").all() as { name: string; type: string; notnull: number; dflt_value: string }[])
     .find((column) => column.name === "fork_count");
   assert.deepEqual(forkColumn && {
