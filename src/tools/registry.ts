@@ -4,6 +4,9 @@ import type { ApprovalMode } from "../types.js";
 import type { GlassTool, ToolContext, ToolResult } from "./types.js";
 import { toFunctionTool } from "./types.js";
 import { configuredCredentialValues, redactSensitiveText, redactSensitiveValue } from "../security.js";
+import { ToolPreflightError } from "./errors.js";
+
+export { ToolPreflightError } from "./errors.js";
 
 interface RegisteredTool {
   tool: GlassTool;
@@ -77,13 +80,6 @@ export class ToolDeniedError extends Error {
   constructor(message = "Tool execution denied by user") {
     super(message);
     this.name = "ToolDeniedError";
-  }
-}
-
-export class ToolPreflightError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "ToolPreflightError";
   }
 }
 

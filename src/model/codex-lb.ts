@@ -419,9 +419,35 @@ export function responseText(response: Pick<Response, "output" | "output_text">)
 }
 
 function redactLmStudioReasoning(response: Response): Response {
+  const output: Response["output"] = [];
+  for (const item of response.output) {
+    if (item.type !== "reasoning") {
+      output.push(item);
+      continue;
+    }
+    const record = item as unknown as Record<string, unknown>;
+    const summary = Array.isArray(record.summary)
+      ? record.summary.flatMap((part) => {
+        if (!part || typeof part !== "object") return [];
+        const summaryPart = part as Record<string, unknown>;
+        return summaryPart.type === "summary_text" && typeof summaryPart.text === "string"
+          ? [{ type: "summary_text", text: summaryPart.text }]
+          : [];
+      })
+      : [];
+    if (summary.length > 0) {
+      const safeRecord: Record<string, unknown> = {
+        id: record.id,
+        type: "reasoning",
+        ...(typeof record.status === "string" ? { status: record.status } : {}),
+        summary,
+      };
+      output.push(safeRecord as unknown as Response["output"][number]);
+    }
+  }
   return {
     ...response,
-    output: response.output.filter((item) => item.type !== "reasoning"),
+    output,
   };
 }
 
@@ -466,6 +492,9 @@ function chatContent(value: unknown): unknown {
     const item = part as Record<string, unknown>;
     if ((item.type === "input_text" || item.type === "output_text" || item.type === "text")
       && typeof item.text === "string") return [{ type: "text", text: item.text }];
+    if (item.type === "refusal" && typeof item.refusal === "string") {
+      return [{ type: "text", text: item.refusal }];
+    }
     if (item.type === "input_image" && typeof item.image_url === "string") {
       return [{ type: "image_url", image_url: { url: item.image_url } }];
     }
@@ -810,10 +839,12 @@ export class CodexLbClient {
     }
     const outputText: string[] = [];
     const reasoningText: string[] = [];
+    const refusalText: string[] = [];
     const toolCalls = new Map<number, { id: string; name: string; arguments: string }>();
     let id = "";
     let model = request.model;
     let usage: Record<string, unknown> | undefined;
+    let finishReason: string | undefined;
     callbacks.onEvent?.({ type: "response.created", response: { id: "", status: "in_progress", model, output: [] } } as unknown as ResponseStreamEvent);
     for await (const raw of openRouterEvents(http, context)) {
       if (!raw || typeof raw !== "object") continue;
@@ -826,7 +857,9 @@ export class CodexLbClient {
       const choices = Array.isArray(event.choices) ? event.choices : [];
       for (const choice of choices) {
         if (!choice || typeof choice !== "object") continue;
-        const delta = (choice as Record<string, unknown>).delta;
+        const choiceRecord = choice as Record<string, unknown>;
+        if (typeof choiceRecord.finish_reason === "string") finishReason = choiceRecord.finish_reason;
+        const delta = choiceRecord.delta;
         if (!delta || typeof delta !== "object") continue;
         const item = delta as Record<string, unknown>;
         const text = typeof item.content === "string" ? item.content : "";
@@ -835,6 +868,8 @@ export class CodexLbClient {
           callbacks.onTextDelta?.(text);
           callbacks.onEvent?.({ type: "response.output_text.delta", delta: text } as unknown as ResponseStreamEvent);
         }
+        const refusal = typeof item.refusal === "string" ? item.refusal : "";
+        if (refusal) refusalText.push(refusal);
         const detailReasoning = Array.isArray(item.reasoning_details)
           ? item.reasoning_details.map((detail) => detail && typeof detail === "object"
             && typeof (detail as Record<string, unknown>).text === "string"
@@ -874,12 +909,20 @@ export class CodexLbClient {
       id: `msg_${id}`, type: "message", role: "assistant", status: "completed",
       content: [{ type: "output_text", text: outputText.join(""), annotations: [], logprobs: [] }],
     });
+    if (refusalText.length > 0) output.push({
+      id: `refusal_${id}`, type: "message", role: "assistant", status: "completed",
+      content: [{ type: "refusal", refusal: refusalText.join("") }],
+    });
     const callOutputIndices = new Map<number, number>();
     for (const [index, call] of [...toolCalls.entries()].sort(([left], [right]) => left - right)) {
       callOutputIndices.set(index, output.length);
       output.push({ id: call.id || `call_${id}_${index}`, type: "function_call", call_id: call.id || `call_${id}_${index}`, name: call.name, arguments: call.arguments, status: "completed" });
     }
-    if (output.length === 0) throw providerError({ code: "malformed_response", message: "response contained no output" }, { ...context, protocol: true });
+    const incompleteReason = finishReason === "length" ? "max_output_tokens"
+      : finishReason === "content_filter" ? "content_filter" : undefined;
+    if (output.length === 0 && !incompleteReason) {
+      throw providerError({ code: "malformed_response", message: "response contained no output" }, { ...context, protocol: true });
+    }
     for (const [index, item] of output.entries()) callbacks.onEvent?.({ type: "response.output_item.done", output_index: index, item } as unknown as ResponseStreamEvent);
     for (const [index, call] of [...toolCalls.entries()].sort(([left], [right]) => left - right)) {
       callbacks.onEvent?.({
@@ -887,8 +930,10 @@ export class CodexLbClient {
       } as unknown as ResponseStreamEvent);
     }
     const response = {
-      id, object: "response", created: Math.floor(Date.now() / 1000), model, status: "completed", output,
+      id, object: "response", created: Math.floor(Date.now() / 1000), model,
+      status: incompleteReason ? "incomplete" : "completed", output,
       output_text: outputText.join(""),
+      ...(incompleteReason ? { incomplete_details: { reason: incompleteReason } } : {}),
       ...(usage ? { usage: {
         input_tokens: typeof usage.prompt_tokens === "number" ? usage.prompt_tokens : 0,
         output_tokens: typeof usage.completion_tokens === "number" ? usage.completion_tokens : 0,
@@ -897,7 +942,10 @@ export class CodexLbClient {
             + (typeof usage.completion_tokens === "number" ? usage.completion_tokens : 0),
       } } : {}),
     } as unknown as Response;
-    callbacks.onEvent?.({ type: "response.completed", response } as unknown as ResponseStreamEvent);
+    callbacks.onEvent?.({
+      type: incompleteReason ? "response.incomplete" : "response.completed",
+      response,
+    } as unknown as ResponseStreamEvent);
     return response;
   }
 
@@ -931,6 +979,7 @@ export class CodexLbClient {
 
     let created: Record<string, unknown> = {};
     let terminal: Record<string, unknown> | null = null;
+    let terminalType: string | undefined;
     let streamedError: unknown = null;
     let sawTerminal = false;
     const output = new Map<number, unknown>();
@@ -949,6 +998,7 @@ export class CodexLbClient {
       }
       if (["response.completed", "response.done", "response.failed", "response.incomplete"].includes(event.type ?? "")) {
         sawTerminal = true;
+        terminalType = event.type;
         terminal = event.response ?? {};
       }
       if (event.type === "error") streamedError = event.error ?? event;
@@ -967,9 +1017,10 @@ export class CodexLbClient {
     const canonicalOutput = terminalOutput.length > 0
       ? terminalOutput
       : [...output.entries()].sort(([left], [right]) => left - right).map(([, item]) => item);
-    const status = typeof combined.status === "string"
-      ? combined.status
-      : streamedError ? "failed" : "completed";
+    const status = terminalType === "response.incomplete" ? "incomplete"
+      : terminalType === "response.failed" ? "failed"
+        : typeof combined.status === "string" ? combined.status
+          : streamedError ? "failed" : "completed";
     if (streamedError || status === "failed" || status === "incomplete") {
       throw providerError(streamedError ?? combined.error ?? combined.incomplete_details ?? { message: `Response ${status}` }, {
         ...context,

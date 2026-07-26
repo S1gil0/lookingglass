@@ -98,6 +98,16 @@ test("keeps useful plain and string payload details", () => {
   assert.match(providerError({ message: "structured provider failure" }, context).message, /structured provider failure/);
 });
 
+test("normalizes bounded incomplete response details without exposing the raw payload", () => {
+  const secret = "incomplete-secret";
+  const error = providerError({
+    incomplete_details: { reason: `max_output_tokens ${secret}\u0000` },
+  }, { ...context, responseStatus: "incomplete", configuredSecrets: [secret] });
+  assert.equal(error.responseStatus, "incomplete");
+  assert.equal(error.incompleteReason, "max_output_tokens [REDACTED]");
+  assert.doesNotMatch(error.message, new RegExp(secret));
+});
+
 test("redacts bearer assignments, configured secrets, URLs, and controls", () => {
   const secret = "very-secret-token";
   const error = providerError(new Error(

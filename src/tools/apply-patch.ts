@@ -15,6 +15,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
+import { ToolPreflightError } from "./errors.js";
 import { isWithin, resolveWorkspacePath } from "./paths.js";
 import type { GlassTool } from "./types.js";
 import { isSensitiveMutationPath, patchRisk } from "./safety.js";
@@ -83,6 +84,8 @@ interface ChangedPath {
   identity: string;
   requestedPath: string;
 }
+
+const MAX_DIAGNOSTIC_CANDIDATE_LINES = 8;
 
 const BEGIN_PATCH = "*** Begin Patch";
 const END_PATCH = "*** End Patch";
@@ -326,10 +329,20 @@ function applyHunks(content: string, hunks: Hunk[], requestedPath: string): stri
     }
     const matches = findMatches(lines, oldLines);
     if (matches.length === 0) {
-      throw new Error(`Hunk ${hunkIndex + 1} did not match exactly: ${requestedPath}`);
+      const lineWord = oldLines.length === 1 ? "line" : "lines";
+      throw new Error(
+        `Hunk ${hunkIndex + 1} did not match exactly: ${requestedPath} `
+        + `(expected ${oldLines.length} existing ${lineWord}; re-read the file and retry)`,
+      );
     }
     if (matches.length > 1) {
-      throw new Error(`Hunk ${hunkIndex + 1} matched ${matches.length} locations: ${requestedPath}`);
+      const candidateLines = matches.slice(0, MAX_DIAGNOSTIC_CANDIDATE_LINES).map((match) => match + 1);
+      const remaining = matches.length - candidateLines.length;
+      const suffix = remaining > 0 ? `, ... (+${remaining} more)` : "";
+      throw new Error(
+        `Hunk ${hunkIndex + 1} matched ${matches.length} locations: ${requestedPath} `
+        + `(candidate lines: ${candidateLines.join(", ")}${suffix}; add unique context)`,
+      );
     }
     lines.splice(matches[0] as number, oldLines.length, ...newLines);
   }
@@ -580,15 +593,27 @@ function classifyPatchRisk(args: ApplyPatchArgs, workspace: string): "write" | "
   return "write";
 }
 
+function preflightPatch(patch: string, workspace: string, platform: NodeJS.Platform): PreparedOperation[] {
+  try {
+    return preflight(parsePatch(patch), workspace, platform);
+  } catch (error) {
+    throw new ToolPreflightError(error instanceof Error ? error.message : String(error));
+  }
+}
+
 export const applyPatchTool: GlassTool<ApplyPatchArgs> = {
   name: "apply_patch",
-  description: "Apply an atomic, workspace-bound patch that adds, updates, moves, or deletes files.",
+  description: "Only argument is `patch`: use the custom `*** Begin Patch`/`*** End Patch` format. Paths are workspace-relative; prefix hunk context/removal/addition lines with ` `, `-`, or `+`. Match exact current file text and include unique context. Changes are atomic.",
   risk: "write",
   classifyRisk: (args, context) => classifyPatchRisk(args, context.workspace),
   parameters: {
     type: "object",
     properties: {
-      patch: { type: "string", minLength: 1 },
+      patch: {
+        type: "string",
+        minLength: 1,
+        description: "Required custom patch text; the only argument. Use workspace-relative paths and exact current text with unique hunk context.",
+      },
     },
     required: ["patch"],
     additionalProperties: false,
@@ -605,7 +630,7 @@ export function applyPatchForPlatform(
   workspace: string,
   platform: NodeJS.Platform = process.platform,
 ): string {
-  const prepared = preflight(parsePatch(patch), workspace, platform);
+  const prepared = preflightPatch(patch, workspace, platform);
   commit(prepared, workspace, platform);
   return changedFileSummary(prepared);
 }

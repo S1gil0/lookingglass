@@ -117,6 +117,28 @@ test("custom Responses profile uses the Responses endpoint", async (t) => {
   assert.equal("prompt_cache_key" in (body ?? {}), false);
 });
 
+test("Responses incomplete events preserve a bounded reason and status", async (t) => {
+  const server = createServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.end([
+      `data: ${JSON.stringify({ type: "response.created", response: { id: "resp_incomplete", status: "in_progress", output: [] } })}\n\n`,
+      `data: ${JSON.stringify({ type: "response.incomplete", response: { id: "resp_incomplete", incomplete_details: { reason: "max_output_tokens" } } })}\n\n`,
+      "data: [DONE]\n\n",
+    ].join(""));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.gateway.provider = "custom";
+  config.gateway.protocol = "responses";
+  config.gateway.baseURL = `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1`;
+  await assert.rejects(() => new CodexLbClient(config).stream(request, {}), (error: unknown) => {
+    assert.equal((error as { responseStatus?: string }).responseStatus, "incomplete");
+    assert.equal((error as { incompleteReason?: string }).incompleteReason, "max_output_tokens");
+    return true;
+  });
+});
+
 test("custom chat profile uses the Chat Completions path and parses basic SSE", async (t) => {
   let path = "";
   let body: Record<string, unknown> | undefined;
@@ -297,6 +319,57 @@ test("raw response streaming ignores gateway metadata and rebuilds missing termi
   assert.ok(seen.includes("response.metadata"));
 });
 
+test("LM Studio preserves safe reasoning summaries for the transcript", async (t) => {
+  const events = [
+    {
+      type: "response.created",
+      response: { id: "resp_lm_reasoning", status: "in_progress", model: "test-model", output: [] },
+    },
+    {
+      type: "response.output_item.done",
+      output_index: 0,
+      item: {
+        id: "reasoning_lm",
+        type: "reasoning",
+        status: "completed",
+        summary: [{ type: "summary_text", text: "**Checking the workspace**", encrypted_content: "summary secret" }],
+        encrypted_content: "internal reasoning",
+      },
+    },
+    {
+      type: "response.output_item.done",
+      output_index: 1,
+      item: {
+        id: "message_lm",
+        type: "message",
+        role: "assistant",
+        status: "completed",
+        content: [{ type: "output_text", text: "done", annotations: [], logprobs: [] }],
+      },
+    },
+    {
+      type: "response.completed",
+      response: { id: "resp_lm_reasoning", status: "completed", model: "test-model" },
+    },
+  ];
+  const server = createServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    for (const event of events) response.write(`data: ${JSON.stringify(event)}\n\n`);
+    response.end("data: [DONE]\n\n");
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const address = server.address() as AddressInfo;
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.gateway.provider = "lm-studio";
+  config.gateway.baseURL = `http://127.0.0.1:${address.port}/v1`;
+  const { previousResponseId: _previousResponseId, ...unanchored } = request;
+  const result = await new CodexLbClient(config).stream({ ...unanchored, model: "test-model" });
+  const reasoning = result.output.find((item) => item.type === "reasoning") as { summary?: unknown[]; encrypted_content?: unknown } | undefined;
+  assert.deepEqual(reasoning?.summary, [{ type: "summary_text", text: "**Checking the workspace**" }]);
+  assert.equal(reasoning?.encrypted_content, undefined);
+});
+
 test("maps OpenRouter free metadata and replays Responses tool items as chat messages", () => {
   const model = openRouterModelInfo({
     id: "demo/model:free",
@@ -342,6 +415,16 @@ test("OpenRouter chat content parts remain valid and tool calls preserve assista
     { type: "text", text: "look" },
     { type: "image_url", image_url: { url: "https://images.invalid/a.png" } },
   ]);
+});
+
+test("OpenRouter replays refusal output without dropping its text", () => {
+  const messages = openRouterMessages("", [
+    { role: "assistant", content: [{ type: "refusal", refusal: "I cannot help with that." }] },
+  ] as ResponseInputItem[]);
+  assert.deepEqual(messages, [{
+    role: "assistant",
+    content: [{ type: "text", text: "I cannot help with that." }],
+  }]);
 });
 
 test("OpenRouter reasoning requires the standard reasoning parameter", () => {
@@ -410,6 +493,47 @@ test("OpenRouter simple stream and stateless tool follow-up use Chat Completions
   assert.equal(second.output_text, "done");
   const secondMessages = bodies[1]?.messages as Array<Record<string, unknown>>;
   assert.equal(secondMessages.some((message) => message.role === "tool" && message.tool_call_id === "call_1"), true);
+});
+
+test("OpenRouter refusal deltas become assistant refusal output", async (t) => {
+  const server = createServer((_req, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.end(`data: ${JSON.stringify({
+      id: "chat_refusal",
+      model: "demo",
+      choices: [{ delta: { refusal: "I cannot help with that." } }],
+    })}\n\ndata: [DONE]\n\n`);
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.gateway.provider = "openrouter";
+  config.gateway.baseURL = `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1`;
+  const result = await new CodexLbClient(config).stream({ ...request });
+  const refusal = result.output.find((item) => item.type === "message") as { content?: unknown[] } | undefined;
+  assert.deepEqual(refusal?.content, [{ type: "refusal", refusal: "I cannot help with that." }]);
+  assert.equal(result.output_text, "");
+});
+
+test("OpenRouter finish reasons preserve incomplete responses", async (t) => {
+  const server = createServer((_req, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.end(`data: ${JSON.stringify({
+      id: "chat_incomplete",
+      model: "demo",
+      choices: [{ finish_reason: "length", delta: {} }],
+    })}\n\ndata: [DONE]\n\n`);
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.gateway.provider = "openrouter";
+  config.gateway.baseURL = `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1`;
+  const result = await new CodexLbClient(config).stream({ ...request });
+  assert.equal(result.status, "incomplete");
+  assert.deepEqual((result as unknown as { incomplete_details?: unknown }).incomplete_details, {
+    reason: "max_output_tokens",
+  });
 });
 
 test("OpenRouter compaction requests a durable checkpoint and normalizes usage", async (t) => {

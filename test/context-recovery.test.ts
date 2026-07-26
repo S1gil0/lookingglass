@@ -274,6 +274,7 @@ test("OpenRouter compacts oversized local replay even when provider usage was tr
   });
 
   assert.equal(result.compacted, true);
+  assert.equal(result.metrics?.compactions, 1);
   assert.equal(compactions, 1);
   assert.match(JSON.stringify(sessions.latestCheckpoint(session.id)?.compact), /bounded local replay/);
 });
@@ -336,6 +337,7 @@ test("high-usage tool rounds compact before the next model request", async (t) =
 
   assert.equal(result.text, "COMPACTED_CONTINUATION");
   assert.equal(result.compacted, true);
+  assert.equal(result.metrics?.compactions, 1);
   assert.equal(compactions, 1);
   assert.equal(requests.length, 2);
   assert.equal(requests[1]?.previousResponseId, undefined);
@@ -512,6 +514,7 @@ test("provider context overflow compacts and retries exactly once", async (t) =>
   assert.equal(requests, 2);
   assert.equal(compactions, 1);
   assert.equal(result.compacted, true);
+  assert.equal(result.metrics?.compactions, 1);
 });
 
 test("parallel tool calls share one aggregate model output budget", async (t) => {

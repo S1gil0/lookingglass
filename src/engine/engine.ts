@@ -39,11 +39,13 @@ export interface EngineCallbacks {
   onResponseStart?(round: number): void;
   onTextDelta?(delta: string): void;
   onReasoningDelta?(delta: string): void;
+  onReasoningSummary?(summary: string): void;
   onStatus?(status: string): void;
   onWarning?(message: string): void;
   onToolStart?(notice: ToolExecutionNotice): void;
   onToolProgress?(notice: ToolExecutionNotice): void;
   onToolFinish?(notice: ToolExecutionNotice): void;
+  onTurnComplete?(metrics: TurnMetrics): void;
 }
 
 export interface TurnOptions {
@@ -61,6 +63,30 @@ export interface TurnResult {
   text: string;
   toolCalls: number;
   compacted: boolean;
+  metrics?: TurnMetrics;
+}
+
+export interface TurnMetrics {
+  modelRounds: number;
+  toolCalls: number;
+  leafAgents: number;
+  compactions: number;
+  responseStatus: string;
+  refusalNotice?: string;
+  incompleteReason?: string;
+  durationMs: number;
+}
+
+export type TurnCompleteMetrics = TurnMetrics;
+
+interface TurnMetricsState {
+  modelRounds: number;
+  toolCalls: number;
+  leafAgents: number;
+  compactions: number;
+  responseStatus?: string;
+  refusalNotice?: string;
+  incompleteReason?: string;
 }
 
 function userItem(text: string): ResponseInputItem {
@@ -71,6 +97,21 @@ function functionCalls(response: Response): ResponseFunctionToolCall[] {
   return response.output.filter(
     (item): item is ResponseFunctionToolCall => item.type === "function_call",
   );
+}
+
+function responseReasoningSummary(response: Response): string | undefined {
+  const summaries = (response.output as unknown[]).flatMap((item) => {
+    if (!item || typeof item !== "object") return [];
+    const record = item as Record<string, unknown>;
+    if (record.type !== "reasoning" || !Array.isArray(record.summary)) return [];
+    return record.summary.flatMap((part) => {
+      if (!part || typeof part !== "object") return [];
+      const summary = part as Record<string, unknown>;
+      return summary.type === "summary_text" && typeof summary.text === "string" ? [summary.text] : [];
+    });
+  });
+  const text = summaries.join("\n").trim();
+  return text || undefined;
 }
 
 function toolOutputItem(callId: string, output: string): ResponseInputItem {
@@ -86,6 +127,51 @@ function errorCode(error: unknown): string | undefined {
   if (!error || typeof error !== "object" || !("code" in error)) return undefined;
   const value = (error as { code?: unknown }).code;
   return typeof value === "string" ? value : undefined;
+}
+
+function errorField(error: unknown, field: string): string | undefined {
+  if (!error || typeof error !== "object" || !(field in error)) return undefined;
+  const value = (error as Record<string, unknown>)[field];
+  return typeof value === "string" ? value : undefined;
+}
+
+function boundedNotice(value: string, secrets: readonly string[], limit = 512): string {
+  const sanitized = redactSensitiveText(value, secrets)
+    .replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return sanitized.length <= limit ? sanitized : `${sanitized.slice(0, Math.max(0, limit - 1))}…`;
+}
+
+/** Extract only bounded assistant refusal content; reasoning and encrypted fields are ignored. */
+export function extractRefusalNotice(response: Pick<Response, "output">, secrets: readonly string[] = []): string | undefined {
+  for (const item of response.output as unknown[]) {
+    if (!item || typeof item !== "object") continue;
+    const message = item as { type?: unknown; role?: unknown; content?: unknown };
+    if (message.type !== "message" || message.role !== "assistant" || !Array.isArray(message.content)) continue;
+    for (const content of message.content) {
+      if (!content || typeof content !== "object") continue;
+      const part = content as { type?: unknown; refusal?: unknown };
+      if (part.type !== "refusal" || typeof part.refusal !== "string") continue;
+      const notice = boundedNotice(part.refusal, secrets);
+      if (notice) return notice;
+    }
+  }
+  return undefined;
+}
+
+function extractIncompleteReason(response: Response, secrets: readonly string[]): string | undefined {
+  const record = response as unknown as Record<string, unknown>;
+  const details = record.incomplete_details ?? record.incompleteDetails;
+  if (!details || typeof details !== "object" || Array.isArray(details)) return undefined;
+  const reason = (details as Record<string, unknown>).reason;
+  return typeof reason === "string" ? boundedNotice(reason, secrets, 128) || undefined : undefined;
+}
+
+function failedResponseStatus(error: unknown): string {
+  const status = errorField(error, "responseStatus");
+  if (status && /^[A-Za-z][A-Za-z0-9_.:-]{0,79}$/.test(status)) return status;
+  return errorField(error, "incompleteReason") ? "incomplete" : "failed";
 }
 
 function isContextOverflowError(error: unknown): boolean {
@@ -153,9 +239,7 @@ export class ConversationEngine {
   }
 
   async turn(sessionId: string, text: string, options: TurnOptions): Promise<TurnResult> {
-    return this.withOperationLease(sessionId, "turn", options.signal, async (signal, executionToken) => {
-      return this.turnLocked(sessionId, text, { ...options, signal }, executionToken);
-    });
+    return this.runTurn(sessionId, text, options);
   }
 
   async turnReserved(
@@ -164,9 +248,62 @@ export class ConversationEngine {
     options: TurnOptions,
     reservation: SessionPromptReservation,
   ): Promise<TurnResult> {
-    return this.withOperationLease(sessionId, "turn", options.signal, async (signal, executionToken) => {
-      return this.turnLocked(sessionId, text, { ...options, signal }, executionToken);
-    }, reservation);
+    return this.runTurn(sessionId, text, options, reservation);
+  }
+
+  private async runTurn(
+    sessionId: string,
+    text: string,
+    options: TurnOptions,
+    reservation?: SessionPromptReservation,
+  ): Promise<TurnResult> {
+    const startedAt = Date.now();
+    const state: TurnMetricsState = {
+      modelRounds: 0,
+      toolCalls: 0,
+      leafAgents: 0,
+      compactions: 0,
+    };
+    try {
+      const result = await this.withOperationLease(sessionId, "turn", options.signal, async (signal, executionToken) => {
+        return this.turnLocked(sessionId, text, { ...options, signal }, executionToken, state);
+      }, reservation);
+      const metrics = this.completeMetrics(state, startedAt, state.responseStatus ?? result.response.status ?? "completed");
+      this.notifyTurnComplete(options.callbacks, metrics);
+      return { ...result, metrics };
+    } catch (error) {
+      state.responseStatus = failedResponseStatus(error);
+      const incompleteReason = errorField(error, "incompleteReason");
+      if (incompleteReason) state.incompleteReason = boundedNotice(
+        incompleteReason,
+        configuredCredentialValues(this.config),
+        128,
+      );
+      const metrics = this.completeMetrics(state, startedAt, state.responseStatus);
+      this.notifyTurnComplete(options.callbacks, metrics);
+      throw error;
+    }
+  }
+
+  private completeMetrics(state: TurnMetricsState, startedAt: number, responseStatus: string): TurnMetrics {
+    return {
+      modelRounds: state.modelRounds,
+      toolCalls: state.toolCalls,
+      leafAgents: state.leafAgents,
+      compactions: state.compactions,
+      responseStatus,
+      ...(state.refusalNotice ? { refusalNotice: state.refusalNotice } : {}),
+      ...(state.incompleteReason ? { incompleteReason: state.incompleteReason } : {}),
+      durationMs: Math.max(0, Date.now() - startedAt),
+    };
+  }
+
+  private notifyTurnComplete(callbacks: EngineCallbacks | undefined, metrics: TurnMetrics): void {
+    try {
+      callbacks?.onTurnComplete?.(metrics);
+    } catch {
+      // Visualization callbacks are observers and must never affect turn execution.
+    }
   }
 
   private async turnLocked(
@@ -174,6 +311,7 @@ export class ConversationEngine {
     text: string,
     options: TurnOptions,
     executionToken: string,
+    metrics: TurnMetricsState,
   ): Promise<TurnResult> {
     this.store.reconcileToolCallEvents(sessionId, executionToken);
     if (this.store.hasUnanchoredContext(sessionId) && this.store.get(sessionId)?.lastResponseId) {
@@ -203,6 +341,7 @@ export class ConversationEngine {
 
     try {
       for (let round = 0; round < this.config.tools.maxToolRounds; round += 1) {
+        metrics.modelRounds += 1;
         options.callbacks?.onStatus?.(round === 0 ? "Thinking" : `Tool round ${round}`);
         options.callbacks?.onResponseStart?.(round);
         const request = await this.requestWithRecovery(
@@ -211,8 +350,19 @@ export class ConversationEngine {
           previousResponseId,
           options,
           executionToken,
+          metrics,
         );
         response = request.response;
+        const reasoningSummary = responseReasoningSummary(response);
+        const status = response.status;
+        metrics.responseStatus = typeof status === "string"
+          && /^[A-Za-z][A-Za-z0-9_.:-]{0,79}$/.test(status)
+          ? status
+          : "completed";
+        const refusalNotice = extractRefusalNotice(response, secrets);
+        if (refusalNotice) metrics.refusalNotice = refusalNotice;
+        const incompleteReason = extractIncompleteReason(response, secrets);
+        if (incompleteReason) metrics.incompleteReason = incompleteReason;
         compacted = request.compacted || compacted;
         const payload: StoredResponsePayload = {
           response: {
@@ -229,12 +379,13 @@ export class ConversationEngine {
         if (!this.store.appendResponseAndSetContinuityFenced(sessionId, executionToken, payload, response.id)) {
           throw new Error("Session operation lease was lost before recording the response");
         }
+        if (reasoningSummary) options.callbacks?.onReasoningSummary?.(reasoningSummary);
 
         const calls = functionCalls(response);
-        if (calls.length === 0) {
-          if (session.kind !== "agent") {
+        if (calls.length === 0 || response.status === "incomplete" || response.status === "failed") {
+          if (calls.length === 0 && response.status !== "incomplete" && response.status !== "failed" && session.kind !== "agent") {
             try {
-              compacted = await this.autoCompact(sessionId, response, options.modelInfo, options, executionToken)
+              compacted = await this.autoCompact(sessionId, response, options.modelInfo, options, executionToken, metrics)
                 || compacted;
             } catch (error) {
               if (options.signal.aborted) throw error;
@@ -252,9 +403,10 @@ export class ConversationEngine {
         }
 
         toolCallCount += calls.length;
-        const outputs = await this.executeCalls(sessionId, calls, options, executionToken);
+        metrics.toolCalls += calls.length;
+        const outputs = await this.executeCalls(sessionId, calls, options, executionToken, metrics);
         if (await this.shouldCompact(sessionId, response, options.modelInfo)) {
-          await this.compactLocked(sessionId, options, executionToken);
+          await this.compactLocked(sessionId, options, executionToken, metrics);
           compacted = true;
           pendingInput = projectContext(this.store, sessionId).input;
           previousResponseId = undefined;
@@ -289,6 +441,7 @@ export class ConversationEngine {
     sessionId: string,
     options: Pick<TurnOptions, "signal" | "callbacks">,
     executionToken: string,
+    metrics?: TurnMetricsState,
   ): Promise<void> {
     const session = this.requireSession(sessionId);
     const context = projectContext(this.store, sessionId);
@@ -312,6 +465,7 @@ export class ConversationEngine {
     )) {
       throw new Error("Session operation lease was lost before saving the compacted context");
     }
+    if (metrics) metrics.compactions += 1;
     options.callbacks?.onStatus?.("Context compacted");
   }
 
@@ -321,6 +475,7 @@ export class ConversationEngine {
     previousResponseId: string | undefined,
     options: TurnOptions,
     executionToken: string,
+    metrics: TurnMetricsState,
   ): Promise<{ response: Response; compacted: boolean }> {
     const client = this.clientFor(session.provider);
     const anchorAbort = new AbortController();
@@ -364,7 +519,7 @@ export class ConversationEngine {
         : error;
       if (isContextOverflowError(recoveryError) && !options.signal.aborted) {
         options.callbacks?.onStatus?.("Recovering context overflow");
-        await this.compactLocked(session.id, options, executionToken);
+        await this.compactLocked(session.id, options, executionToken, metrics);
         const recoverySession = this.requireSession(session.id);
         const streamed = await client.stream({
           model: recoverySession.model,
@@ -410,6 +565,7 @@ export class ConversationEngine {
     calls: ResponseFunctionToolCall[],
     options: TurnOptions,
     executionToken: string,
+    metrics: TurnMetricsState,
   ): Promise<ResponseInputItem[]> {
     const modelOutputBytes = Math.max(1, Math.floor(this.config.tools.maxOutputBytes / Math.max(1, calls.length)));
     const readOnly = calls.every((call) => {
@@ -418,7 +574,7 @@ export class ConversationEngine {
     });
     if (readOnly) {
       const settled = await Promise.allSettled(
-        calls.map((call) => this.executeCall(sessionId, call, options, executionToken, modelOutputBytes)),
+        calls.map((call) => this.executeCall(sessionId, call, options, executionToken, modelOutputBytes, metrics)),
       );
       const failure = settled.find((result): result is PromiseRejectedResult => result.status === "rejected");
       if (failure) throw failure.reason;
@@ -426,7 +582,7 @@ export class ConversationEngine {
     }
     const outputs: ResponseInputItem[] = [];
     for (const call of calls) {
-      outputs.push(await this.executeCall(sessionId, call, options, executionToken, modelOutputBytes));
+      outputs.push(await this.executeCall(sessionId, call, options, executionToken, modelOutputBytes, metrics));
     }
     return outputs;
   }
@@ -437,6 +593,7 @@ export class ConversationEngine {
     options: TurnOptions,
     executionToken: string,
     modelOutputBytes: number,
+    metrics: TurnMetricsState,
   ): Promise<ResponseInputItem> {
     let args: unknown;
     try {
@@ -553,6 +710,12 @@ export class ConversationEngine {
       }
       options.signal.throwIfAborted();
       const result = await this.tools.execute(call.name, args, context);
+      if (call.name === "run_agents") {
+        const attempted = result.metadata?.agentTasksAttempted;
+        if (typeof attempted === "number" && Number.isFinite(attempted) && attempted > 0) {
+          metrics.leafAgents += Math.floor(attempted);
+        }
+      }
       if (options.signal.aborted) {
         this.persistUnknownToolOutput(sessionId, call, executionToken, options);
         throw new Error("Tool execution was interrupted; its outcome is unknown");
@@ -658,9 +821,10 @@ export class ConversationEngine {
     model: ModelInfo,
     options: TurnOptions,
     executionToken: string,
+    metrics: TurnMetricsState,
   ): Promise<boolean> {
     if (!await this.shouldCompact(sessionId, response, model)) return false;
-    await this.compactLocked(sessionId, options, executionToken);
+    await this.compactLocked(sessionId, options, executionToken, metrics);
     return true;
   }
 

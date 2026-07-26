@@ -33,5 +33,5 @@ export function createCoreToolRegistry(scheduler?: SchedulerStore, agents?: Agen
 }
 
 export { ToolRegistry, ToolDeniedError } from "./registry.js";
-export type { ApprovalDecision, ApprovalRequest, QuestionRequest, ToolContext, ToolResult } from "./types.js";
+export type { ApprovalDecision, ApprovalRequest, QuestionRequest, ToolContext, ToolResult, ToolResultMetadata } from "./types.js";
 export type { AgentBatchRunner, AgentTaskInput, RunAgentsArgs } from "./agents.js";

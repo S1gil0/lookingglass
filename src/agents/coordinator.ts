@@ -36,6 +36,25 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function progressDetail(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  const compact = value.replace(/\s+/gu, " ").trim();
+  return compact || undefined;
+}
+
+function reportAgentAction(
+  context: ToolContext,
+  identity: string,
+  taskId: string,
+  action: string,
+  detail?: string,
+): void {
+  const suffix = progressDetail(detail);
+  context.reportProgress?.(
+    `${identity} | agent ${JSON.stringify(taskId)} [${action}]${suffix ? `: ${suffix}` : ""}`,
+  );
+}
+
 function utf8Prefix(text: string, maxBytes: number): string {
   const data = Buffer.from(text);
   let end = Math.min(data.length, Math.max(0, maxBytes));
@@ -93,10 +112,12 @@ export class AgentCoordinator implements AgentBatchRunner {
     const concurrency = Math.min(args.concurrency ?? 4, args.tasks.length);
     const results = new Array<AgentTaskResult>(args.tasks.length);
     let cursor = 0;
+    let attempted = 0;
     const runTask = async (task: AgentTaskInput, index: number): Promise<void> => {
       context.signal.throwIfAborted();
+      attempted += 1;
       const identity = `${model.provider}:${model.id} | reasoning ${parent.agentReasoningEffort}`;
-      context.reportProgress?.(`${identity} | agent ${task.id} [starting]`);
+      reportAgentAction(context, identity, task.id, "starting");
       const child = this.sessions.create({
         workspace: this.workspace,
         provider: model.provider,
@@ -121,7 +142,28 @@ export class AgentCoordinator implements AgentBatchRunner {
             ask: async () => "",
           },
           callbacks: {
-            onStatus: (status) => context.reportProgress?.(`${identity} | agent ${task.id} [${status}]`),
+            onStatus: (status) => reportAgentAction(context, identity, task.id, status),
+            onToolStart: (notice) => reportAgentAction(
+              context,
+              identity,
+              task.id,
+              `tool ${notice.name} started`,
+              notice.summary,
+            ),
+            onToolProgress: (notice) => reportAgentAction(
+              context,
+              identity,
+              task.id,
+              `tool ${notice.name} progress`,
+              notice.output,
+            ),
+            onToolFinish: (notice) => reportAgentAction(
+              context,
+              identity,
+              task.id,
+              `tool ${notice.name} ${notice.failed ? "failed" : "finished"}`,
+              notice.output,
+            ),
           },
           modelInfo: model,
           automated: true,
@@ -136,7 +178,7 @@ export class AgentCoordinator implements AgentBatchRunner {
           reasoningEffort: parent.agentReasoningEffort,
           text: turn.text.trim() || "Agent completed without a text response.",
         };
-        context.reportProgress?.(`${identity} | agent ${task.id} [done]`);
+        reportAgentAction(context, identity, task.id, "done");
       } catch (error) {
         if (context.signal.aborted) throw error;
         results[index] = {
@@ -147,7 +189,7 @@ export class AgentCoordinator implements AgentBatchRunner {
           reasoningEffort: parent.agentReasoningEffort,
           error: errorMessage(error),
         };
-        context.reportProgress?.(`${identity} | agent ${task.id} [failed]: ${errorMessage(error)}`);
+        reportAgentAction(context, identity, task.id, "failed", errorMessage(error));
       }
     };
     const workers = Array.from({ length: concurrency }, async () => {
@@ -174,7 +216,9 @@ export class AgentCoordinator implements AgentBatchRunner {
       ].join("\n")),
     ].join("\n");
     const limit = this.config.tools.maxOutputBytes;
-    if (Buffer.byteLength(fullOutput) <= limit) return { output: fullOutput };
+    if (Buffer.byteLength(fullOutput) <= limit) {
+      return { output: fullOutput, metadata: { agentTasksAttempted: attempted } };
+    }
     const artifact = this.artifacts.save(parent.id, "agent-results", fullOutput, {
       model: `${model.provider}:${model.id}`,
       reasoningEffort: parent.agentReasoningEffort,
@@ -187,6 +231,7 @@ export class AgentCoordinator implements AgentBatchRunner {
       display: `Agent batch completed; full results saved to ${artifact.uri}`,
       artifactUri: artifact.uri,
       truncated: true,
+      metadata: { agentTasksAttempted: attempted },
     };
   }
 }

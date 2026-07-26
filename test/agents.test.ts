@@ -14,7 +14,7 @@ import { SessionStore } from "../src/storage/session-store.js";
 import { createCoreToolRegistry, createWorkerToolRegistry } from "../src/tools/index.js";
 import { ToolPreflightError } from "../src/tools/registry.js";
 import type { AgentBatchRunner } from "../src/tools/agents.js";
-import type { ToolContext } from "../src/tools/types.js";
+import type { GlassTool, ToolContext } from "../src/tools/types.js";
 import type { GatewayModel } from "../src/types.js";
 
 function response(id: string, text: string): Response {
@@ -154,12 +154,98 @@ test("agent coordinator runs isolated tasks concurrently with configured model m
   assert.match(result.output, /codex-lb:gpt-luna \| reasoning high/);
   assert.match(result.output, /child_session_id:/);
   assert.equal(instructionLoads, 3);
-  assert.ok(progress.some((message) => /gpt-luna.*reasoning high.*agent fast \[starting\]/.test(message)));
+  assert.equal(result.metadata?.agentTasksAttempted, 3);
+  assert.ok(progress.some((message) => /gpt-luna.*reasoning high.*agent "fast" \[starting\]/.test(message)));
   assert.equal(sessions.list(root).length, 1);
   const children = db.prepare("SELECT * FROM sessions WHERE parent_session_id = ?").all(parent.id) as { session_kind: string; model: string; reasoning_effort: string }[];
   assert.equal(children.length, 3);
   assert.ok(children.every((child) => child.session_kind === "agent"));
   assert.ok(children.every((child) => child.model === "gpt-luna" && child.reasoning_effort === "high"));
+});
+
+test("agent coordinator forwards child tool callbacks as agent progress actions", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "looking-glass-agents-callbacks-"));
+  const artifactDir = join(root, "artifacts");
+  mkdirSync(artifactDir);
+  const db = openDatabase(join(root, "state.db"));
+  t.after(() => {
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+  const sessions = new SessionStore(db);
+  const artifacts = new ArtifactStore(db, artifactDir);
+  const parent = sessions.create({
+    workspace: root,
+    provider: "codex-lb",
+    model: "gpt-sol",
+    reasoningEffort: "medium",
+    agentProvider: "codex-lb",
+    agentModel: "gpt-luna",
+    agentReasoningEffort: "high",
+    verbosity: "low",
+    fast: false,
+    approvalMode: "unrestricted",
+  });
+  let requests = 0;
+  const client = {
+    supportsResponseContinuity: () => true,
+    async stream() {
+      requests += 1;
+      return requests === 1
+        ? toolCallResponse("progress", "progress_tool", { value: "sample" })
+        : response("done", "agent done");
+    },
+  } as unknown as CodexLbClient;
+  const progressTool: GlassTool<{ value: string }> = {
+    name: "progress_tool",
+    description: "Emit progress from a child tool.",
+    risk: "read",
+    parameters: {
+      type: "object",
+      properties: { value: { type: "string" } },
+      required: ["value"],
+      additionalProperties: false,
+    },
+    summarize: ({ value }) => value,
+    execute: async ({ value }, context) => {
+      context.reportProgress?.(`progress ${value}`);
+      return { output: `result ${value}` };
+    },
+  };
+  const coordinator = new AgentCoordinator(
+    structuredClone(DEFAULT_CONFIG),
+    root,
+    sessions,
+    artifacts,
+    () => client,
+    createWorkerToolRegistry().register(progressTool),
+    "main instructions",
+    async () => agentModel,
+  );
+  const progress: string[] = [];
+  const context: ToolContext = {
+    workspace: root,
+    sessionId: parent.id,
+    config: structuredClone(DEFAULT_CONFIG),
+    approvalMode: "unrestricted",
+    artifacts,
+    sessions,
+    signal: new AbortController().signal,
+    approve: async () => "deny",
+    ask: async () => "",
+    reportProgress: (message) => progress.push(message),
+  };
+
+  const result = await coordinator.run({
+    tasks: [{ id: "callbacks", prompt: "Use the progress tool." }],
+    concurrency: 1,
+  }, context);
+
+  assert.equal(requests, 2);
+  assert.match(result.output, /agent done/);
+  assert.ok(progress.some((message) => /agent "callbacks" \[tool progress_tool started\]: sample/.test(message)));
+  assert.ok(progress.some((message) => /agent "callbacks" \[tool progress_tool progress\]: progress sample/.test(message)));
+  assert.ok(progress.some((message) => /agent "callbacks" \[tool progress_tool finished\]: result sample/.test(message)));
 });
 
 test("agent coordinator propagates read-only context to code-mode child turns", async (t) => {

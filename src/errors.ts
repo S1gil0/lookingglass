@@ -24,6 +24,7 @@ interface ProviderErrorFields {
   param?: string;
   status?: number;
   responseStatus?: number | string;
+  incompleteReason?: string;
 }
 
 export interface NormalizedProviderError extends Error, ProviderErrorFields {}
@@ -35,6 +36,7 @@ interface DetailFields {
   param?: string;
   status?: number;
   responseStatus?: number | string;
+  incompleteReason?: string;
 }
 
 interface CauseEntry {
@@ -112,7 +114,7 @@ function collectDetails(value: unknown, result: DetailFields, seen: Set<object>,
   seen.add(value);
 
   // Prefer the useful nested provider object over an SDK's generic outer message.
-  for (const key of ["error", "detail", "errors"]) {
+  for (const key of ["error", "detail", "errors", "incomplete_details", "incompleteDetails"]) {
     collectDetails(read(value, key), result, seen, depth + 1);
   }
 
@@ -153,6 +155,24 @@ function collectDetails(value: unknown, result: DetailFields, seen: Set<object>,
       ?? (status === undefined ? responseStatusValue(rawStatus) : undefined);
     if (responseStatus !== undefined) result.responseStatus = responseStatus;
   }
+  if (result.incompleteReason === undefined) {
+    const incompleteReason = textValue(read(value, "incompleteReason"))
+      ?? textValue(read(value, "incomplete_reason"));
+    if (incompleteReason !== undefined) result.incompleteReason = incompleteReason;
+  }
+}
+
+function responseIncompleteReason(value: unknown, seen: Set<object>, depth = 0): string | undefined {
+  if (depth > 6 || !value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  if (seen.has(value)) return undefined;
+  seen.add(value);
+  const direct = textValue(read(value, "reason"));
+  if (direct !== undefined) return direct;
+  for (const key of ["incomplete_details", "incompleteDetails", "response", "error", "detail"]) {
+    const found = responseIncompleteReason(read(value, key), seen, depth + 1);
+    if (found !== undefined) return found;
+  }
+  return undefined;
 }
 
 function inspectCauses(value: unknown, result: CauseClues, seen: Set<object>, depth = 0): void {
@@ -316,11 +336,18 @@ export function providerError(error: unknown, context: ProviderErrorContext): No
   const code = safeField(detail.code, secrets, 96);
   const type = safeField(detail.type, secrets, 96);
   const param = safeField(detail.param, secrets, 96);
+  const incompleteReason = safeField(
+    detail.incompleteReason
+      ?? (responseStatus === "incomplete" ? responseIncompleteReason(error, new Set<object>()) : undefined),
+    secrets,
+    128,
+  );
   if (code !== undefined) fields.code = code;
   if (type !== undefined) fields.type = type;
   if (param !== undefined) fields.param = param;
   if (status !== undefined) fields.status = status;
   if (responseStatus !== undefined) fields.responseStatus = responseStatus;
+  if (incompleteReason !== undefined) fields.incompleteReason = incompleteReason;
   Object.assign(normalized, fields);
   return normalized as NormalizedProviderError;
 }

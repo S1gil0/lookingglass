@@ -43,6 +43,13 @@ export interface ToolResult {
   display?: string;
   artifactUri?: string;
   truncated?: boolean;
+  /** Ephemeral execution facts for the current engine turn. */
+  metadata?: ToolResultMetadata;
+}
+
+export interface ToolResultMetadata {
+  /** Number of leaf tasks actually started by run_agents. */
+  agentTasksAttempted?: number;
 }
 
 export interface GlassTool<TArgs = unknown> {

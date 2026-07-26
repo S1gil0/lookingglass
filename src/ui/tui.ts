@@ -34,6 +34,7 @@ import { CodexLbClient } from "../model/codex-lb.js";
 import type {
   EngineCallbacks,
   EngineInteraction,
+  TurnMetrics,
 } from "../engine/engine.js";
 import { projectContext } from "../engine/context.js";
 import type { InboxRecord, SchedulerJob } from "../scheduler/types.js";
@@ -155,10 +156,68 @@ function oneLine(text: string, limit = MAX_TOOL_PREVIEW): string {
   return compact.length > limit ? `${compact.slice(0, Math.max(0, limit - 3))}...` : compact;
 }
 
-export function contextUsageLabel(inputTokens: number, contextWindow: number): string {
-  if (contextWindow <= 0) return "ctx:?";
-  const percent = Math.max(0, Math.min(999, Math.round((inputTokens / contextWindow) * 100)));
-  return `ctx:${percent}%`;
+export function formatTokenCount(inputTokens: number | null | undefined): string | null {
+  if (typeof inputTokens !== "number" || !Number.isFinite(inputTokens) || inputTokens < 0) return null;
+  const tokens = Math.max(0, Math.round(inputTokens));
+  if (tokens < 1_000) return String(tokens);
+  const compact = (tokens / 1_000).toFixed(1).replace(/\.0$/u, "");
+  return `${compact}k`;
+}
+
+export function contextUsageLabel(
+  inputTokens: number | null | undefined,
+  contextWindow: number | null | undefined,
+): string {
+  const tokenCount = formatTokenCount(inputTokens);
+  const suffix = tokenCount ? `/${tokenCount}` : "";
+  if (typeof contextWindow !== "number" || !Number.isFinite(contextWindow) || contextWindow <= 0) {
+    return `ctx:?${suffix}`;
+  }
+  if (!tokenCount) return "ctx:?";
+  const usableInputTokens = typeof inputTokens === "number" && Number.isFinite(inputTokens)
+    ? Math.max(0, inputTokens)
+    : 0;
+  const percent = Math.max(0, Math.min(999, Math.round((usableInputTokens / contextWindow) * 100)));
+  return `ctx:${percent}%${suffix}`;
+}
+
+function metricCount(value: number): number {
+  return Number.isFinite(value) ? Math.max(0, Math.round(value)) : 0;
+}
+
+function metricStatus(value: unknown): string {
+  return typeof value === "string" ? oneLine(value, 80) || "unknown" : "unknown";
+}
+
+function metricDuration(durationMs: number): string {
+  const duration = Math.max(0, Number.isFinite(durationMs) ? durationMs : 0);
+  return duration < 1_000 ? `${Math.round(duration)}ms` : `${(duration / 1_000).toFixed(1)}s`;
+}
+
+/** Format the bounded, non-reasoning details shown after each model turn. */
+export function formatTurnSummary(metrics: TurnMetrics): string {
+  const summary = [
+    `status:${metricStatus(metrics.responseStatus)}`,
+    `duration:${metricDuration(metrics.durationMs)}`,
+    `rounds:${metricCount(metrics.modelRounds)}`,
+    `tools:${metricCount(metrics.toolCalls)}`,
+    `agents:${metricCount(metrics.leafAgents)}`,
+    `compactions:${metricCount(metrics.compactions)}`,
+  ];
+  const refusal = typeof metrics.refusalNotice === "string" ? oneLine(metrics.refusalNotice, 512) : "";
+  const incompleteReason = typeof metrics.incompleteReason === "string"
+    ? oneLine(metrics.incompleteReason, 128)
+    : "";
+  if (refusal) summary.push(`refusal:${refusal}`);
+  if (incompleteReason) summary.push(`incomplete:${incompleteReason}`);
+  return summary.join(" | ");
+}
+
+function turnSummaryColor(metrics: TurnMetrics): Style {
+  const status = metricStatus(metrics.responseStatus).toLowerCase();
+  if (/failed|error|refus|reject/.test(status)) return red;
+  if (metrics.refusalNotice || metrics.incompleteReason || /incomplete|cancel|abort|partial/.test(status)) return yellow;
+  return green;
 }
 
 export function sessionMetadataLine(
@@ -300,6 +359,10 @@ function pad(line: string, width: number): string {
 
 function wrap(text: string, width: number): string[] {
   return wrapTextWithAnsi(displaySafe(text), Math.max(1, width));
+}
+
+function plainReasoningText(text: string): string {
+  return displaySafe(text).replace(/\*\*|__/g, "");
 }
 
 function renderFrame(title: string, body: string[], width: number): string[] {
@@ -485,24 +548,22 @@ class StreamingAssistant extends AssistantMessage {
   }
 }
 
-class ReasoningSummary implements Component {
+export class ReasoningSummary implements Component {
   protected text: string;
 
   constructor(text = "") {
-    this.text = displaySafe(text);
+    this.text = plainReasoningText(text);
   }
 
   setText(text: string): void {
-    this.text = displaySafe(text);
+    this.text = plainReasoningText(text);
   }
 
   invalidate(): void {}
 
   render(width: number): string[] {
     if (!this.text) return [];
-    const contentWidth = Math.max(1, width - 2);
-    return [dim("Reasoning summary"), ...wrap(this.text, contentWidth).map((line) => `  ${dim(line)}`), ""]
-      .map((line) => fit(line, width));
+    return [...wrap(this.text, width).map((line) => tonalLine(line, width, 234)), ""];
   }
 }
 
@@ -538,9 +599,12 @@ class StreamingReasoning extends ReasoningSummary {
 }
 
 export class ToolCard implements Component {
+  private static readonly MAX_AGENT_ACTIONS = 5;
   private output: string | null = null;
   private failed = false;
   private finished = false;
+  private readonly agentActions = new Map<string, string[]>();
+  private readonly agentIdentities = new Map<string, string>();
 
   constructor(
     readonly callId: string,
@@ -555,7 +619,17 @@ export class ToolCard implements Component {
   }
 
   progress(output: string): void {
-    if (!this.finished) this.output = oneLine(output) || null;
+    if (this.finished) return;
+    const agentProgress = this.parseAgentProgress(output);
+    if (agentProgress) {
+      const history = this.agentActions.get(agentProgress.agent) ?? [];
+      history.unshift(agentProgress.action);
+      history.length = Math.min(history.length, ToolCard.MAX_AGENT_ACTIONS);
+      this.agentActions.set(agentProgress.agent, history);
+      if (agentProgress.identity) this.agentIdentities.set(agentProgress.agent, agentProgress.identity);
+      return;
+    }
+    this.output = oneLine(output) || null;
   }
 
   invalidate(): void {}
@@ -564,12 +638,46 @@ export class ToolCard implements Component {
     const state = this.finished ? (this.failed ? red("failed") : green("done")) : yellow("running");
     const header = `${dim("tool")} ${cyan(oneLine(this.name))} [${state}] ${oneLine(this.summary)}`;
     const lines = [fit(header, width)];
+    for (const [agent, actions] of this.agentActions) {
+      const identity = this.agentIdentities.get(agent);
+      const label = identity ? `agent ${agent} | ${identity}` : `agent ${agent}`;
+      lines.push(fit(`  ${cyan(oneLine(label))}`, width));
+      lines.push(...[...actions].reverse().map((action) => fit(`    ${dim(action)}`, width)));
+    }
     if (this.output) lines.push(fit(`  ${dim(this.output)}`, width));
     return [...lines.map((line) => tonalLine(line, width, 236)), ""];
   }
+
+  private parseAgentProgress(output: string): { agent: string; action: string; identity?: string } | null {
+    const encodedMatch = output.match(/^(?:(.*?)\s+\|\s+)?agent\s+("(?:\\[\s\S]|[^"\\])*")\s+\[([^\]]+)\](?::\s?(.*))?$/u);
+    if (encodedMatch) {
+      try {
+        const agent = JSON.parse(encodedMatch[2]!) as unknown;
+        if (typeof agent === "string") {
+          const identity = oneLine(encodedMatch[1] ?? "", 120);
+          const action = oneLine([
+            encodedMatch[3] ?? "",
+            encodedMatch[4] ? `: ${encodedMatch[4]}` : "",
+          ].join(""));
+          return agent && action ? { agent, action, ...(identity ? { identity } : {}) } : null;
+        }
+      } catch {
+        // Fall through to the legacy parser for malformed or older messages.
+      }
+    }
+    const match = output.match(/^(?:(.*?)\s+\|\s+)?agent\s+(.+?)\s+\[([^\]]+)\](?::\s?(.*))?$/u);
+    if (!match) return null;
+    const identity = oneLine(match[1] ?? "", 120);
+    const agent = oneLine(match[2] ?? "", 80);
+    const action = oneLine([
+      match[3] ?? "",
+      match[4] ? `: ${match[4]}` : "",
+    ].join(""));
+    return agent && action ? { agent, action, ...(identity ? { identity } : {}) } : null;
+  }
 }
 
-class Notice implements Component {
+export class Notice implements Component {
   constructor(
     private readonly label: string,
     private readonly text: string,
@@ -1220,7 +1328,7 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
   let activityTimer: NodeJS.Timeout | null = null;
   let activityFrame = 0;
   let selectionDragging = false;
-  let contextInputTokens = 0;
+  let contextInputTokens: number | null = null;
   let contextWindow = 0;
   let unavailableModelKey: string | null = null;
   let nextModelAvailabilityCheckAt = 0;
@@ -1420,7 +1528,7 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
       }
       if (event.kind === "response") {
         const summary = reasoningSummary(event);
-        if (session.showReasoning && summary) root.addEntry(new ReasoningSummary(summary));
+        if (summary) root.addEntry(new ReasoningSummary(summary));
         const text = assistantText(event);
         if (text) root.addEntry(new AssistantMessage(text));
         continue;
@@ -1458,10 +1566,13 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
   const callbacks = (): EngineCallbacks => {
     let currentAssistant: StreamingAssistant | null = null;
     let currentReasoning: StreamingReasoning | null = null;
+    let reasoningDeltaSeen = false;
+    let turnCompleteShown = false;
     return {
       onResponseStart(round) {
         currentAssistant?.flush();
         currentReasoning?.flush();
+        reasoningDeltaSeen = false;
         currentReasoning = new StreamingReasoning(requestTranscriptRender);
         streamingReasoning.add(currentReasoning);
         if (session.showReasoning) add(currentReasoning);
@@ -1479,8 +1590,12 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
         currentAssistant.append(delta);
       },
       onReasoningDelta(delta) {
+        reasoningDeltaSeen = true;
         engineStatus = "Reasoning";
         currentReasoning?.append(delta);
+      },
+      onReasoningSummary(summary) {
+        if (!session.showReasoning || !reasoningDeltaSeen) add(new ReasoningSummary(summary));
       },
       onStatus(status) {
         engineStatus = displaySafe(status);
@@ -1488,6 +1603,11 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
       },
       onWarning(message) {
         addNotice("warning", message, yellow);
+      },
+      onTurnComplete(metrics) {
+        if (turnCompleteShown) return;
+        turnCompleteShown = true;
+        addNotice("turn", formatTurnSummary(metrics), turnSummaryColor(metrics));
       },
       onToolStart(notice) {
         currentAssistant?.flush();
@@ -1984,7 +2104,7 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
       { value: "approvals", label: "Manage always approvals", description: `${approvals.length} registered` },
       {
         value: "thinking",
-        label: session.showReasoning ? "Hide reasoning summaries" : "Show reasoning summaries",
+        label: session.showReasoning ? "Hide live reasoning" : "Show live reasoning",
       },
     ], `${session.id}\n${session.model}`);
     if (!action || stopping) return;
@@ -2221,7 +2341,7 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
       else throw new Error(`/${command} accepts on or off`);
       session = app.sessions.updateSettings(session.id, { showReasoning: enabled });
       loadSessionEvents();
-      addNotice("reasoning", `Reasoning summaries ${enabled ? "shown" : "hidden"}.`, cyan);
+      addNotice("reasoning", `Live reasoning ${enabled ? "shown" : "hidden"}.`, cyan);
       return;
     }
     if (command === "fast") {
@@ -2375,7 +2495,7 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
     },
     {
       name: "thinking",
-      description: "Show or hide reasoning summaries",
+      description: "Show or hide live model reasoning",
       argumentHint: "[on|off]",
       getArgumentCompletions: (prefix) => ["on", "off"]
         .filter((value) => value.startsWith(prefix))

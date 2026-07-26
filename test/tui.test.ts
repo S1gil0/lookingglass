@@ -9,13 +9,17 @@ import {
   activityLine,
   contextUsageLabel,
   defaultGatewayBaseURL,
+  formatTokenCount,
+  formatTurnSummary,
   formatCommandApproval,
   inboxLine,
   initialTuiSession,
   markInboxItemsRead,
+  Notice,
   mouseWheelDelta,
   parseTerminalMouse,
   parseSessionSchedule,
+  ReasoningSummary,
   selectedScreenText,
   sessionMetadataLine,
   shouldAutoDisplayInbox,
@@ -174,8 +178,8 @@ test("renders activity separately from ordered session metadata", () => {
     parentSessionId: null,
     createdAt: 1,
     updatedAt: 1,
-  }, "unrestricted", "ctx:42%");
-  assert.equal(metadata, "qwen/model | medium | ctx:42% | agents:on | unrestricted | persist:on | Session name");
+  }, "unrestricted", "ctx:42%/1.2k");
+  assert.equal(metadata, "qwen/model | medium | ctx:42%/1.2k | agents:on | unrestricted | persist:on | Session name");
   const narrow = sessionMetadataLine({
     id: "session",
     workspace: "/tmp",
@@ -198,13 +202,57 @@ test("renders activity separately from ordered session metadata", () => {
     parentSessionId: null,
     createdAt: 1,
     updatedAt: 1,
-  }, "unrestricted", "ctx:42%", 79);
-  assert.match(narrow, /^qwen\/.* \| medium \| ctx:42% \| agents:off \| unrestricted \| p:on \| A/);
+  }, "unrestricted", "ctx:42%/1.2k", 79);
+  assert.match(narrow, /^qwen\/.* \| medium \| ctx:42%\/1.2k \| agents:off \| unrestricted \| p:on \| A/);
   assert.ok(narrow.length <= 79);
-  assert.equal(contextUsageLabel(65_536, 262_144), "ctx:25%");
-  assert.equal(contextUsageLabel(1, 0), "ctx:?");
+  assert.equal(formatTokenCount(512), "512");
+  assert.equal(formatTokenCount(1_000), "1k");
+  assert.equal(formatTokenCount(1_200), "1.2k");
+  assert.equal(formatTokenCount(12_400), "12.4k");
+  assert.equal(contextUsageLabel(512, 2_048), "ctx:25%/512");
+  assert.equal(contextUsageLabel(1_200, 3_000), "ctx:40%/1.2k");
+  assert.equal(contextUsageLabel(12_400, 15_500), "ctx:80%/12.4k");
+  assert.equal(contextUsageLabel(null, 15_500), "ctx:?");
+  assert.equal(contextUsageLabel(null, 0), "ctx:?");
+  assert.equal(contextUsageLabel(1_200, 0), "ctx:?/1.2k");
   assert.equal(activityLine(true, "Thinking", 1, 12), "Thinking.. | scroll:+12");
   assert.equal(activityLine(false, "ignored", 0, 0), "Ready");
+});
+
+test("renders reasoning summaries as plain text on a distinct tonal background", () => {
+  const lines = new ReasoningSummary("**Plan** the __safe__ path\nThen verify it.").render(32);
+  const plain = lines.map(stripVTControlCharacters);
+
+  assert.equal(plain.at(-1), "");
+  assert.match(lines[0]!, /\x1b\[38;5;252;48;5;234m/);
+  assert.equal(plain[0]?.trimEnd(), "Plan the safe path");
+  assert.equal(plain[1]?.trimEnd(), "Then verify it.");
+  assert.equal(plain[0]?.length, 32);
+  assert.equal(plain[1]?.length, 32);
+  assert.doesNotMatch(plain.join("\n"), /\*\*|__/);
+  assert.doesNotMatch(plain.join("\n"), /Reasoning summary/);
+  assert.doesNotMatch(lines.join("\n"), /\x1b\[2m/);
+});
+
+test("formats bounded turn summaries for narrow transcript notices", () => {
+  const summary = formatTurnSummary({
+    responseStatus: "incomplete",
+    durationMs: 1_234,
+    modelRounds: 2,
+    toolCalls: 3,
+    leafAgents: 4,
+    compactions: 1,
+    refusalNotice: `no\nreason ${"x".repeat(600)}`,
+    incompleteReason: "max_output_tokens",
+  });
+  assert.match(summary, /^status:incomplete \| duration:1\.2s \| rounds:2 \| tools:3 \| agents:4 \| compactions:1/);
+  assert.match(summary, /\| refusal:no reason x/);
+  assert.match(summary, /\| incomplete:max_output_tokens$/);
+  assert.ok(summary.length < 800);
+  assert.doesNotMatch(summary, /\x1b/);
+  const noticeLines = new Notice("turn", summary).render(32).map(stripVTControlCharacters);
+  assert.ok(noticeLines.every((line) => line.length <= 32));
+  assert.match(noticeLines.join("\n"), /status:incomplete/);
 });
 
 test("formats shell approval signatures as readable scopes", () => {
@@ -262,6 +310,65 @@ test("uses distinct transcript tones without repeating the assistant title", () 
   assert.equal(stripVTControlCharacters(user[0]!).length, width);
   assert.equal(stripVTControlCharacters(assistant[0]!).length, width);
   assert.equal(stripVTControlCharacters(toolLines[0]!).length, width);
+});
+
+test("keeps agent progress oldest-first, grouped, bounded, and visible after finish", () => {
+  const tool = new ToolCard("agents", "run_agents", "Run agents");
+  const progress = (agent: string, action: string): void => {
+    tool.progress(`codex-lb:gpt-luna | reasoning high | agent ${agent} [${action}]`);
+  };
+  progress("alpha", "older");
+  progress("alpha", "newer");
+  progress("beta", "separate");
+
+  const initial = stripVTControlCharacters(tool.render(96).join("\n"));
+  assert.ok(initial.indexOf("older") < initial.indexOf("newer"));
+  assert.ok(initial.indexOf("agent alpha") < initial.indexOf("agent beta"));
+  assert.match(initial, /agent beta[\s\S]*separate/);
+
+  const bounded = new ToolCard("bounded", "run_agents", "Run agents");
+  for (let index = 0; index < 12; index += 1) {
+    bounded.progress(`codex-lb:gpt-luna | reasoning high | agent alpha [action-${index}]`);
+  }
+  const boundedText = stripVTControlCharacters(bounded.render(96).join("\n"));
+  assert.equal((boundedText.match(/action-\d+/gu) ?? []).length, 5);
+  assert.doesNotMatch(boundedText, /action-[0-6](?:\D|$)/u);
+  assert.ok(boundedText.indexOf("action-10") < boundedText.indexOf("action-11"));
+
+  bounded.finish("final agent output", false);
+  const finished = stripVTControlCharacters(bounded.render(96).join("\n"));
+  assert.match(finished, /action-11/);
+  assert.match(finished, /final agent output/);
+});
+
+test("keeps encoded arbitrary agent ids distinct while rendering readable labels", () => {
+  const tool = new ToolCard("encoded-agents", "run_agents", "Run agents");
+  const progress = (agent: string, action: string): void => {
+    tool.progress(`codex-lb:gpt-luna | reasoning high | agent ${JSON.stringify(agent)} [${action}]`);
+  };
+  const whitespaceId = "worker  id";
+  const ordinaryId = "worker id";
+  const bracketId = "worker [id]";
+  const newlineId = "worker\nid";
+  const longId = `long-${"a".repeat(100)}`;
+  const similarLongId = `long-${"a".repeat(99)}b`;
+  progress(whitespaceId, "whitespace");
+  progress(ordinaryId, "ordinary");
+  progress(bracketId, "bracket");
+  progress(newlineId, "newline");
+  for (let index = 0; index < 12; index += 1) progress(longId, `long-${index}`);
+  progress(similarLongId, "similar-long");
+
+  const rendered = stripVTControlCharacters(tool.render(400).join("\n"));
+  assert.equal((rendered.match(/agent worker id \|/gu) ?? []).length, 3);
+  assert.match(rendered, /agent worker \[id\] \|/u);
+  assert.match(rendered, new RegExp(`agent ${longId} \\|`, "u"));
+  assert.match(rendered, new RegExp(`agent ${similarLongId} \\|`, "u"));
+  assert.match(rendered, /newline/u);
+  assert.doesNotMatch(rendered, /\\n/u);
+  assert.equal((rendered.match(/long-\d+/gu) ?? []).length, 5);
+  assert.doesNotMatch(rendered, /long-[0-6](?:\D|$)/u);
+  assert.match(rendered, /similar-long/u);
 });
 
 test("renders approval actions as clickable buttons", () => {

@@ -384,7 +384,7 @@ Enter slash commands inside `glass`:
 | `/agents [on\|off]` | Enable or disable delegation for this session |
 | `/agentmodel [ID]` | Select the model used by leaf agents |
 | `/agentreasoning [effort]` | Select leaf-agent reasoning effort |
-| `/thinking [on\|off]` | Show or hide model-provided reasoning summaries |
+| `/thinking [on\|off]` | Show or hide live model reasoning; persisted response summaries remain visible |
 | `/fast [on\|off]` | Toggle fast service when supported |
 | `/compact` | Compact the current conversation context |
 | `/permissions [review\|code\|unrestricted]` | Change durable approval mode |

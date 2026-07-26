@@ -11,7 +11,7 @@ import { SchedulerStore } from "../src/scheduler/store.js";
 import { applyPatchTool } from "../src/tools/apply-patch.js";
 import { bashTool, powershellApprovalExecutable } from "../src/tools/bash.js";
 import { readTool } from "../src/tools/read.js";
-import { ToolRegistry, toolApprovalSignature } from "../src/tools/registry.js";
+import { ToolPreflightError, ToolRegistry, toolApprovalSignature } from "../src/tools/registry.js";
 import { createScheduleTools } from "../src/tools/schedule.js";
 import { bashApprovalExecutable, bashCommandRisk, isSensitiveMutationPath, patchRisk, powershellCommandRisk, shellEnvironment, workspacePatchRisk } from "../src/tools/safety.js";
 import { powershellArguments, powershellExecutable, shellCommand, shellDefinition, shellKind, taskkillExecutable, windowsSystemRoot } from "../src/tools/shell.js";
@@ -416,6 +416,32 @@ test("apply_patch requires approval for sensitive symlink targets when links are
   context.config.tools.approval = "code";
   context.approve = async () => "deny";
   await assert.rejects(registry.execute("apply_patch", sensitiveSymlink, context), /denied/);
+});
+
+test("apply_patch classifies execute-time preflight failures before mutation", async (t) => {
+  const { context, workspace } = fixture(t);
+  const path = join(workspace, "late.txt");
+  writeFileSync(path, "before\n");
+  context.config.tools.approval = "review";
+  context.approve = async () => {
+    writeFileSync(path, "changed while approval was pending\n");
+    return "once";
+  };
+
+  const registry = new ToolRegistry().register(applyPatchTool);
+  const args = registry.parseArguments("apply_patch", JSON.stringify({
+    patch: "*** Begin Patch\n*** Update File: late.txt\n@@\n-before\n+after\n*** End Patch",
+  }));
+
+  await assert.rejects(
+    registry.execute("apply_patch", args, context),
+    (error: unknown) => {
+      assert.ok(error instanceof ToolPreflightError);
+      assert.match(String(error), /did not match exactly/);
+      return true;
+    },
+  );
+  assert.equal(readFileSync(path, "utf8"), "changed while approval was pending\n");
 });
 
 test("Bash keeps executable approval scope while PowerShell stays exact-command scoped", (t) => {

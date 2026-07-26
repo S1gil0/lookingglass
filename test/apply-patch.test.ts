@@ -181,7 +181,13 @@ test("rejects malformed patches and non-matching hunks", async (t) => {
       "+replacement",
       "*** End Patch",
     ]),
-    /did not match exactly/,
+    (error: unknown) => {
+      assert.match(String(error), /did not match exactly/);
+      assert.match(String(error), /expected 1 existing line/);
+      assert.match(String(error), /re-read the file/);
+      assert.doesNotMatch(String(error), /missing/);
+      return true;
+    },
   );
   assert.equal(readFileSync(path, "utf8"), "unchanged\n");
   assert.equal(existsSync(join(root, "bad.txt")), false);
@@ -201,7 +207,13 @@ test("rejects ambiguous update matches", async (t) => {
       "+changed",
       "*** End Patch",
     ]),
-    /matched 2 locations/,
+    (error: unknown) => {
+      assert.match(String(error), /matched 2 locations/);
+      assert.match(String(error), /candidate lines: 1, 3/);
+      assert.match(String(error), /add unique context/);
+      assert.doesNotMatch(String(error), /same/);
+      return true;
+    },
   );
   assert.equal(readFileSync(path, "utf8"), "same\nother\nsame\n");
 });
