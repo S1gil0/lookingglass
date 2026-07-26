@@ -41,9 +41,6 @@ export function stdioCallbacks(): EngineCallbacks {
     onTextDelta(delta) {
       process.stdout.write(terminalSafe(delta));
     },
-    onReasoningDelta(delta) {
-      if (process.env.LOOKING_GLASS_SHOW_REASONING === "1") process.stderr.write(`\x1b[2m${terminalSafe(delta)}\x1b[0m`);
-    },
     onStatus(status) {
       if (process.stderr.isTTY) process.stderr.write(`\r\x1b[2m${terminalSafe(status).padEnd(32)}\x1b[0m`);
     },

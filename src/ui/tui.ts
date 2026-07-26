@@ -227,28 +227,30 @@ export function sessionMetadataLine(
   width = Number.POSITIVE_INFINITY,
 ): string {
   const narrow = Number.isFinite(width) && width < 100;
+  const modelInfo = `${session.model} (${session.reasoningEffort})`;
   const middle = [
-    session.reasoningEffort,
+    session.agentsEnabled
+      ? `agent: ${session.agentModel} (${session.agentReasoningEffort})`
+      : "agent: off",
     contextUsage,
-    `agents:${session.agentsEnabled ? "on" : "off"}`,
     approval,
     `${narrow ? "p" : "persist"}:${session.persistent ? "on" : "off"}`,
   ];
   const separators = 3 * (middle.length + 1);
   const available = Number.isFinite(width)
     ? Math.max(8, Math.floor(width) - middle.reduce((sum, value) => sum + value.length, 0) - separators)
-    : session.model.length + session.title.length;
+    : modelInfo.length + session.title.length;
   let modelWidth = Math.max(4, Math.floor(available * 0.6));
   let titleWidth = Math.max(4, available - modelWidth);
-  if (session.model.length < modelWidth) {
-    titleWidth += modelWidth - session.model.length;
-    modelWidth = session.model.length;
+  if (modelInfo.length < modelWidth) {
+    titleWidth += modelWidth - modelInfo.length;
+    modelWidth = modelInfo.length;
   } else if (session.title.length < titleWidth) {
     modelWidth += titleWidth - session.title.length;
     titleWidth = session.title.length;
   }
   return [
-    oneLine(session.model, modelWidth),
+    oneLine(modelInfo, modelWidth),
     ...middle,
     oneLine(session.title, titleWidth),
   ].join(" | ");
@@ -564,37 +566,6 @@ export class ReasoningSummary implements Component {
   render(width: number): string[] {
     if (!this.text) return [];
     return [...wrap(this.text, width).map((line) => tonalLine(line, width, 234)), ""];
-  }
-}
-
-class StreamingReasoning extends ReasoningSummary {
-  private raw = "";
-  private timer: NodeJS.Timeout | null = null;
-
-  constructor(private readonly requestRender: () => void) {
-    super();
-  }
-
-  append(delta: string): void {
-    this.raw += delta;
-    if (this.timer) return;
-    this.timer = setTimeout(() => {
-      this.timer = null;
-      this.setText(this.raw);
-      this.requestRender();
-    }, STREAM_RENDER_MS);
-  }
-
-  flush(): void {
-    if (this.timer) clearTimeout(this.timer);
-    this.timer = null;
-    this.setText(this.raw);
-    this.requestRender();
-  }
-
-  dispose(): void {
-    if (this.timer) clearTimeout(this.timer);
-    this.timer = null;
   }
 }
 
@@ -1313,7 +1284,6 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
   const tui = new TUI(terminal, false);
   const toolCards = new Map<string, ToolCard>();
   const streaming = new Set<StreamingAssistant>();
-  const streamingReasoning = new Set<StreamingReasoning>();
   const seenInbox = new Set<string>();
   const suppressedInbox = new Map<string, string>();
   const pendingTasks = new Set<Promise<void>>();
@@ -1565,17 +1535,10 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
 
   const callbacks = (): EngineCallbacks => {
     let currentAssistant: StreamingAssistant | null = null;
-    let currentReasoning: StreamingReasoning | null = null;
-    let reasoningDeltaSeen = false;
     let turnCompleteShown = false;
     return {
       onResponseStart(round) {
         currentAssistant?.flush();
-        currentReasoning?.flush();
-        reasoningDeltaSeen = false;
-        currentReasoning = new StreamingReasoning(requestTranscriptRender);
-        streamingReasoning.add(currentReasoning);
-        if (session.showReasoning) add(currentReasoning);
         currentAssistant = new StreamingAssistant(requestTranscriptRender);
         streaming.add(currentAssistant);
         add(currentAssistant);
@@ -1589,13 +1552,8 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
         }
         currentAssistant.append(delta);
       },
-      onReasoningDelta(delta) {
-        reasoningDeltaSeen = true;
-        engineStatus = "Reasoning";
-        currentReasoning?.append(delta);
-      },
       onReasoningSummary(summary) {
-        if (!session.showReasoning || !reasoningDeltaSeen) add(new ReasoningSummary(summary));
+        add(new ReasoningSummary(summary));
       },
       onStatus(status) {
         engineStatus = displaySafe(status);
@@ -1674,9 +1632,7 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
       else addNotice("error", errorMessage(error), red);
     } finally {
       for (const assistant of streaming) assistant.flush();
-      for (const reasoning of streamingReasoning) reasoning.flush();
       streaming.clear();
-      streamingReasoning.clear();
       refreshContextUsage();
       endOperation();
     }
@@ -2102,19 +2058,12 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
       { value: "rename", label: "Rename session", description: session.title },
       { value: "schedules", label: "Manage schedules", description: `${jobs.length} attached` },
       { value: "approvals", label: "Manage always approvals", description: `${approvals.length} registered` },
-      {
-        value: "thinking",
-        label: session.showReasoning ? "Hide live reasoning" : "Show live reasoning",
-      },
     ], `${session.id}\n${session.model}`);
     if (!action || stopping) return;
     if (action === "persist") setPersistence(!session.persistent);
     else if (action === "schedules") await showCronBrowser(true);
     else if (action === "approvals") await showCommandApprovals();
-    else if (action === "thinking") {
-      session = app.sessions.updateSettings(session.id, { showReasoning: !session.showReasoning });
-      loadSessionEvents();
-    } else if (action === "rename") {
+    else if (action === "rename") {
       const title = await interaction.ask({ question: "New session title" });
       if (title.trim()) {
         session = app.sessions.rename(session.id, title);
@@ -2333,17 +2282,6 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
       addNotice("agent reasoning", `Agent reasoning effort set to ${supported}.`, cyan);
       return;
     }
-    if (command === "thinking" || command === "show-reasoning") {
-      let enabled: boolean;
-      if (!argument) enabled = !session.showReasoning;
-      else if (["on", "true", "1"].includes(argument.toLowerCase())) enabled = true;
-      else if (["off", "false", "0"].includes(argument.toLowerCase())) enabled = false;
-      else throw new Error(`/${command} accepts on or off`);
-      session = app.sessions.updateSettings(session.id, { showReasoning: enabled });
-      loadSessionEvents();
-      addNotice("reasoning", `Live reasoning ${enabled ? "shown" : "hidden"}.`, cyan);
-      return;
-    }
     if (command === "fast") {
       const model = await app.catalogModel(session.model, session.provider, signal);
       if (stopping) return;
@@ -2492,14 +2430,6 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
       )).reasoningEfforts
         .filter((effort) => effort.startsWith(prefix))
         .map((effort) => ({ value: effort, label: effort })),
-    },
-    {
-      name: "thinking",
-      description: "Show or hide live model reasoning",
-      argumentHint: "[on|off]",
-      getArgumentCompletions: (prefix) => ["on", "off"]
-        .filter((value) => value.startsWith(prefix))
-        .map((value) => ({ value, label: value })),
     },
     {
       name: "fast",
@@ -2695,7 +2625,6 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
     if (activityTimer) clearInterval(activityTimer);
     cancelActiveInteraction();
     for (const assistant of streaming) assistant.dispose();
-    for (const reasoning of streamingReasoning) reasoning.dispose();
     if (started) {
       try {
         await terminal.drainInput();

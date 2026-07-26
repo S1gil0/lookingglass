@@ -38,7 +38,6 @@ export interface EngineInteraction {
 export interface EngineCallbacks {
   onResponseStart?(round: number): void;
   onTextDelta?(delta: string): void;
-  onReasoningDelta?(delta: string): void;
   onReasoningSummary?(summary: string): void;
   onStatus?(status: string): void;
   onWarning?(message: string): void;

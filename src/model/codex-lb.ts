@@ -95,7 +95,6 @@ interface RawResponseEvent {
 
 export interface StreamCallbacks {
   onTextDelta?(delta: string): void;
-  onReasoningDelta?(delta: string): void;
   onEvent?(event: ResponseStreamEvent): void;
 }
 
@@ -879,7 +878,6 @@ export class CodexLbClient {
           : typeof item.reasoning_content === "string" ? item.reasoning_content : detailReasoning;
         if (reasoning) {
           reasoningText.push(reasoning);
-          callbacks.onReasoningDelta?.(reasoning);
           callbacks.onEvent?.({ type: "response.reasoning_summary_text.delta", delta: reasoning } as unknown as ResponseStreamEvent);
         }
         if (Array.isArray(item.tool_calls)) {
@@ -987,9 +985,6 @@ export class CodexLbClient {
       callbacks.onEvent?.(event as ResponseStreamEvent);
       if (event.type === "response.output_text.delta" && typeof event.delta === "string") {
         callbacks.onTextDelta?.(event.delta);
-      }
-      if (event.type === "response.reasoning_summary_text.delta" && typeof event.delta === "string") {
-        callbacks.onReasoningDelta?.(event.delta);
       }
       if (event.type === "response.created" && event.response) created = event.response;
       if ((event.type === "response.output_item.added" || event.type === "response.output_item.done")

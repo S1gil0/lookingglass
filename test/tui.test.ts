@@ -179,7 +179,7 @@ test("renders activity separately from ordered session metadata", () => {
     createdAt: 1,
     updatedAt: 1,
   }, "unrestricted", "ctx:42%/1.2k");
-  assert.equal(metadata, "qwen/model | medium | ctx:42%/1.2k | agents:on | unrestricted | persist:on | Session name");
+  assert.equal(metadata, "qwen/model (medium) | agent: gpt-luna (high) | ctx:42%/1.2k | unrestricted | persist:on | Session name");
   const narrow = sessionMetadataLine({
     id: "session",
     workspace: "/tmp",
@@ -203,7 +203,7 @@ test("renders activity separately from ordered session metadata", () => {
     createdAt: 1,
     updatedAt: 1,
   }, "unrestricted", "ctx:42%/1.2k", 79);
-  assert.match(narrow, /^qwen\/.* \| medium \| ctx:42%\/1.2k \| agents:off \| unrestricted \| p:on \| A/);
+  assert.match(narrow, /^qwen\/.* \| agent: off \| ctx:42%\/1.2k \| unrestricted \| p:on \| A/);
   assert.ok(narrow.length <= 79);
   assert.equal(formatTokenCount(512), "512");
   assert.equal(formatTokenCount(1_000), "1k");
