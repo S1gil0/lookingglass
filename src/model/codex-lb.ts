@@ -5,6 +5,7 @@ import type {
   ResponseInputItem,
   ResponseStreamEvent,
 } from "openai/resources/responses/responses";
+import { Agent } from "undici";
 import type { GatewayProtocol, GatewayProvider, GlassConfig, ModelInfo, ReasoningEffort, Verbosity } from "../types.js";
 
 interface ErrorDetail {
@@ -737,9 +738,28 @@ async function* openRouterEvents(response: globalThis.Response, context: Provide
 
 export class CodexLbClient {
   private readonly apiKey: string;
+  private readonly lmStudioAgent: Agent | undefined;
 
   constructor(private readonly config: GlassConfig) {
     this.apiKey = process.env[config.gateway.apiKeyEnv] || "local-looking-glass";
+    if (config.gateway.provider === "lm-studio") {
+      // Local model prefill and token generation can leave the connection quiet
+      // for longer than Undici's 300-second headers/body defaults. The request
+      // AbortSignal remains the overall finite deadline for this client.
+      this.lmStudioAgent = new Agent({ headersTimeout: 0, bodyTimeout: 0 });
+    }
+  }
+
+  private fetchOptions(init: RequestInit): RequestInit {
+    // Node's fetch types use the bundled Undici version, while the direct
+    // dependency can have a different set of structurally incompatible types.
+    return this.lmStudioAgent
+      ? ({ ...init, dispatcher: this.lmStudioAgent } as unknown as RequestInit)
+      : init;
+  }
+
+  close(): void {
+    void this.lmStudioAgent?.close();
   }
 
   supportsResponseContinuity(): boolean {
@@ -753,10 +773,10 @@ export class CodexLbClient {
     const context = requestContext(provider, "models", this.apiKey, signal, timeout);
     if (this.config.gateway.provider === "lm-studio") {
       try {
-        const response = await fetch(lmStudioModelsURL(this.config.gateway.baseURL), {
+        const response = await fetch(lmStudioModelsURL(this.config.gateway.baseURL), this.fetchOptions({
           headers: { authorization: `Bearer ${this.apiKey}` },
           signal: requestSignal,
-        });
+        }));
         const nativeContext = { ...context, operation: "models (native catalog)" };
         const payload = objectPayload(
           await readJsonResponse(response, nativeContext),
@@ -775,10 +795,10 @@ export class CodexLbClient {
     }
     let response: globalThis.Response;
     try {
-      response = await fetch(`${this.config.gateway.baseURL.replace(/\/$/, "")}/models`, {
+      response = await fetch(`${this.config.gateway.baseURL.replace(/\/$/, "")}/models`, this.fetchOptions({
         headers: { authorization: `Bearer ${this.apiKey}` },
         signal: requestSignal,
-      });
+      }));
     } catch (error) {
       throw providerError(error, context);
     }
@@ -958,7 +978,7 @@ export class CodexLbClient {
     const context = requestContext(this.config.gateway.provider, "stream", this.apiKey, request.signal, timeout);
     let http: globalThis.Response;
     try {
-      http = await fetch(`${this.config.gateway.baseURL}/responses`, {
+      http = await fetch(`${this.config.gateway.baseURL}/responses`, this.fetchOptions({
         method: "POST",
         headers: {
           authorization: `Bearer ${this.apiKey}`,
@@ -967,7 +987,7 @@ export class CodexLbClient {
         },
         body: JSON.stringify({ ...params, stream: true }),
         signal,
-      });
+      }));
     } catch (error) {
       throw providerError(error, context);
     }
@@ -1139,7 +1159,7 @@ export class CodexLbClient {
       const context = requestContext(responseProvider, "compact", this.apiKey, request.signal, timeout);
       let http: globalThis.Response;
       try {
-        http = await fetch(`${this.config.gateway.baseURL.replace(/\/$/, "")}/responses`, {
+        http = await fetch(`${this.config.gateway.baseURL.replace(/\/$/, "")}/responses`, this.fetchOptions({
           method: "POST",
           headers: {
             authorization: `Bearer ${this.apiKey}`,
@@ -1147,7 +1167,7 @@ export class CodexLbClient {
           },
           body: JSON.stringify(buildResponseParams(responseProvider, profile, "responses")),
           signal,
-        });
+        }));
       } catch (error) {
         throw providerError(error, context);
       }

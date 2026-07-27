@@ -73,6 +73,7 @@ export class LookingGlassApp {
   }
 
   private rebuildRuntime(): void {
+    this.clients?.forEach((client) => client.close());
     const clients = new Map([this.config.gateway, ...this.config.gateways].map((gateway) => {
       const providerConfig = { ...this.config, gateway };
       return [gateway.provider, new CodexLbClient(providerConfig)] as const;
@@ -351,6 +352,7 @@ export class LookingGlassApp {
   }
 
   close(): void {
+    this.clients?.forEach((client) => client.close());
     checkpointDatabase(this.db);
     this.db.close();
   }

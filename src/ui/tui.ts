@@ -42,6 +42,7 @@ import { initialDue } from "../scheduler/schedule.js";
 import type { ApprovalDecision, ApprovalRequest, QuestionRequest } from "../tools/types.js";
 import { isWithin } from "../tools/paths.js";
 import { windowsSystemExecutable } from "../tools/shell.js";
+import { normalizeTaskPlan, type TaskPlanItem, type TaskPlanSnapshot, type TaskPlanStatus } from "../task-plan.js";
 import type {
   ApprovalMode,
   GatewayModel,
@@ -234,7 +235,7 @@ export function sessionMetadataLine(
       : "agent: off",
     contextUsage,
     approval,
-    `${narrow ? "p" : "persist"}:${session.persistent ? "on" : "off"}`,
+    ...(session.persistent ? [`${narrow ? "p" : "persist"}:on`] : []),
   ];
   const separators = 3 * (middle.length + 1);
   const available = Number.isFinite(width)
@@ -671,7 +672,77 @@ export class Notice implements Component {
   }
 }
 
-class FullHeightRoot extends Container {
+const taskPlanStatusMarkers: Record<TaskPlanStatus, string> = {
+  pending: "☐",
+  in_progress: ">",
+  completed: "✓",
+  cancelled: "×",
+};
+
+function taskPlanStatusColor(status: TaskPlanStatus): Style {
+  if (status === "completed") return green;
+  if (status === "cancelled") return red;
+  if (status === "in_progress") return yellow;
+  return dim;
+}
+
+/** The compact checklist kept visible below the transcript. */
+export class TaskPlanPanel implements Component {
+  private snapshot: TaskPlanSnapshot | null = null;
+
+  setSnapshot(snapshot: TaskPlanSnapshot | null): void {
+    if (!snapshot) {
+      this.snapshot = null;
+      return;
+    }
+    try {
+      const items = normalizeTaskPlan(snapshot.plan).items;
+      this.snapshot = items.some((item) => item.status === "pending" || item.status === "in_progress")
+        ? snapshot
+        : null;
+    } catch {
+      this.snapshot = null;
+    }
+  }
+
+  invalidate(): void {}
+
+  render(width: number, maxLines = Number.POSITIVE_INFINITY): string[] {
+    if (!this.snapshot) return [];
+    const safeWidth = Math.max(1, Math.floor(Number.isFinite(width) ? width : 1));
+    let items: TaskPlanItem[] = [];
+    try {
+      items = normalizeTaskPlan(this.snapshot.plan).items;
+    } catch {
+      // Stored snapshots are validated by SessionStore; retain a safe empty
+      // panel if an in-memory caller supplies malformed data.
+    }
+    const completed = items.filter((item) => item.status === "completed").length;
+    const lines = [bold(cyan(`Task plan ${completed}/${items.length} complete`))];
+    for (const item of items) {
+      const status = item.status;
+      const marker = taskPlanStatusColor(status)(taskPlanStatusMarkers[status]);
+      const prefix = `${marker} `;
+      const contentWidth = Math.max(1, safeWidth - visibleWidth(prefix));
+      const contentLines = wrap(oneLine(item.content, 240), contentWidth);
+      const first = contentLines[0] ?? "";
+      lines.push(fit(prefix + first, safeWidth));
+      const continuationIndent = " ".repeat(visibleWidth(prefix));
+      for (const line of contentLines.slice(1)) {
+        lines.push(fit(continuationIndent + line, safeWidth));
+      }
+    }
+    const rendered = lines.map((line, index) => tonalLine(line, safeWidth, index === 0 ? 235 : 234));
+    if (!Number.isFinite(maxLines) || rendered.length <= maxLines) return rendered;
+
+    const lineLimit = Math.max(1, Math.floor(maxLines));
+    const omitted = rendered.length - Math.max(0, lineLimit - 1);
+    const overflow = tonalLine(fit(dim(`[... ${omitted} more plan lines]`), safeWidth), safeWidth, 234);
+    return [...rendered.slice(0, Math.max(0, lineLimit - 1)), overflow];
+  }
+}
+
+export class FullHeightRoot extends Container {
   private readonly entries: Component[] = [];
   private transcriptCache: string[] | null = null;
   private transcriptCacheWidth = 0;
@@ -688,6 +759,7 @@ class FullHeightRoot extends Container {
   constructor(
     private readonly terminal: AlternateScreenTerminal,
     readonly editor: TurnEditor,
+    private readonly taskPlanPanel: TaskPlanPanel,
     private readonly activityText: () => string,
     private readonly metadataText: (width: number) => string,
   ) {
@@ -780,6 +852,7 @@ class FullHeightRoot extends Container {
 
   override invalidate(): void {
     this.editor.invalidate();
+    this.taskPlanPanel.invalidate();
     for (const entry of this.entries) entry.invalidate();
     this.invalidateTranscript();
   }
@@ -795,10 +868,15 @@ class FullHeightRoot extends Container {
       return this.renderSelection(lines);
     }
 
+    // Reserve enough space for the editor, activity, and metadata before
+    // rendering the sticky checklist. Without this cap, a valid large plan
+    // can push the input and session metadata below the terminal viewport.
+    const taskPlanRows = Math.max(1, height - 5);
+    const taskPlanLines = this.taskPlanPanel.render(safeWidth, taskPlanRows).map((line) => fit(line, safeWidth));
     let editorLines = this.editor.render(safeWidth).map((line) => fit(line, safeWidth));
-    const maxEditorRows = Math.max(3, height - 4);
+    const maxEditorRows = Math.max(3, height - taskPlanLines.length - 4);
     if (editorLines.length > maxEditorRows) editorLines = editorLines.slice(0, maxEditorRows);
-    this.viewportRows = Math.max(0, height - editorLines.length - 2);
+    this.viewportRows = Math.max(0, height - editorLines.length - taskPlanLines.length - 2);
 
     if (!this.transcriptCache || this.transcriptCacheWidth !== safeWidth) {
       this.transcriptCache = this.entries.flatMap((entry) => entry.render(safeWidth).map((line) => fit(line, safeWidth)));
@@ -822,7 +900,14 @@ class FullHeightRoot extends Container {
     this.selectableRows = topPadding.length + visibleTranscript.length;
     const activity = fit(dim(` ${oneLine(this.activityText(), 10_000)}`), safeWidth);
     const metadata = fit(dim(` ${oneLine(this.metadataText(Math.max(1, safeWidth - 1)), 10_000)}`), safeWidth);
-    return this.renderSelection([...topPadding, ...visibleTranscript, activity, ...editorLines, metadata]);
+    return this.renderSelection([
+      ...topPadding,
+      ...visibleTranscript,
+      ...taskPlanLines,
+      activity,
+      ...editorLines,
+      metadata,
+    ]);
   }
 }
 
@@ -1315,7 +1400,8 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
     width,
   );
   const editor = new TurnEditor(tui, editorTheme, { paddingX: 1, autocompleteMaxVisible: 7 });
-  const root = new FullHeightRoot(terminal, editor, activityText, metadataText);
+  const taskPlanPanel = new TaskPlanPanel();
+  const root = new FullHeightRoot(terminal, editor, taskPlanPanel, activityText, metadataText);
   tui.addChild(root);
   tui.setFocus(editor);
   tui.setClearOnShrink(true);
@@ -1488,6 +1574,10 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
   };
 
   const loadSessionEvents = (): void => {
+    // The checklist is a turn-scoped activity indicator. Keep durable plan
+    // state available to the model, but never resurrect a stale sticky panel
+    // while reloading a session or refreshing scheduler output.
+    taskPlanPanel.setSnapshot(null);
     root.clearTranscript();
     toolCards.clear();
     for (const event of app.sessions.events(session.id)) {
@@ -1586,6 +1676,10 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
           add(card);
         }
         card.finish(notice.output ?? "No output", notice.failed ?? false);
+        if (notice.name === "task_plan") {
+          taskPlanPanel.setSnapshot(app.sessions.latestTaskPlan(session.id));
+          requestRender();
+        }
         requestTranscriptRender();
       },
     };
@@ -1605,6 +1699,10 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
     activeController = null;
     activeOperation = false;
     engineStatus = "Ready";
+    // A model may leave an item pending after a failed, cancelled, or
+    // otherwise incomplete turn. Do not let that stale state reserve the
+    // sticky checklist forever; the durable snapshot remains in the session.
+    taskPlanPanel.setSnapshot(null);
     editor.setEnabled(true);
     refreshSession();
     restoreEditor();
@@ -1750,6 +1848,7 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
     const apiKey = enteredApiKey || previousApiKey || "";
     let models: GatewayModel[] = [];
     let catalogError: unknown = null;
+    let client: CodexLbClient | undefined;
     if (apiKey) process.env[apiKeyEnv] = apiKey;
     try {
       const gateway = {
@@ -1759,12 +1858,13 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
         baseURL,
         apiKeyEnv,
       };
-      const client = new CodexLbClient({ ...app.config, gateway });
+      client = new CodexLbClient({ ...app.config, gateway });
       const catalogSignal = AbortSignal.any([signal, AbortSignal.timeout(10_000)]);
       models = (await client.models(catalogSignal)).map((model) => ({ ...model, provider }));
     } catch (error) {
       catalogError = error;
     } finally {
+      client?.close();
       restoreApiKeyEnvironment(apiKeyEnv, previousApiKey);
     }
     signal.throwIfAborted();

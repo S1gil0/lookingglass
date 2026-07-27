@@ -12,6 +12,7 @@ import {
   formatTokenCount,
   formatTurnSummary,
   formatCommandApproval,
+  FullHeightRoot,
   inboxLine,
   initialTuiSession,
   markInboxItemsRead,
@@ -24,9 +25,11 @@ import {
   sessionMetadataLine,
   shouldAutoDisplayInbox,
   restoreApiKeyEnvironment,
+  TaskPlanPanel,
 } from "../src/ui/tui.js";
 import { terminalSafe } from "../src/ui/stdio.js";
 import type { InboxRecord, SchedulerJob } from "../src/scheduler/types.js";
+import type { TaskPlanSnapshot } from "../src/task-plan.js";
 
 test("parses one-shot and quoted or unquoted cron session schedules", () => {
   assert.deepEqual(parseSessionSchedule("once 2026-07-20T12:00:00Z inspect services"), {
@@ -195,7 +198,7 @@ test("renders activity separately from ordered session metadata", () => {
     fast: false,
     approvalMode: "unrestricted",
     showReasoning: true,
-    persistent: true,
+    persistent: false,
     promptCacheKey: "cache",
     lastResponseId: null,
     kind: "interactive",
@@ -203,7 +206,8 @@ test("renders activity separately from ordered session metadata", () => {
     createdAt: 1,
     updatedAt: 1,
   }, "unrestricted", "ctx:42%/1.2k", 79);
-  assert.match(narrow, /^qwen\/.* \| agent: off \| ctx:42%\/1.2k \| unrestricted \| p:on \| A/);
+  assert.match(narrow, /^qwen\/.* \| agent: off \| ctx:42%\/1.2k \| unrestricted \| A/);
+  assert.doesNotMatch(narrow, /(?:^|\| )p(?:ersist)?:/);
   assert.ok(narrow.length <= 79);
   assert.equal(formatTokenCount(512), "512");
   assert.equal(formatTokenCount(1_000), "1k");
@@ -540,4 +544,111 @@ test("stacks approval buttons safely at minimum terminal width", () => {
   assert.equal(modal.handleMouse({ ...border, action: "press" }), false);
   assert.equal(modal.handleMouse({ ...border, action: "release" }), false);
   assert.equal(result, null);
+});
+
+function taskPlanSnapshot(items: TaskPlanSnapshot["plan"]["items"]): TaskPlanSnapshot {
+  return { plan: { items }, sequence: 1, createdAt: 1 };
+}
+
+test("renders no task-plan panel without a snapshot", () => {
+  const panel = new TaskPlanPanel();
+  assert.deepEqual(panel.render(40), []);
+  panel.setSnapshot(null);
+  assert.deepEqual(panel.render(40), []);
+  panel.setSnapshot(taskPlanSnapshot([]));
+  assert.deepEqual(panel.render(40), []);
+});
+
+test("hides completed task plans so resumed transcript content is not pushed below them", () => {
+  const panel = new TaskPlanPanel();
+  panel.setSnapshot(taskPlanSnapshot([
+    { id: "done", content: "Finished work", priority: "medium", status: "completed" },
+    { id: "canceled", content: "Canceled work", priority: "low", status: "cancelled" },
+  ]));
+  assert.deepEqual(panel.render(40), []);
+
+  panel.setSnapshot(taskPlanSnapshot([
+    { id: "active", content: "Work in progress", priority: "high", status: "in_progress" },
+  ]));
+  assert.notDeepEqual(panel.render(40), []);
+  // End-of-turn cleanup clears even a plan whose terminal status was never
+  // recorded by the model.
+  panel.setSnapshot(null);
+  assert.deepEqual(panel.render(40), []);
+
+  const terminal = { rows: 12, columns: 40 } as never;
+  const editor = {
+    invalidate() {},
+    render() { return ["editor input"]; },
+  } as never;
+  const root = new FullHeightRoot(terminal, editor, panel, () => "activity", () => "metadata");
+  root.addEntry(new AssistantMessage("The turn has resumed."));
+  const plain = root.render(40).map(stripVTControlCharacters);
+  assert.ok(plain.some((line) => line.includes("The turn has resumed.")));
+  assert.equal(plain.some((line) => line.includes("Task plan")), false);
+});
+
+test("renders task-plan checkmarks without status or priority text", () => {
+  const panel = new TaskPlanPanel();
+  panel.setSnapshot(taskPlanSnapshot([
+    { id: "pending", content: "Pending work", priority: "low", status: "pending" },
+    { id: "active", content: "Active work", priority: "high", status: "in_progress" },
+    { id: "done", content: "Finished work", priority: "medium", status: "completed" },
+    { id: "canceled", content: "Canceled work", priority: "low", status: "cancelled" },
+  ]));
+  const raw = panel.render(80).join("\n");
+  const rendered = stripVTControlCharacters(raw);
+  assert.match(rendered, /Task plan 1\/4 complete/);
+  assert.match(rendered, /☐ Pending work/);
+  assert.match(rendered, /> Active work/);
+  assert.match(rendered, /✓ Finished work/);
+  assert.match(rendered, /× Canceled work/);
+  assert.doesNotMatch(rendered, /pending|in_progress|completed|cancelled|priority|high|medium|low/);
+  assert.match(raw, /\x1b\[33m>/);
+  assert.match(raw, /\x1b\[32m✓/);
+  assert.match(raw, /48;5;234m/);
+});
+
+test("wraps task-plan content to a bounded width and neutralizes controls", () => {
+  const panel = new TaskPlanPanel();
+  panel.setSnapshot(taskPlanSnapshot([{
+    id: "bounded",
+    content: `long ${"content ".repeat(25)}\x1b[31m\nnext\tpart\u0007`,
+    priority: "high",
+    status: "in_progress",
+  }]));
+  const width = 28;
+  const lines = panel.render(width);
+  const plain = lines.map(stripVTControlCharacters);
+  assert.ok(plain.length > 2);
+  assert.ok(plain.every((line) => line.length <= width));
+  assert.doesNotMatch(lines.join("\n"), /\x1b\[31m/);
+  assert.match(plain.join("\n"), /next/);
+  assert.match(plain.join("\n"), /part/);
+});
+
+test("caps an oversized task plan so the checklist stays above the editor viewport", () => {
+  const rows = 12;
+  const columns = 32;
+  const terminal = { rows, columns } as never;
+  const panel = new TaskPlanPanel();
+  panel.setSnapshot(taskPlanSnapshot(Array.from({ length: 32 }, (_, index) => ({
+    id: `item-${index}`,
+    content: `Item ${index} ${"word ".repeat(35)}`,
+    priority: "low" as const,
+    status: "pending" as const,
+  }))));
+  const editor = {
+    invalidate() {},
+    render() { return ["editor input"]; },
+  } as never;
+  const root = new FullHeightRoot(terminal, editor, panel, () => "activity", () => "metadata");
+
+  const frame = root.render(columns);
+  const plain = frame.map(stripVTControlCharacters);
+  assert.equal(frame.length, rows);
+  assert.equal(plain.at(-1), " metadata");
+  assert.ok(plain.some((line) => line.includes("editor input")));
+  assert.match(plain.join("\n"), /\[\.\.\. \d+ more plan lines\]/);
+  assert.ok(plain.every((line) => line.length <= columns));
 });

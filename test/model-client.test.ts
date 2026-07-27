@@ -117,6 +117,34 @@ test("custom Responses profile uses the Responses endpoint", async (t) => {
   assert.equal("prompt_cache_key" in (body ?? {}), false);
 });
 
+test("LM Studio streams use a long-lived dispatcher without changing codex-lb", async (t) => {
+  const requests: Array<RequestInit & { dispatcher?: unknown }> = [];
+  t.mock.method(globalThis, "fetch", async (_input: unknown, init?: RequestInit): Promise<Response> => {
+    requests.push((init ?? {}) as RequestInit & { dispatcher?: unknown });
+    return new Response([
+      `data: ${JSON.stringify({ type: "response.created", response: { id: "resp_dispatcher", status: "in_progress", model: request.model, output: [] } })}\n\n`,
+      `data: ${JSON.stringify({ type: "response.output_item.done", output_index: 0, item: { id: "msg_dispatcher", type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: "DISPATCHER_OK", annotations: [], logprobs: [] }] } })}\n\n`,
+      `data: ${JSON.stringify({ type: "response.completed", response: { id: "resp_dispatcher", status: "completed", model: request.model, output: [] } })}\n\n`,
+      "data: [DONE]\n\n",
+    ].join(""), { status: 200, headers: { "content-type": "text/event-stream" } });
+  });
+
+  const lmConfig = structuredClone(DEFAULT_CONFIG);
+  lmConfig.gateway.provider = "lm-studio";
+  const lmClient = new CodexLbClient(lmConfig);
+  t.after(() => lmClient.close());
+  const { previousResponseId: _lmPreviousResponseId, ...unanchoredRequest } = request;
+  const lmResult = await lmClient.stream(unanchoredRequest);
+  assert.equal(lmResult.output_text, "DISPATCHER_OK");
+  assert.ok(requests[0]?.dispatcher);
+
+  const codexClient = new CodexLbClient(structuredClone(DEFAULT_CONFIG));
+  t.after(() => codexClient.close());
+  const codexResult = await codexClient.stream(unanchoredRequest);
+  assert.equal(codexResult.output_text, "DISPATCHER_OK");
+  assert.equal(requests[1]?.dispatcher, undefined);
+});
+
 test("Responses incomplete events preserve a bounded reason and status", async (t) => {
   const server = createServer((_request, response) => {
     response.writeHead(200, { "content-type": "text/event-stream" });
@@ -364,7 +392,9 @@ test("LM Studio preserves safe reasoning summaries for the transcript", async (t
   config.gateway.provider = "lm-studio";
   config.gateway.baseURL = `http://127.0.0.1:${address.port}/v1`;
   const { previousResponseId: _previousResponseId, ...unanchored } = request;
-  const result = await new CodexLbClient(config).stream({ ...unanchored, model: "test-model" });
+  const client = new CodexLbClient(config);
+  t.after(() => client.close());
+  const result = await client.stream({ ...unanchored, model: "test-model" });
   const reasoning = result.output.find((item) => item.type === "reasoning") as { summary?: unknown[]; encrypted_content?: unknown } | undefined;
   assert.deepEqual(reasoning?.summary, [{ type: "summary_text", text: "**Checking the workspace**" }]);
   assert.equal(reasoning?.encrypted_content, undefined);

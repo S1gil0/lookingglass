@@ -25,6 +25,7 @@ export interface ToolContext {
   sessionId: string;
   authorizationSessionId?: string;
   callId?: string;
+  executionToken?: string;
   config: GlassConfig;
   approvalMode?: ApprovalMode;
   artifacts: ArtifactStore;

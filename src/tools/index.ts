@@ -6,6 +6,7 @@ import { ToolRegistry } from "./registry.js";
 import { globTool, grepTool } from "./search.js";
 import { createScheduleTools } from "./schedule.js";
 import { createRunAgentsTool, type AgentBatchRunner } from "./agents.js";
+import { taskPlanTool } from "./task-plan.js";
 import type { SchedulerStore } from "../scheduler/store.js";
 
 export function createWorkerToolRegistry(): ToolRegistry {
@@ -24,7 +25,8 @@ export function createCoreToolRegistry(scheduler?: SchedulerStore, agents?: Agen
     .register(grepTool)
     .register(applyPatchTool)
     .register(bashTool)
-    .register(askUserTool);
+    .register(askUserTool)
+    .register(taskPlanTool);
   if (agents) registry.register(createRunAgentsTool(agents));
   if (scheduler) {
     for (const tool of createScheduleTools(scheduler)) registry.register(tool);

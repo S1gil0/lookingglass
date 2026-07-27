@@ -1,5 +1,11 @@
 import { randomUUID } from "node:crypto";
 import type { GlassDatabase } from "./database.js";
+import {
+  normalizeTaskPlan,
+  parseTaskPlanSnapshotPayload,
+  type TaskPlan,
+  type TaskPlanSnapshot,
+} from "../task-plan.js";
 import type {
   ApprovalMode,
   EventKind,
@@ -645,6 +651,44 @@ export class SessionStore {
       "SELECT COALESCE(MAX(sequence), 0) AS sequence FROM session_events WHERE session_id = ?",
     ).get(sessionId) as { sequence: number };
     return row.sequence;
+  }
+
+  latestTaskPlan(sessionId: string): TaskPlanSnapshot | null {
+    const rows = this.db.prepare(`
+      SELECT sequence, payload_json, created_at
+      FROM session_events
+      WHERE session_id = ? AND kind = 'note'
+      ORDER BY sequence DESC
+    `).all(sessionId) as Array<Pick<EventRow, "sequence" | "payload_json" | "created_at">>;
+
+    for (const row of rows) {
+      let rawPayload: unknown;
+      try {
+        rawPayload = JSON.parse(row.payload_json) as unknown;
+      } catch {
+        continue;
+      }
+      const payload = parseTaskPlanSnapshotPayload(rawPayload);
+      if (payload) return { plan: payload.plan, sequence: row.sequence, createdAt: row.created_at };
+    }
+    return null;
+  }
+
+  saveTaskPlan(sessionId: string, executionToken: string, plan: TaskPlan): TaskPlanSnapshot | null {
+    const normalizedPlan = normalizeTaskPlan(plan);
+    const save = this.db.transaction(() => {
+      const now = Date.now();
+      if (!this.hasOperationLeaseRow(sessionId, executionToken, now)) return null;
+      const session = this.require(sessionId);
+      if (session.kind === "agent") throw new Error("Task plans can only be saved in the main session");
+      const event = this.appendEventRow(sessionId, "note", {
+        type: "task_plan",
+        version: 1,
+        plan: normalizedPlan,
+      }, now);
+      return { plan: normalizedPlan, sequence: event.sequence, createdAt: event.createdAt };
+    });
+    return save.immediate();
   }
 
   saveCheckpoint(

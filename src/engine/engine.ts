@@ -13,6 +13,7 @@ import type { SessionPromptReservation } from "../scheduler/types.js";
 import type { ApprovalDecision, ApprovalRequest, QuestionRequest, ToolContext, ToolResult } from "../tools/types.js";
 import type { ToolRegistry } from "../tools/registry.js";
 import { ToolDeniedError, ToolPreflightError, toolApprovalSignature } from "../tools/registry.js";
+import { formatTaskPlanInstructions } from "../task-plan.js";
 import { projectContext } from "./context.js";
 import { configuredCredentialValues, redactSensitiveText, redactSensitiveValue } from "../security.js";
 import type {
@@ -213,6 +214,11 @@ export class ConversationEngine {
     return typeof this.clientOrResolver === "function"
       ? this.clientOrResolver(provider)
       : this.clientOrResolver;
+  }
+
+  private instructionsFor(session: SessionRecord): string {
+    if (session.kind === "agent") return this.instructions;
+    return `${this.instructions}\n\n${formatTaskPlanInstructions(this.store.latestTaskPlan(session.id))}`;
   }
 
   private toolSummary(name: string, args: unknown): string {
@@ -448,7 +454,7 @@ export class ConversationEngine {
     options.callbacks?.onStatus?.("Compacting context");
     const compact = await this.clientFor(session.provider).compact({
       model: session.model,
-      instructions: this.instructions,
+      instructions: this.instructionsFor(session),
       input: context.input,
       promptCacheKey: session.promptCacheKey,
       fast: session.fast,
@@ -494,7 +500,7 @@ export class ConversationEngine {
     try {
       const streamed = await client.stream({
         model: session.model,
-        instructions: this.instructions,
+        instructions: this.instructionsFor(session),
         input,
         tools: this.toolDefinitions(session),
         promptCacheKey: session.promptCacheKey,
@@ -522,7 +528,7 @@ export class ConversationEngine {
         const recoverySession = this.requireSession(session.id);
         const streamed = await client.stream({
           model: recoverySession.model,
-          instructions: this.instructions,
+          instructions: this.instructionsFor(recoverySession),
           input: projectContext(this.store, session.id).input,
           tools: this.toolDefinitions(recoverySession),
           promptCacheKey: recoverySession.promptCacheKey,
@@ -542,7 +548,7 @@ export class ConversationEngine {
       if (!recoverySession) throw new Error("Session operation lease was lost during stale-anchor recovery");
       const streamed = await client.stream({
         model: recoverySession.model,
-        instructions: this.instructions,
+        instructions: this.instructionsFor(recoverySession),
         input: context.input,
         tools: this.toolDefinitions(recoverySession),
         promptCacheKey: recoverySession.promptCacheKey,
@@ -571,7 +577,7 @@ export class ConversationEngine {
       const tool = this.tools.get(call.name);
       return tool?.risk === "read" && call.name !== "ask_user";
     });
-    if (readOnly) {
+    if (readOnly && !calls.some((call) => call.name === "task_plan")) {
       const settled = await Promise.allSettled(
         calls.map((call) => this.executeCall(sessionId, call, options, executionToken, modelOutputBytes, metrics)),
       );
@@ -685,6 +691,7 @@ export class ConversationEngine {
       sessionId,
       ...(options.authorizationSessionId ? { authorizationSessionId: options.authorizationSessionId } : {}),
       callId: call.call_id,
+      executionToken,
       config: this.config,
       approvalMode: this.requireSession(sessionId).approvalMode,
       artifacts: this.artifacts,
@@ -836,7 +843,7 @@ export class ConversationEngine {
     const providerTokens = response.usage?.input_tokens ?? 0;
     const context = projectContext(this.store, sessionId).input;
     const estimatedTokens = Math.ceil((
-      this.instructions.length
+      this.instructionsFor(this.requireSession(sessionId)).length
       + JSON.stringify(this.toolDefinitions(this.requireSession(sessionId))).length
       + JSON.stringify(context).length
     ) / 4) + 2_000;

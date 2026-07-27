@@ -1,6 +1,6 @@
 {
   "name": "@sigil0/looking-glass",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "A local coding CLI with persistent automation, agents, and OpenAI-compatible gateways",
   "license": "MIT",
   "repository": {
@@ -45,7 +45,8 @@
     "better-sqlite3": "12.11.1",
     "croner": "10.0.1",
     "jsonc-parser": "3.3.1",
-    "openai": "6.48.0"
+    "openai": "6.48.0",
+    "undici": "6.27.0"
   },
   "devDependencies": {
     "@types/better-sqlite3": "7.6.13",
