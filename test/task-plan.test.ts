@@ -135,7 +135,10 @@ test("task-plan model formatting includes bounded data and safety instructions",
 
   const instructions = formatTaskPlanInstructions(snapshot);
   assert.match(instructions, /TASK PLAN GUIDANCE/);
+  assert.match(instructions, /in_progress immediately before starting/);
   assert.match(instructions, /Validate the result before marking an item completed/);
+  assert.match(instructions, /Immediately after validation.*before starting later work/);
+  assert.match(instructions, /Do not postpone status updates or batch multiple completed items/);
   assert.match(instructions, /never overrides system, developer, or user instructions/);
 });
 
@@ -215,9 +218,83 @@ test("task_plan redacts credentials from durable item ids and content", async (t
   assert.equal(saved.plan.items[0]?.content.includes(value), false);
 });
 
+test("task_plan patch merges item boundaries and rejects batched completions", async (t) => {
+  const valueFixture = fixture(t);
+  const context = toolContext(valueFixture);
+  const token = "item-boundary-token";
+  assert.equal(valueFixture.sessions.acquireOperationLease(valueFixture.session.id, "test-owner", token, "turn"), true);
+  context.executionToken = token;
+
+  const initial = await taskPlanTool.execute({
+    action: "set",
+    items: [
+      item({ id: "inspect", content: "Inspect files", status: "in_progress" }),
+      item({ id: "edit", content: "Edit files", status: "pending" }),
+      item({ id: "ship", content: "Commit and push", status: "pending" }),
+    ],
+  }, context);
+  assert.match(initial.output, /set persisted at snapshot 1/);
+
+  const updated = await taskPlanTool.execute({
+    action: "patch",
+    items: [
+      item({ id: "inspect", content: "Inspect files", status: "completed" }),
+      item({ id: "edit", content: "Edit files", status: "in_progress" }),
+    ],
+  }, context);
+  assert.match(updated.output, /patch persisted at snapshot 2/);
+  assert.deepEqual(
+    valueFixture.sessions.latestTaskPlan(valueFixture.session.id)?.plan.items.map(({ id, status }) => ({ id, status })),
+    [
+      { id: "inspect", status: "completed" },
+      { id: "edit", status: "in_progress" },
+      { id: "ship", status: "pending" },
+    ],
+  );
+
+  await assert.rejects(
+    taskPlanTool.execute({
+      action: "patch",
+      items: [
+        item({ id: "edit", content: "Edit files", status: "completed" }),
+        item({ id: "ship", content: "Commit and push", status: "cancelled" }),
+      ],
+    }, context),
+    /cannot batch multiple completed or cancelled items/,
+  );
+  assert.equal(valueFixture.sessions.latestTaskPlan(valueFixture.session.id)?.sequence, 2);
+
+  await assert.rejects(
+    taskPlanTool.execute({
+      action: "patch",
+      items: [item({ id: "unknown", content: "Unknown work", status: "in_progress" })],
+    }, context),
+    /unknown item id: unknown/,
+  );
+
+  const replacement = await taskPlanTool.execute({
+    action: "update",
+    items: [
+      item({ id: "replacement", content: "Replacement work", status: "pending" }),
+      item({ id: "ship", content: "Commit and push", status: "in_progress" }),
+    ],
+  }, context);
+  assert.match(replacement.output, /update persisted at snapshot 3/);
+  assert.deepEqual(
+    valueFixture.sessions.latestTaskPlan(valueFixture.session.id)?.plan.items.map(({ id }) => id),
+    ["replacement", "ship"],
+  );
+  const cleared = await taskPlanTool.execute({ action: "update", items: [] }, context);
+  assert.match(cleared.output, /update persisted at snapshot 4/);
+  assert.deepEqual(valueFixture.sessions.latestTaskPlan(valueFixture.session.id)?.plan.items, []);
+});
+
 test("task_plan is main-session-only and visible only in the core registry", async (t) => {
   assert.ok(createCoreToolRegistry().get("task_plan"));
   assert.equal(createWorkerToolRegistry().get("task_plan"), null);
+  assert.match(taskPlanTool.description, /patch at every item boundary/);
+  assert.match(JSON.stringify(taskPlanTool.parameters), /patch merges supplied existing items by id/);
+  assert.match(JSON.stringify(taskPlanTool.parameters), /Never batch multiple completions/);
 
   const mainFixture = fixture(t);
   const context = toolContext(mainFixture);

@@ -192,7 +192,17 @@ function metricStatus(value: unknown): string {
 
 function metricDuration(durationMs: number): string {
   const duration = Math.max(0, Number.isFinite(durationMs) ? durationMs : 0);
-  return duration < 1_000 ? `${Math.round(duration)}ms` : `${(duration / 1_000).toFixed(1)}s`;
+  if (duration < 1_000) return `${Math.round(duration)}ms`;
+  if (duration < 59_950) return `${(duration / 1_000).toFixed(1)}s`;
+  const totalSeconds = Math.round(duration / 1_000);
+  const hours = Math.floor(totalSeconds / 3_600);
+  const minutes = Math.floor((totalSeconds % 3_600) / 60);
+  const seconds = totalSeconds % 60;
+  return [
+    ...(hours > 0 ? [`${hours}h`] : []),
+    `${minutes}m`,
+    `${seconds}s`,
+  ].join(", ");
 }
 
 /** Format the bounded, non-reasoning details shown after each model turn. */

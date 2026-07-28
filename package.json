@@ -1,6 +1,6 @@
 {
   "name": "@sigil0/looking-glass",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "description": "A local coding CLI with persistent automation, agents, and OpenAI-compatible gateways",
   "license": "MIT",
   "repository": {

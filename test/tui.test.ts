@@ -259,6 +259,20 @@ test("formats bounded turn summaries for narrow transcript notices", () => {
   assert.match(noticeLines.join("\n"), /status:incomplete/);
 });
 
+test("formats long turn durations with hour, minute, and second components", () => {
+  const metrics = {
+    responseStatus: "completed",
+    modelRounds: 1,
+    toolCalls: 0,
+    leafAgents: 0,
+    compactions: 0,
+  };
+  assert.match(formatTurnSummary({ ...metrics, durationMs: 59_949 }), /duration:59\.9s/);
+  assert.match(formatTurnSummary({ ...metrics, durationMs: 59_950 }), /duration:1m, 0s/);
+  assert.match(formatTurnSummary({ ...metrics, durationMs: 61_000 }), /duration:1m, 1s/);
+  assert.match(formatTurnSummary({ ...metrics, durationMs: 22_891_000 }), /duration:6h, 21m, 31s/);
+});
+
 test("formats shell approval signatures as readable scopes", () => {
   const approvedAt = Date.parse("2026-07-19T12:00:00Z");
   assert.deepEqual(formatCommandApproval(
