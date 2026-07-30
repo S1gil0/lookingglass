@@ -268,9 +268,9 @@ test("formats long turn durations with hour, minute, and second components", () 
     compactions: 0,
   };
   assert.match(formatTurnSummary({ ...metrics, durationMs: 59_949 }), /duration:59\.9s/);
-  assert.match(formatTurnSummary({ ...metrics, durationMs: 59_950 }), /duration:1m, 0s/);
-  assert.match(formatTurnSummary({ ...metrics, durationMs: 61_000 }), /duration:1m, 1s/);
-  assert.match(formatTurnSummary({ ...metrics, durationMs: 22_891_000 }), /duration:6h, 21m, 31s/);
+  assert.match(formatTurnSummary({ ...metrics, durationMs: 59_950 }), /duration:1m 0s/);
+  assert.match(formatTurnSummary({ ...metrics, durationMs: 61_000 }), /duration:1m 1s/);
+  assert.match(formatTurnSummary({ ...metrics, durationMs: 22_891_000 }), /duration:6h 21m 31s/);
 });
 
 test("formats shell approval signatures as readable scopes", () => {

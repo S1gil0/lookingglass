@@ -13,7 +13,7 @@ import { credentialEnvironmentNames } from "./security.js";
 import { schedulerDoctorCheck, type DoctorCheck } from "./doctor.js";
 import { serializeConfig } from "./config.js";
 
-const VERSION = "0.5.3";
+const VERSION = "0.5.4";
 
 function usage(): string {
   return `Looking Glass ${VERSION}

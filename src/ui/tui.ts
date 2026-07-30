@@ -202,7 +202,7 @@ function metricDuration(durationMs: number): string {
     ...(hours > 0 ? [`${hours}h`] : []),
     `${minutes}m`,
     `${seconds}s`,
-  ].join(", ");
+  ].join(" ");
 }
 
 /** Format the bounded, non-reasoning details shown after each model turn. */
