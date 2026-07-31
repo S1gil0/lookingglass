@@ -1720,15 +1720,21 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
 
   const runTurn = async (text: string): Promise<void> => {
     const controller = beginOperation("Thinking");
+    const turnCallbacks = callbacks();
     try {
-      const model = await app.catalogModel(session.model, session.provider, controller.signal);
+      const model = await app.modelForTurn(
+        session.model,
+        session.provider,
+        controller.signal,
+        turnCallbacks.onStatus,
+      );
       contextWindow = model.contextWindow;
       if (controller.signal.aborted || stopping) return;
       add(new UserMessage(text));
       const turn = app.engine.turn(session.id, text, {
         signal: controller.signal,
         interaction,
-        callbacks: callbacks(),
+        callbacks: turnCallbacks,
         modelInfo: model,
       });
       refreshSession();

@@ -12,6 +12,8 @@ import { ConversationEngine } from "./engine/engine.js";
 import { AgentCoordinator } from "./agents/coordinator.js";
 import type { GatewayModel, GatewayProvider, GlassConfig, ModelInfo, SessionRecord } from "./types.js";
 import { SchedulerStore } from "./scheduler/store.js";
+import { isTransientProviderError } from "./errors.js";
+import { abortableRetryDelay, waitForTransientRetry, type RetryDelay } from "./retry.js";
 
 const MODEL_CATALOG_TIMEOUT_MS = 10_000;
 const INITIAL_SESSION_CATALOG_TIMEOUT_MS = 1_500;
@@ -89,7 +91,11 @@ export class LookingGlassApp {
       (provider) => this.clientForProvider(provider),
       createWorkerToolRegistry(),
       () => this.instructions.text,
-      (id, provider, signal) => this.catalogModel(id, provider, signal),
+      (id, provider, signal) => this.modelForTurn(
+        id,
+        provider,
+        signal ?? new AbortController().signal,
+      ),
     );
     const tools = createCoreToolRegistry(this.scheduler, agents);
     const engine = new ConversationEngine(
@@ -256,6 +262,25 @@ export class LookingGlassApp {
     const match = models.find((model) => model.id === id);
     if (!match) throw new Error(`Model is not available: ${provider}:${id}`);
     return match;
+  }
+
+  async modelForTurn(
+    id: string,
+    provider: GatewayProvider,
+    signal: AbortSignal,
+    onStatus?: (status: string) => void,
+    delay: RetryDelay = abortableRetryDelay,
+  ): Promise<GatewayModel> {
+    let attempt = 0;
+    while (true) {
+      try {
+        return await this.catalogModel(id, provider, signal);
+      } catch (error) {
+        if (signal.aborted || !isTransientProviderError(error)) throw error;
+        attempt += 1;
+        await waitForTransientRetry(signal, attempt, onStatus, delay);
+      }
+    }
   }
 
   async model(id: string, signal?: AbortSignal, provider?: GatewayProvider): Promise<GatewayModel> {

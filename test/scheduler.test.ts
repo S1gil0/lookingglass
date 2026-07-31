@@ -655,6 +655,34 @@ test("active interactive session leases defer scheduled prompt claims", (t) => {
   assert.equal(store.claimSessionPrompts("session-daemon", "session-boot", due + 101, 1_000, 10).length, 1);
 });
 
+test("daemon renewal keeps a running session prompt reservation alive", (t) => {
+  const { db, root, store } = fixture(t);
+  const due = Date.parse("2026-01-01T00:00:00Z");
+  const sessionId = createSession(db, root, true);
+  store.createSessionPrompt(sessionPromptInput(
+    sessionId,
+    "wait for provider recovery",
+    new Date(due).toISOString(),
+  ), due - 1);
+  store.materialize(due);
+  assert.equal(store.acquireLease("retry-daemon", "retry-boot", due, 1_000), true);
+  const claim = store.claimSessionPrompts("retry-daemon", "retry-boot", due, 1_000, 1)[0];
+  assert.ok(claim);
+  assert.equal(store.startClaimedSessionPrompt(
+    claim.occurrence.id,
+    claim.occurrence.claimToken,
+    claim.occurrence.claimOwner,
+    claim.occurrence.claimBootId,
+    due + 1,
+  )?.state, "running");
+
+  assert.equal(store.renewLease("retry-daemon", "retry-boot", due + 500, 1_000), true);
+  const lease = db.prepare(`
+    SELECT renewed_at, expires_at FROM session_operation_leases WHERE session_id = ?
+  `).get(sessionId) as { renewed_at: number; expires_at: number };
+  assert.deepEqual(lease, { renewed_at: due + 500, expires_at: due + 1_500 });
+});
+
 test("session prompt lease takeover fences results and blocks recurring jobs", (t) => {
   const { db, root, store } = fixture(t);
   const createdAt = Date.parse("2026-01-01T00:00:30Z");

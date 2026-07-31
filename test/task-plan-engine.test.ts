@@ -95,23 +95,27 @@ test("main-session requests receive the saved task plan state and guidance", asy
   const client = {
     async stream(request: ResponseRequest) {
       requests.push(request);
+      if (requests.length === 1) {
+        throw Object.assign(new Error("provider temporarily unavailable"), { status: 503 });
+      }
       return response("main-response", "done");
     },
   } as unknown as CodexLbClient;
   const engine = new ConversationEngine(
     structuredClone(DEFAULT_CONFIG), root, sessions, artifacts, client, createCoreToolRegistry(), "base instructions",
+    async () => undefined,
   );
 
   await engine.turn(session.id, "continue", turnOptions());
 
-  assert.equal(requests.length, 1);
-  const request = requests[0];
-  assert.ok(request);
-  assert.match(request.instructions, /TASK PLAN STATE/);
-  assert.match(request.instructions, /snapshot sequence: 1/);
-  assert.match(request.instructions, /Implement the durable task plan integration/);
-  assert.match(request.instructions, /TASK PLAN GUIDANCE/);
-  assert.ok(request.tools.some((tool) => tool.name === "task_plan"));
+  assert.equal(requests.length, 2);
+  for (const request of requests) {
+    assert.match(request.instructions, /TASK PLAN STATE/);
+    assert.match(request.instructions, /snapshot sequence: 1/);
+    assert.match(request.instructions, /Implement the durable task plan integration/);
+    assert.match(request.instructions, /TASK PLAN GUIDANCE/);
+    assert.ok(request.tools.some((tool) => tool.name === "task_plan"));
+  }
 });
 
 test("agent-session requests omit task plan instructions and the task plan tool", async (t) => {

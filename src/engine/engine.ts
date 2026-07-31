@@ -16,6 +16,8 @@ import { ToolDeniedError, ToolPreflightError, toolApprovalSignature } from "../t
 import { formatTaskPlanInstructions } from "../task-plan.js";
 import { projectContext } from "./context.js";
 import { configuredCredentialValues, redactSensitiveText, redactSensitiveValue } from "../security.js";
+import { isTransientProviderError } from "../errors.js";
+import { abortableRetryDelay, waitForTransientRetry, type RetryDelay } from "../retry.js";
 import type {
   StoredErrorPayload,
   StoredResponsePayload,
@@ -208,6 +210,7 @@ export class ConversationEngine {
     private readonly clientOrResolver: CodexLbClient | ((provider: GatewayProvider) => CodexLbClient),
     private readonly tools: ToolRegistry,
     private readonly instructions: string,
+    private readonly delay: RetryDelay = abortableRetryDelay,
   ) {}
 
   private clientFor(provider: GatewayProvider): CodexLbClient {
@@ -447,19 +450,32 @@ export class ConversationEngine {
     options: Pick<TurnOptions, "signal" | "callbacks">,
     executionToken: string,
     metrics?: TurnMetricsState,
+    essential = true,
   ): Promise<void> {
     const session = this.requireSession(sessionId);
     const context = projectContext(this.store, sessionId);
     if (context.input.length === 0) return;
-    options.callbacks?.onStatus?.("Compacting context");
-    const compact = await this.clientFor(session.provider).compact({
-      model: session.model,
-      instructions: this.instructionsFor(session),
-      input: context.input,
-      promptCacheKey: session.promptCacheKey,
-      fast: session.fast,
-      signal: options.signal,
-    });
+    let retryAttempt = 0;
+    let compact: Awaited<ReturnType<CodexLbClient["compact"]>>;
+    while (true) {
+      options.signal.throwIfAborted();
+      options.callbacks?.onStatus?.("Compacting context");
+      try {
+        compact = await this.clientFor(session.provider).compact({
+          model: session.model,
+          instructions: this.instructionsFor(session),
+          input: context.input,
+          promptCacheKey: session.promptCacheKey,
+          fast: session.fast,
+          signal: options.signal,
+        });
+        break;
+      } catch (error) {
+        if (!essential || options.signal.aborted || !isTransientProviderError(error)) throw error;
+        retryAttempt += 1;
+        await this.waitForRetry(options.callbacks, options.signal, retryAttempt);
+      }
+    }
     const usage = compact.usage;
     const inputTokens = usage && typeof usage === "object" && !Array.isArray(usage)
       && typeof (usage as Record<string, unknown>).input_tokens === "number"
@@ -474,6 +490,14 @@ export class ConversationEngine {
     options.callbacks?.onStatus?.("Context compacted");
   }
 
+  private async waitForRetry(
+    callbacks: EngineCallbacks | undefined,
+    signal: AbortSignal,
+    attempt: number,
+  ): Promise<void> {
+    await waitForTransientRetry(signal, attempt, callbacks?.onStatus, this.delay);
+  }
+
   private async requestWithRecovery(
     session: SessionRecord,
     input: ResponseInputItem[],
@@ -482,86 +506,102 @@ export class ConversationEngine {
     executionToken: string,
     metrics: TurnMetricsState,
   ): Promise<{ response: Response; compacted: boolean }> {
-    const client = this.clientFor(session.provider);
-    const anchorAbort = new AbortController();
-    let anchorTimedOut = false;
-    let firstEventTimer: NodeJS.Timeout | undefined;
-    const clearFirstEventTimer = (): void => {
-      if (firstEventTimer) clearTimeout(firstEventTimer);
-      firstEventTimer = undefined;
-    };
-    if (previousResponseId) {
-      firstEventTimer = setTimeout(() => {
-        anchorTimedOut = true;
-        anchorAbort.abort();
-      }, 30_000);
-      firstEventTimer.unref();
-    }
-    try {
-      const streamed = await client.stream({
-        model: session.model,
-        instructions: this.instructionsFor(session),
-        input,
-        tools: this.toolDefinitions(session),
-        promptCacheKey: session.promptCacheKey,
-        reasoningEffort: session.reasoningEffort,
-        supportsReasoning: options.modelInfo.supportsReasoning,
-        supportsParallelToolCalls: options.modelInfo.supportsParallelToolCalls,
-        verbosity: session.verbosity,
-        fast: session.fast,
-        ...(previousResponseId ? { previousResponseId } : {}),
-        signal: previousResponseId ? AbortSignal.any([options.signal, anchorAbort.signal]) : options.signal,
-      }, {
-        ...options.callbacks,
-        onEvent: clearFirstEventTimer,
-      });
-      return { response: streamed, compacted: false };
-    } catch (error) {
-      const recoveryError = anchorTimedOut
-        ? Object.assign(new Error("Previous response produced no stream event within 30 seconds"), {
-            code: "previous_response_first_event_timeout",
-          })
-        : error;
-      if (isContextOverflowError(recoveryError) && !options.signal.aborted) {
-        options.callbacks?.onStatus?.("Recovering context overflow");
-        await this.compactLocked(session.id, options, executionToken, metrics);
-        const recoverySession = this.requireSession(session.id);
-        const streamed = await client.stream({
-          model: recoverySession.model,
-          instructions: this.instructionsFor(recoverySession),
-          input: projectContext(this.store, session.id).input,
-          tools: this.toolDefinitions(recoverySession),
-          promptCacheKey: recoverySession.promptCacheKey,
-          reasoningEffort: recoverySession.reasoningEffort,
+    let currentSession = session;
+    let currentInput = input;
+    let currentPreviousResponseId = previousResponseId;
+    let compacted = false;
+    let contextRecoveryUsed = false;
+    let staleRecoveryUsed = false;
+    let retryAttempt = 0;
+    let visibleText = false;
+
+    const streamAttempt = async (): Promise<Response> => {
+      const anchorAbort = new AbortController();
+      let anchorTimedOut = false;
+      let firstEventTimer: NodeJS.Timeout | undefined;
+      const clearFirstEventTimer = (): void => {
+        if (firstEventTimer) clearTimeout(firstEventTimer);
+        firstEventTimer = undefined;
+      };
+      if (currentPreviousResponseId) {
+        firstEventTimer = setTimeout(() => {
+          anchorTimedOut = true;
+          anchorAbort.abort();
+        }, 30_000);
+        firstEventTimer.unref();
+      }
+      try {
+        return await this.clientFor(currentSession.provider).stream({
+          model: currentSession.model,
+          instructions: this.instructionsFor(currentSession),
+          input: currentInput,
+          tools: this.toolDefinitions(currentSession),
+          promptCacheKey: currentSession.promptCacheKey,
+          reasoningEffort: currentSession.reasoningEffort,
           supportsReasoning: options.modelInfo.supportsReasoning,
           supportsParallelToolCalls: options.modelInfo.supportsParallelToolCalls,
-          verbosity: recoverySession.verbosity,
-          fast: recoverySession.fast,
-          signal: options.signal,
-        }, options.callbacks);
-        return { response: streamed, compacted: true };
+          verbosity: currentSession.verbosity,
+          fast: currentSession.fast,
+          ...(currentPreviousResponseId ? { previousResponseId: currentPreviousResponseId } : {}),
+          signal: currentPreviousResponseId
+            ? AbortSignal.any([options.signal, anchorAbort.signal])
+            : options.signal,
+        }, {
+          ...options.callbacks,
+          onTextDelta: (delta) => {
+            if (delta.length > 0) visibleText = true;
+            options.callbacks?.onTextDelta?.(delta);
+          },
+          onEvent: clearFirstEventTimer,
+        });
+      } catch (error) {
+        if (anchorTimedOut) {
+          throw Object.assign(new Error("Previous response produced no stream event within 30 seconds"), {
+            code: "previous_response_first_event_timeout",
+          });
+        }
+        throw error;
+      } finally {
+        clearFirstEventTimer();
       }
-      if (!previousResponseId || !isStaleResponseError(recoveryError, true) || options.signal.aborted) throw recoveryError;
-      options.callbacks?.onStatus?.("Recovering conversation context");
-      const context = projectContext(this.store, session.id);
-      const recoverySession = this.store.resetContinuityFenced(session.id, executionToken);
-      if (!recoverySession) throw new Error("Session operation lease was lost during stale-anchor recovery");
-      const streamed = await client.stream({
-        model: recoverySession.model,
-        instructions: this.instructionsFor(recoverySession),
-        input: context.input,
-        tools: this.toolDefinitions(recoverySession),
-        promptCacheKey: recoverySession.promptCacheKey,
-        reasoningEffort: recoverySession.reasoningEffort,
-        supportsReasoning: options.modelInfo.supportsReasoning,
-        supportsParallelToolCalls: options.modelInfo.supportsParallelToolCalls,
-        verbosity: recoverySession.verbosity,
-        fast: recoverySession.fast,
-        signal: options.signal,
-      }, options.callbacks);
-      return { response: streamed, compacted: false };
-    } finally {
-      clearFirstEventTimer();
+    };
+
+    while (true) {
+      try {
+        const streamed = await streamAttempt();
+        return { response: streamed, compacted };
+      } catch (error) {
+        if (!visibleText && isContextOverflowError(error) && !contextRecoveryUsed && !options.signal.aborted) {
+          contextRecoveryUsed = true;
+          options.callbacks?.onStatus?.("Recovering context overflow");
+          await this.compactLocked(session.id, options, executionToken, metrics);
+          currentSession = this.requireSession(session.id);
+          currentInput = projectContext(this.store, session.id).input;
+          currentPreviousResponseId = undefined;
+          compacted = true;
+          continue;
+        }
+        if (!visibleText && currentPreviousResponseId
+          && !staleRecoveryUsed
+          && isStaleResponseError(error, true)
+          && !options.signal.aborted) {
+          staleRecoveryUsed = true;
+          options.callbacks?.onStatus?.("Recovering conversation context");
+          const context = projectContext(this.store, session.id);
+          const recoverySession = this.store.resetContinuityFenced(session.id, executionToken);
+          if (!recoverySession) throw new Error("Session operation lease was lost during stale-anchor recovery");
+          currentSession = recoverySession;
+          currentInput = context.input;
+          currentPreviousResponseId = undefined;
+          continue;
+        }
+        if (!visibleText && !options.signal.aborted && isTransientProviderError(error)) {
+          retryAttempt += 1;
+          await this.waitForRetry(options.callbacks, options.signal, retryAttempt);
+          continue;
+        }
+        throw error;
+      }
     }
   }
 
@@ -830,7 +870,7 @@ export class ConversationEngine {
     metrics: TurnMetricsState,
   ): Promise<boolean> {
     if (!await this.shouldCompact(sessionId, response, model)) return false;
-    await this.compactLocked(sessionId, options, executionToken, metrics);
+    await this.compactLocked(sessionId, options, executionToken, metrics, false);
     return true;
   }
 

@@ -517,6 +517,111 @@ test("provider context overflow compacts and retries exactly once", async (t) =>
   assert.equal(result.metrics?.compactions, 1);
 });
 
+test("transient model failures retry one logical round with bounded backoff and ephemeral statuses", async (t) => {
+  const { root, sessions, session, artifacts } = fixture(t);
+  const requests: ResponseRequest[] = [];
+  const delays: number[] = [];
+  const statuses: string[] = [];
+  const client = {
+    async stream(request: ResponseRequest) {
+      requests.push(request);
+      if (requests.length <= 6) throw Object.assign(new Error("provider unavailable"), { status: 503 });
+      return response("retry-success", "RETRY_SUCCESS");
+    },
+  } as unknown as CodexLbClient;
+  const engine = new ConversationEngine(
+    structuredClone(DEFAULT_CONFIG), root, sessions, artifacts, client, new ToolRegistry(), "instructions",
+    async (milliseconds: number) => { delays.push(milliseconds); },
+  );
+  const result = await engine.turn(session.id, "retry this", {
+    signal: new AbortController().signal,
+    interaction: { approve: async () => "once", ask: async () => "" },
+    callbacks: { onStatus: (status) => statuses.push(status) },
+    modelInfo,
+  });
+  assert.equal(result.text, "RETRY_SUCCESS");
+  assert.equal(result.metrics?.modelRounds, 1);
+  assert.deepEqual(delays, [1_000, 2_000, 4_000, 8_000, 16_000, 30_000]);
+  assert.ok(statuses.some((status) => /waiting.*attempt 1.*1s.*Ctrl\+C/i.test(status)));
+  assert.ok(statuses.some((status) => /reconnecting.*attempt 6.*30s.*Ctrl\+C/i.test(status)));
+  assert.equal(sessions.events(session.id).filter((event) => event.kind === "error").length, 0);
+});
+
+test("abort during transient backoff does not issue another provider request", async (t) => {
+  const { root, sessions, session, artifacts } = fixture(t);
+  const controller = new AbortController();
+  let requests = 0;
+  const client = {
+    async stream() {
+      requests += 1;
+      throw Object.assign(new Error("temporarily unavailable"), { status: 503 });
+    },
+  } as unknown as CodexLbClient;
+  const engine = new ConversationEngine(
+    structuredClone(DEFAULT_CONFIG), root, sessions, artifacts, client, new ToolRegistry(), "instructions",
+    async () => new Promise<void>(() => undefined),
+  );
+  const turn = engine.turn(session.id, "stop retrying", {
+    signal: controller.signal,
+    interaction: { approve: async () => "once", ask: async () => "" },
+    modelInfo,
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  controller.abort();
+  await assert.rejects(turn);
+  assert.equal(requests, 1);
+});
+
+test("permanent and partially visible provider failures are not retried", async (t) => {
+  const { root, sessions, session, artifacts } = fixture(t);
+  const delays: number[] = [];
+  let requests = 0;
+  const permanent = {
+    async stream() {
+      requests += 1;
+      throw Object.assign(new Error("invalid request"), { status: 400 });
+    },
+  } as unknown as CodexLbClient;
+  const permanentEngine = new ConversationEngine(
+    structuredClone(DEFAULT_CONFIG), root, sessions, artifacts, permanent, new ToolRegistry(), "instructions",
+    async (milliseconds: number) => { delays.push(milliseconds); },
+  );
+  await assert.rejects(permanentEngine.turn(session.id, "permanent", {
+    signal: new AbortController().signal,
+    interaction: { approve: async () => "once", ask: async () => "" },
+    modelInfo,
+  }));
+  assert.equal(requests, 1);
+  assert.equal(delays.length, 0);
+
+  const partialSession = sessions.create({
+    workspace: root,
+    model: "test-model",
+    reasoningEffort: "medium",
+    verbosity: "low",
+    fast: false,
+  });
+  requests = 0;
+  const partial = {
+    async stream(_request: ResponseRequest, callbacks?: { onTextDelta?: (delta: string) => void }) {
+      requests += 1;
+      callbacks?.onTextDelta?.("already visible");
+      throw Object.assign(new Error("provider unavailable"), { status: 503 });
+    },
+  } as unknown as CodexLbClient;
+  const partialEngine = new ConversationEngine(
+    structuredClone(DEFAULT_CONFIG), root, sessions, artifacts, partial, new ToolRegistry(), "instructions",
+    async (milliseconds: number) => { delays.push(Number(milliseconds)); },
+  );
+  await assert.rejects(partialEngine.turn(partialSession.id, "partial", {
+    signal: new AbortController().signal,
+    interaction: { approve: async () => "once", ask: async () => "" },
+    modelInfo,
+  }));
+  assert.equal(requests, 1);
+  assert.equal(delays.length, 0);
+});
+
 test("parallel tool calls share one aggregate model output budget", async (t) => {
   const { root, sessions, session, artifacts } = fixture(t);
   const large: GlassTool<Record<string, never>> = {
@@ -566,6 +671,61 @@ test("parallel tool calls share one aggregate model output budget", async (t) =>
   assert.ok(outputs.every((item) => Buffer.byteLength(item.output) <= Math.floor(4_096 / 20)));
   assert.ok(outputs.reduce((total, item) => total + Buffer.byteLength(item.output), 0) <= 4_096);
   assert.ok(outputs.every((item) => /artifact/.test(item.output)));
+});
+
+test("essential compaction retries transient failures while terminal maintenance defers", async (t) => {
+  const { root, sessions, session, artifacts } = fixture(t);
+  sessions.appendEvent<StoredUserPayload>(session.id, "user", { item: user("compact this") });
+  const delays: number[] = [];
+  let compactions = 0;
+  const client = {
+    async compact() {
+      compactions += 1;
+      if (compactions === 1) throw Object.assign(new Error("compactor unavailable"), { status: 503 });
+      return { id: "checkpoint", output: [], usage: { input_tokens: 10 } };
+    },
+  } as unknown as CodexLbClient;
+  const engine = new ConversationEngine(
+    structuredClone(DEFAULT_CONFIG), root, sessions, artifacts, client, new ToolRegistry(), "instructions",
+    async (milliseconds: number) => { delays.push(milliseconds); },
+  );
+  await engine.compactNow(session.id, {
+    signal: new AbortController().signal,
+    callbacks: { onStatus: () => undefined },
+  });
+  assert.equal(compactions, 2);
+  assert.deepEqual(delays, [1_000]);
+
+  const terminal = sessions.create({
+    workspace: root,
+    model: "test-model",
+    reasoningEffort: "medium",
+    verbosity: "low",
+    fast: false,
+  });
+  for (let index = 0; index < 4; index += 1) {
+    sessions.appendEvent<StoredUserPayload>(terminal.id, "user", { item: user(`seed ${index}`) });
+  }
+  const terminalClient = {
+    async stream() {
+      const final = response("maintenance-defer", "TERMINAL_ANSWER");
+      final.usage = { input_tokens: 250_000, output_tokens: 10, total_tokens: 250_010 } as never;
+      return final;
+    },
+    async compact() {
+      throw Object.assign(new Error("terminal compactor unavailable"), { status: 503 });
+    },
+  } as unknown as CodexLbClient;
+  const terminalEngine = new ConversationEngine(
+    structuredClone(DEFAULT_CONFIG), root, sessions, artifacts, terminalClient, new ToolRegistry(), "instructions",
+    async () => { throw new Error("terminal maintenance must not retry"); },
+  );
+  const terminalResult = await terminalEngine.turn(terminal.id, "finish", {
+    signal: new AbortController().signal,
+    interaction: { approve: async () => "once", ask: async () => "" },
+    modelInfo,
+  });
+  assert.equal(terminalResult.text, "TERMINAL_ANSWER");
 });
 
 test("completed answers survive terminal maintenance compaction failure", async (t) => {
@@ -713,6 +873,39 @@ test("mutating preflight failures return to the model without becoming unknown",
   assert.equal(sessions.getToolCall(session.id, "call_preflight")?.state, "failed");
   assert.equal(sessions.events(session.id).filter((event) => event.kind === "error").length, 0);
   assert.equal(sessions.events(session.id).filter((event) => event.kind === "tool_denied").length, 0);
+});
+
+test("stale-anchor recovery takes precedence over transient retry", async (t) => {
+  const { root, sessions, session, artifacts } = fixture(t);
+  sessions.setLastResponseId(session.id, "stale-anchor");
+  const delays: number[] = [];
+  const requests: ResponseRequest[] = [];
+  const client = {
+    async stream(request: ResponseRequest) {
+      requests.push(request);
+      if (requests.length === 1) {
+        throw Object.assign(new Error("previous response unavailable"), {
+          code: "previous_response_owner_unavailable",
+          status: 502,
+        });
+      }
+      return response("stale-recovered", "STALE_RECOVERED");
+    },
+  } as unknown as CodexLbClient;
+  const engine = new ConversationEngine(
+    structuredClone(DEFAULT_CONFIG), root, sessions, artifacts, client, new ToolRegistry(), "instructions",
+    async (milliseconds: number) => { delays.push(milliseconds); },
+  );
+  const result = await engine.turn(session.id, "recover stale", {
+    signal: new AbortController().signal,
+    interaction: { approve: async () => "once", ask: async () => "" },
+    modelInfo,
+  });
+  assert.equal(result.text, "STALE_RECOVERED");
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0]?.previousResponseId, "stale-anchor");
+  assert.equal(requests[1]?.previousResponseId, undefined);
+  assert.deepEqual(delays, []);
 });
 
 test("stale anchored turns rotate affinity and retry once from local replay", async (t) => {

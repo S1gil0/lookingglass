@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { providerError, providerHttpError } from "../src/errors.js";
+import { isTransientProviderError, providerError, providerHttpError } from "../src/errors.js";
 
 const context = { provider: "test-provider", operation: "responses.create" };
 
@@ -134,4 +134,72 @@ test("redacts qualified credential fields and URL userinfo", () => {
   assert.match(error.message, /private_key=\[REDACTED\]/);
   assert.match(error.message, /https:\/\/example\.invalid\/path/);
   assert.doesNotMatch(error.message, /@|\?/);
+});
+
+test("classifies transient provider failures and preserves safe retry metadata", () => {
+  const timeout = providerError(Object.assign(new Error("request timed out"), { code: "ETIMEDOUT" }), context);
+  const refused = providerError(Object.assign(new Error("connect failed"), { code: "ECONNREFUSED" }), context);
+  const dns = providerError(Object.assign(new Error("lookup failed"), { cause: { code: "EAI_AGAIN" } }), context);
+  const cancelledController = new AbortController();
+  cancelledController.abort();
+  const cancelled = providerError(new Error("The operation was aborted"), {
+    ...context,
+    callerSignal: cancelledController.signal,
+  });
+  const timeoutController = new AbortController();
+  timeoutController.abort();
+  const timedOutAbort = providerError(new Error("The operation was aborted"), {
+    ...context,
+    timeoutSignal: timeoutController.signal,
+  });
+  const cases: Array<[string, unknown, boolean]> = [
+    ["429", providerHttpError(429, { error: { code: "rate_limit", message: "Too many requests" } }, context), true],
+    ["503", providerHttpError(503, { error: { message: "service unavailable" } }, context), true],
+    ["timeout", timeout, true],
+    ["timeout abort signal", timedOutAbort, true],
+    ["connection refused", refused, true],
+    ["DNS", dns, true],
+    ["caller cancellation", cancelled, false],
+    ["generic 404", providerHttpError(404, { error: { message: "not found" } }, context), false],
+    ["generic 400", providerHttpError(400, { error: { message: "bad input" } }, context), false],
+    ["temporary model unavailable", providerHttpError(404, {
+      error: { code: "model_unavailable", message: "model temporarily unavailable" },
+    }, context), true],
+    ["unsupported endpoint", providerHttpError(404, {
+      error: { code: "no_compatible_endpoint", message: "no compatible endpoint" },
+    }, context), false],
+    ["malformed protocol", providerError({ code: "malformed_response", message: "response was not valid JSON" }, {
+      ...context,
+      protocol: true,
+    }), false],
+  ];
+
+  for (const [label, error, expected] of cases) {
+    assert.equal(isTransientProviderError(error), expected, label);
+    assert.equal((error as { retryable?: boolean }).retryable, expected, `${label} metadata`);
+  }
+  assert.equal((timeout as { kind?: string }).kind, "timeout");
+  assert.equal((cancelled as { kind?: string }).kind, "cancelled");
+});
+
+test("supports raw transport and HTTP errors without retrying permanent failures", () => {
+  const rawReset = Object.assign(new Error("fetch failed"), {
+    cause: Object.assign(new Error("socket reset"), { code: "ECONNRESET" }),
+  });
+  const rawDns = Object.assign(new Error("getaddrinfo ENOTFOUND gateway.invalid"), { code: "ENOTFOUND" });
+  const rawTimeout = Object.assign(new Error("headers timeout"), { name: "TimeoutError" });
+  const remoteAbort = Object.assign(new Error("remote connection aborted"), { code: "ECONNABORTED" });
+
+  assert.equal(isTransientProviderError(rawReset), true);
+  assert.equal(isTransientProviderError(rawDns), true);
+  assert.equal(isTransientProviderError(rawTimeout), true);
+  assert.equal(isTransientProviderError(remoteAbort), true);
+  assert.equal(isTransientProviderError({ status: 408, message: "request timeout" }), true);
+  assert.equal(isTransientProviderError({ status: 425 }), true);
+  assert.equal(isTransientProviderError({ status: 502 }), true);
+  assert.equal(isTransientProviderError({ status: 401, message: "unauthorized" }), false);
+  assert.equal(isTransientProviderError({ status: 422, message: "invalid request" }), false);
+  assert.equal(isTransientProviderError({ status: 503, code: "malformed_response" }), false);
+  assert.equal(isTransientProviderError({ status: 404, code: "no_compatible_provider" }), false);
+  assert.equal(isTransientProviderError(new Error("caller canceled the request")), false);
 });

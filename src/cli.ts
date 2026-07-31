@@ -13,7 +13,7 @@ import { credentialEnvironmentNames } from "./security.js";
 import { schedulerDoctorCheck, type DoctorCheck } from "./doctor.js";
 import { serializeConfig } from "./config.js";
 
-const VERSION = "0.5.4";
+const VERSION = "0.6.0";
 
 function usage(): string {
   return `Looking Glass ${VERSION}
@@ -169,7 +169,7 @@ async function runSchedulerDaemon(app: LookingGlassApp): Promise<void> {
         if (!scopedApp.hasProvider(scheduledSession.provider)) {
           throw new Error(`Session provider is not configured: ${scheduledSession.provider}`);
         }
-        const model = await scopedApp.model(scheduledSession.model, signal, scheduledSession.provider);
+        const model = await scopedApp.modelForTurn(scheduledSession.model, scheduledSession.provider, signal);
         const result = await scopedApp.engine.turnReserved(scheduledSession.id, job.prompt, {
           signal,
           modelInfo: model,
@@ -319,16 +319,17 @@ async function runPrompt(app: LookingGlassApp, args: string[]): Promise<void> {
   const prompt = promptParts.join(" ").trim();
   if (!prompt) throw new Error("run requires a prompt");
   const session = await app.currentOrNewSession(sessionId);
-  const model = await app.catalogModel(session.model, session.provider);
   const controller = new AbortController();
+  const callbacks = stdioCallbacks();
   const abort = (): void => controller.abort();
   process.once("SIGINT", abort);
   process.once("SIGTERM", abort);
   try {
+    const model = await app.modelForTurn(session.model, session.provider, controller.signal, callbacks.onStatus);
     await app.engine.turn(session.id, prompt, {
       signal: controller.signal,
       interaction: stdioInteraction(assumeYes),
-      callbacks: stdioCallbacks(),
+      callbacks,
       modelInfo: model,
     });
     process.stdout.write("\n");

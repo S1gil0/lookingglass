@@ -680,6 +680,16 @@ export class SchedulerStore {
         UPDATE scheduler_occurrences SET claim_lease_expires_at = ?
         WHERE state IN ('claimed', 'running') AND claim_owner = ? AND claim_boot_id = ?
       `).run(now + leaseMs, owner, bootId);
+      const reservationOwner = sessionPromptReservation(owner, bootId, "").owner;
+      this.db.prepare(`
+        UPDATE session_operation_leases SET renewed_at = ?, expires_at = ?
+        WHERE owner = ? AND token IN (
+          SELECT 'session-prompt:' || claim_token
+          FROM scheduler_occurrences
+          WHERE state IN ('claimed', 'running')
+            AND claim_owner = ? AND claim_boot_id = ? AND claim_token IS NOT NULL
+        )
+      `).run(now, now + leaseMs, reservationOwner, owner, bootId);
       return true;
     });
     return renew.immediate();

@@ -41,6 +41,20 @@ The main model and worker-agent model are configured independently, including se
 
 Looking Glass is designed for one local operator. It is not a hosted service, multi-user system, or replacement for operating-system isolation.
 
+## Screenshots
+
+### Development workflow
+
+![Looking Glass reading project files, applying a patch, running tests, and tracking a task plan](./img/ex3.png)
+
+### Persistent session automation
+
+![Looking Glass scheduling work and resuming the same persistent session later](./img/ex2.png)
+
+### Concurrent worker agents
+
+![Looking Glass coordinating parallel worker agents and applying reviewed fixes](./img/ex1.png)
+
 ## Requirements
 
 - Linux or native Windows
@@ -394,6 +408,8 @@ Enter slash commands inside `glass`:
 
 The transcript supports mouse-wheel scrolling, `PageUp`, and `PageDown`. Dragging across text selects and copies it through OSC52 with a native clipboard fallback. `Ctrl+C` cancels the active turn or exits when no turn is running.
 
+Before any visible model output, transient connectivity, rate-limit, and temporary provider/model availability failures keep the current turn alive. Looking Glass retries indefinitely with exponential backoff capped at 30 seconds, preserving the session, task plan, and operation lease; press `Ctrl+C` to stop waiting normally. Failures after visible output are not retried because replaying them could duplicate or mix streamed text.
+
 ## The Main Automation Workflow
 
 Scheduled session prompts are the feature to use when you want Looking Glass to continue a project by itself. A scheduled prompt is not a detached new chat. It is a future turn of an existing session.
@@ -724,6 +740,7 @@ src/
   tools/                 Coding tools, schemas, approvals, and safety policy
   ui/                    TUI and stdio interfaces
 test/                    Unit and integration coverage
+img/                     README screenshots
 looking-glass-light.svg  README title graphic (light)
 looking-glass-dark.svg   README title graphic (dark)
 ```
