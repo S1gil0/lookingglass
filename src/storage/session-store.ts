@@ -88,6 +88,14 @@ interface ToolCallRow {
   execution_token: string | null;
 }
 
+interface OperationLeaseRow {
+  owner: string;
+  token: string;
+  acquired_at: number;
+  renewed_at: number;
+  expires_at: number;
+}
+
 export interface ToolCallClaim {
   record: ToolCallRecord;
   acquired: boolean;
@@ -120,9 +128,288 @@ export interface SessionDeletionSummary {
   retainedArtifacts: number;
 }
 
+export interface AgentSessionRetentionPolicy {
+  maxAgeMs?: number;
+  minAgeMs?: number;
+  maxSessions?: number;
+  maxLogicalBytes?: number;
+  maxSessionsPerRun?: number;
+  maxLogicalBytesPerRun?: number;
+}
+
+export interface AgentSessionRetentionEstimate {
+  sessions: number;
+  logicalBytes: number;
+  rows: number;
+  artifacts: number;
+  artifactBytes: number;
+}
+
+export type AgentSessionRetentionMode = "dry-run" | "apply";
+
+export interface AgentSessionRetentionReport {
+  mode: AgentSessionRetentionMode;
+  dryRun: boolean;
+  now: number;
+  policy: AgentSessionRetentionPolicy;
+  total: AgentSessionRetentionEstimate;
+  candidate: AgentSessionRetentionEstimate;
+  eligible: AgentSessionRetentionEstimate;
+  protected: AgentSessionRetentionEstimate;
+  selected: AgentSessionRetentionEstimate;
+  remaining: AgentSessionRetentionEstimate;
+  batchLimited: boolean;
+}
+
+export interface OrphanedToolCallReconciliationReport {
+  toolCallsMarkedUnknown: number;
+  expiredLeasesDeleted: number;
+}
+
 export interface CommandApprovalRecord {
   signature: string;
   approvedAt: number;
+}
+
+/**
+ * A lease state is deliberately limited to ownership-independent information.
+ * In particular, it never contains the session id, owner, or execution token
+ * that were used to inspect the row.
+ */
+export type OperationLeaseStateKind = "active" | "expired" | "missing" | "replaced";
+
+export interface OperationLeaseState {
+  kind: OperationLeaseStateKind;
+  /** The duration represented by the observed row, when one exists. */
+  leaseDurationMs: number | null;
+  /** Time since the observed row was last renewed, when one exists. */
+  renewalAgeMs: number | null;
+  /** Positive until expiry and zero/negative after expiry, when one exists. */
+  expiryOffsetMs: number | null;
+}
+
+export interface OperationLeaseCheck {
+  ok: boolean;
+  state: OperationLeaseState;
+}
+
+/**
+ * Optional inputs for the aggregate session-storage stats snapshot.  The
+ * second age name is retained as a descriptive alias for callers that want
+ * to make it explicit that only started calls are considered.
+ */
+export interface SessionStatsSnapshotOptions {
+  now?: number;
+  staleToolCallAgeMs?: number;
+  staleStartedToolCallAgeMs?: number;
+}
+
+export interface SessionStatsSnapshot {
+  sessions: {
+    total: number;
+    interactive: number;
+    agent: number;
+    persistent: number;
+  };
+  events: {
+    total: number;
+    user: number;
+    response: number;
+    toolStarted: number;
+    toolResult: number;
+    toolDenied: number;
+    error: number;
+    note: number;
+  };
+  checkpoints: {
+    total: number;
+  };
+  toolCalls: {
+    total: number;
+    started: number;
+    completed: number;
+    denied: number;
+    failed: number;
+    unknown: number;
+    /** Started calls at least staleToolCallAgeMs old, regardless of lease. */
+    staleStarted: number;
+    /** Stale started calls without a matching live operation lease. */
+    orphanedStarted: number;
+    oldestStaleStartedAgeMs: number | null;
+  };
+  leases: {
+    total: number;
+    active: number;
+    stale: number;
+    oldestStaleAgeMs: number | null;
+  };
+}
+
+export type SessionOperationalStats = SessionStatsSnapshot;
+export type SessionStats = SessionStatsSnapshot;
+
+interface RetentionSessionRow {
+  id: string;
+  session_kind: SessionKind;
+  persistent: number;
+  updated_at: number;
+  events: number;
+  checkpoints: number;
+  tool_calls: number;
+  approvals: number;
+  logical_bytes: number;
+  artifacts: number;
+  artifact_bytes: number;
+  active_lease: number;
+  scheduler_jobs: number;
+  active_schedule: number;
+  child_sessions: number;
+  uncertain_tool_calls: number;
+}
+
+interface RetentionPlan {
+  rows: RetentionSessionRow[];
+  candidate: RetentionSessionRow[];
+  eligible: RetentionSessionRow[];
+  selected: RetentionSessionRow[];
+}
+
+const RETENTION_POLICY_KEYS = new Set<keyof AgentSessionRetentionPolicy>([
+  "maxAgeMs",
+  "minAgeMs",
+  "maxSessions",
+  "maxLogicalBytes",
+  "maxSessionsPerRun",
+  "maxLogicalBytesPerRun",
+]);
+
+const ORPHANED_TOOL_DIAGNOSTIC = "Tool execution was orphaned before a durable result was recorded.";
+
+/** Five minutes avoids treating a legitimately long-running tool as stale. */
+export const DEFAULT_STALE_STARTED_TOOL_CALL_AGE_MS = 5 * 60 * 1000;
+export const DEFAULT_STALE_TOOL_CALL_AGE_MS = DEFAULT_STALE_STARTED_TOOL_CALL_AGE_MS;
+
+function finiteInteger(name: string, value: number, minimum = 0): void {
+  if (!Number.isSafeInteger(value) || value < minimum) {
+    throw new Error(`${name} must be a non-negative safe integer`);
+  }
+}
+
+function validateNow(now: number): void {
+  finiteInteger("now", now);
+}
+
+const SESSION_STATS_OPTION_KEYS = new Set<keyof SessionStatsSnapshotOptions>([
+  "now",
+  "staleToolCallAgeMs",
+  "staleStartedToolCallAgeMs",
+]);
+
+function normalizeSessionStatsInput(
+  nowOrOptions: number | SessionStatsSnapshotOptions,
+  positionalStaleToolCallAgeMs: number | undefined,
+): { now: number; staleToolCallAgeMs: number } {
+  if (positionalStaleToolCallAgeMs !== undefined) {
+    finiteInteger("staleToolCallAgeMs", positionalStaleToolCallAgeMs);
+  }
+  if (typeof nowOrOptions === "number") {
+    validateNow(nowOrOptions);
+    const staleToolCallAgeMs = positionalStaleToolCallAgeMs ?? DEFAULT_STALE_STARTED_TOOL_CALL_AGE_MS;
+    finiteInteger("staleToolCallAgeMs", staleToolCallAgeMs);
+    return { now: nowOrOptions, staleToolCallAgeMs };
+  }
+  if (nowOrOptions === null || typeof nowOrOptions !== "object" || Array.isArray(nowOrOptions)) {
+    throw new Error("Session stats options must be an object or a timestamp");
+  }
+  for (const key of Object.keys(nowOrOptions) as Array<keyof SessionStatsSnapshotOptions>) {
+    if (!SESSION_STATS_OPTION_KEYS.has(key)) throw new Error(`Unknown session stats option: ${key}`);
+  }
+  if (positionalStaleToolCallAgeMs !== undefined
+    && (nowOrOptions.staleToolCallAgeMs !== undefined
+      || nowOrOptions.staleStartedToolCallAgeMs !== undefined)) {
+    throw new Error("Stale tool-call age must be supplied once");
+  }
+  const optionAge = nowOrOptions.staleToolCallAgeMs;
+  const startedOptionAge = nowOrOptions.staleStartedToolCallAgeMs;
+  if (nowOrOptions.now !== undefined) validateNow(nowOrOptions.now);
+  if (optionAge !== undefined) finiteInteger("staleToolCallAgeMs", optionAge);
+  if (startedOptionAge !== undefined) finiteInteger("staleToolCallAgeMs", startedOptionAge);
+  if (optionAge !== undefined && startedOptionAge !== undefined && optionAge !== startedOptionAge) {
+    throw new Error("Stale tool-call age options must agree");
+  }
+  const now = nowOrOptions.now === undefined ? Date.now() : nowOrOptions.now;
+  const staleToolCallAgeMs = positionalStaleToolCallAgeMs
+    ?? optionAge
+    ?? startedOptionAge
+    ?? DEFAULT_STALE_STARTED_TOOL_CALL_AGE_MS;
+  validateNow(now);
+  finiteInteger("staleToolCallAgeMs", staleToolCallAgeMs);
+  return { now, staleToolCallAgeMs };
+}
+
+function validateRetentionPolicy(policy: AgentSessionRetentionPolicy): AgentSessionRetentionPolicy {
+  if (policy === null || typeof policy !== "object" || Array.isArray(policy)) {
+    throw new Error("Agent session retention policy must be an object");
+  }
+  for (const key of Object.keys(policy) as Array<keyof AgentSessionRetentionPolicy>) {
+    if (!RETENTION_POLICY_KEYS.has(key)) throw new Error(`Unknown retention policy field: ${key}`);
+  }
+  for (const key of RETENTION_POLICY_KEYS) {
+    const value = policy[key];
+    if (value !== undefined) finiteInteger(key, value);
+  }
+  return { ...policy };
+}
+
+function retentionRowIsEligible(row: RetentionSessionRow): boolean {
+  return row.session_kind === "agent"
+    && row.persistent === 0
+    && row.active_lease === 0
+    && row.scheduler_jobs === 0
+    && row.active_schedule === 0
+    && row.child_sessions === 0
+    && row.uncertain_tool_calls === 0;
+}
+
+function retentionEstimate(rows: RetentionSessionRow[]): AgentSessionRetentionEstimate {
+  let logicalBytes = 0;
+  let events = 0;
+  let checkpoints = 0;
+  let toolCalls = 0;
+  let approvals = 0;
+  let artifacts = 0;
+  let artifactBytes = 0;
+  for (const row of rows) {
+    logicalBytes += row.logical_bytes;
+    events += row.events;
+    checkpoints += row.checkpoints;
+    toolCalls += row.tool_calls;
+    approvals += row.approvals;
+    artifacts += row.artifacts;
+    artifactBytes += row.artifact_bytes;
+  }
+  return {
+    sessions: rows.length,
+    logicalBytes,
+    rows: rows.length + events + checkpoints + toolCalls + approvals,
+    artifacts,
+    artifactBytes,
+  };
+}
+
+function subtractRetentionEstimate(
+  total: AgentSessionRetentionEstimate,
+  removed: AgentSessionRetentionEstimate,
+): AgentSessionRetentionEstimate {
+  return {
+    sessions: total.sessions - removed.sessions,
+    logicalBytes: total.logicalBytes - removed.logicalBytes,
+    rows: total.rows - removed.rows,
+    // Session deletion detaches artifacts with ON DELETE SET NULL; it does
+    // not remove either their rows or their external files.
+    artifacts: total.artifacts,
+    artifactBytes: total.artifactBytes,
+  };
 }
 
 function sessionFromRow(row: SessionRow): SessionRecord {
@@ -534,6 +821,87 @@ export class SessionStore {
     return remove.immediate();
   }
 
+  planAgentSessionRetention(
+    policy: AgentSessionRetentionPolicy,
+    now = Date.now(),
+  ): AgentSessionRetentionReport {
+    const checkedPolicy = validateRetentionPolicy(policy);
+    validateNow(now);
+    return this.buildAgentSessionRetentionReport(checkedPolicy, now, "dry-run");
+  }
+
+  previewAgentSessionRetention(
+    policy: AgentSessionRetentionPolicy,
+    now = Date.now(),
+  ): AgentSessionRetentionReport {
+    return this.planAgentSessionRetention(policy, now);
+  }
+
+  applyAgentSessionRetention(
+    policy: AgentSessionRetentionPolicy,
+    now = Date.now(),
+  ): AgentSessionRetentionReport {
+    const checkedPolicy = validateRetentionPolicy(policy);
+    validateNow(now);
+    // Keep the expensive byte-accounting scan outside the writer transaction.
+    // The short transaction below revalidates every candidate before deletion.
+    const plan = this.buildAgentSessionRetentionPlan(checkedPolicy, now);
+    const apply = this.db.transaction(() => {
+      const removed: RetentionSessionRow[] = [];
+      for (const row of plan.selected) {
+        // Recheck mutability and every protection predicate under BEGIN
+        // IMMEDIATE. Artifacts detach through their existing foreign key.
+        const result = this.db.prepare(`
+          DELETE FROM sessions
+          WHERE id = ? AND session_kind = 'agent' AND persistent = 0 AND updated_at = ?
+            AND NOT EXISTS (
+              WITH RECURSIVE ancestors(id) AS (
+                SELECT id FROM sessions WHERE id = ?
+                UNION ALL
+                SELECT current.parent_session_id FROM sessions current
+                JOIN ancestors child ON current.id = child.id
+                WHERE current.parent_session_id IS NOT NULL
+              )
+              SELECT 1 FROM session_operation_leases lease
+              JOIN ancestors ON ancestors.id = lease.session_id
+              WHERE lease.expires_at > ?
+            )
+            AND NOT EXISTS (SELECT 1 FROM sessions child WHERE child.parent_session_id = sessions.id)
+            AND NOT EXISTS (SELECT 1 FROM scheduler_jobs job WHERE job.session_id = sessions.id)
+            AND NOT EXISTS (
+              SELECT 1 FROM tool_calls call
+              WHERE call.session_id = sessions.id AND call.state IN ('started', 'unknown')
+            )
+        `).run(row.id, row.updated_at, row.id, now);
+        if (result.changes === 1) removed.push(row);
+      }
+      return this.buildAgentSessionRetentionReportFromPlan(
+        checkedPolicy,
+        now,
+        "apply",
+        { ...plan, selected: removed },
+      );
+    });
+    return apply.immediate();
+  }
+
+  agentSessionRetention(
+    policy: AgentSessionRetentionPolicy,
+    mode: AgentSessionRetentionMode = "dry-run",
+    now = Date.now(),
+  ): AgentSessionRetentionReport {
+    if (mode === "dry-run") return this.planAgentSessionRetention(policy, now);
+    if (mode === "apply") return this.applyAgentSessionRetention(policy, now);
+    throw new Error("Retention mode must be dry-run or apply");
+  }
+
+  pruneAgentSessions(
+    policy: AgentSessionRetentionPolicy,
+    now = Date.now(),
+  ): AgentSessionRetentionReport {
+    return this.applyAgentSessionRetention(policy, now);
+  }
+
   appendEvent<T>(sessionId: string, kind: EventKind, payload: T): SessionEvent<T> {
     const append = this.db.transaction(() => {
       return this.appendEventRow(sessionId, kind, payload, Date.now());
@@ -624,6 +992,28 @@ export class SessionStore {
       ORDER BY sequence ASC
     `).all(sessionId, afterSequence) as EventRow[];
     return rows.map(eventFromRow);
+  }
+
+  recentEvents(sessionId: string, limit: number): SessionEvent[] {
+    const boundedLimit = Number.isFinite(limit) ? Math.max(0, Math.floor(limit)) : 0;
+    if (boundedLimit === 0) return [];
+    const rows = this.db.prepare(`
+      SELECT * FROM (
+        SELECT * FROM session_events
+        WHERE session_id = ?
+        ORDER BY sequence DESC
+        LIMIT ?
+      )
+      ORDER BY sequence ASC
+    `).all(sessionId, boundedLimit) as EventRow[];
+    return rows.map(eventFromRow);
+  }
+
+  eventCount(sessionId: string): number {
+    const row = this.db.prepare(
+      "SELECT COUNT(*) AS count FROM session_events WHERE session_id = ?",
+    ).get(sessionId) as { count: number };
+    return row.count;
   }
 
   latestResponseUsage(sessionId: string): { sequence: number; inputTokens: number } | null {
@@ -943,31 +1333,108 @@ export class SessionStore {
     return acquire.immediate();
   }
 
-  renewOperationLease(sessionId: string, owner: string, token: string, now = Date.now(), leaseMs = 30_000): boolean {
-    return this.db.prepare(`
+  /**
+   * Keep the successful heartbeat path to one conditional write. If it
+   * fails, inspect the current row only to produce a safe best-effort
+   * diagnosis; the failed renewal remains fenced regardless of classification.
+   */
+  renewOperationLeaseChecked(
+    sessionId: string,
+    owner: string,
+    token: string,
+    now = Date.now(),
+    leaseMs = 30_000,
+  ): OperationLeaseCheck {
+    const result = this.db.prepare(`
       UPDATE session_operation_leases SET renewed_at = ?, expires_at = ?
       WHERE session_id = ? AND owner = ? AND token = ? AND expires_at > ?
-    `).run(now, now + leaseMs, sessionId, owner, token, now).changes === 1;
+    `).run(now, now + leaseMs, sessionId, owner, token, now);
+    if (result.changes === 1) {
+      return {
+        ok: true,
+        state: {
+          kind: "active",
+          leaseDurationMs: leaseMs,
+          renewalAgeMs: 0,
+          expiryOffsetMs: leaseMs,
+        },
+      };
+    }
+    return { ok: false, state: this.readOperationLeaseState(sessionId, owner, token, now) };
+  }
+
+  renewOperationLease(sessionId: string, owner: string, token: string, now = Date.now(), leaseMs = 30_000): boolean {
+    return this.renewOperationLeaseChecked(sessionId, owner, token, now, leaseMs).ok;
+  }
+
+  /** Check ownership and expiry while retaining a safe diagnosis on failure. */
+  assertOperationLeaseChecked(
+    sessionId: string,
+    owner: string,
+    token: string,
+    now = Date.now(),
+  ): OperationLeaseCheck {
+    const state = this.readOperationLeaseState(sessionId, owner, token, now);
+    return { ok: state.kind === "active", state };
   }
 
   assertOperationLease(sessionId: string, owner: string, token: string, now = Date.now()): boolean {
-    return Boolean(this.db.prepare(`
-      SELECT 1 FROM session_operation_leases
-      WHERE session_id = ? AND owner = ? AND token = ? AND expires_at > ?
-    `).get(sessionId, owner, token, now));
+    return this.assertOperationLeaseChecked(sessionId, owner, token, now).ok;
+  }
+
+  /** Check a fencing token without exposing the corresponding owner. */
+  assertOperationTokenChecked(sessionId: string, token: string, now = Date.now()): OperationLeaseCheck {
+    const state = this.readOperationLeaseState(sessionId, undefined, token, now);
+    return { ok: state.kind === "active", state };
   }
 
   assertOperationToken(sessionId: string, token: string, now = Date.now()): boolean {
-    return Boolean(this.db.prepare(`
-      SELECT 1 FROM session_operation_leases
-      WHERE session_id = ? AND token = ? AND expires_at > ?
-    `).get(sessionId, token, now));
+    return this.assertOperationTokenChecked(sessionId, token, now).ok;
+  }
+
+  /**
+   * Inspect the current row using the expected ownership, returning only
+   * timing and classification data.  This is useful for diagnostics after a
+   * failed renewal or final assertion; it is not a way to bypass fencing.
+   */
+  inspectOperationLease(
+    sessionId: string,
+    owner: string,
+    token: string,
+    now = Date.now(),
+  ): OperationLeaseState {
+    return this.readOperationLeaseState(sessionId, owner, token, now);
   }
 
   releaseOperationLease(sessionId: string, owner: string, token: string): boolean {
     return this.db.prepare(`
       DELETE FROM session_operation_leases WHERE session_id = ? AND owner = ? AND token = ?
     `).run(sessionId, owner, token).changes === 1;
+  }
+
+  reconcileOrphanedToolCalls(now = Date.now()): OrphanedToolCallReconciliationReport {
+    validateNow(now);
+    const reconcile = this.db.transaction(() => {
+      const marked = this.db.prepare(`
+        UPDATE tool_calls
+        SET state = 'unknown', output_text = NULL, error_text = ?, finished_at = ?
+        WHERE state = 'started'
+          AND NOT EXISTS (
+            SELECT 1 FROM session_operation_leases l
+            WHERE l.session_id = tool_calls.session_id
+              AND l.token = tool_calls.execution_token
+              AND l.expires_at > ?
+          )
+      `).run(ORPHANED_TOOL_DIAGNOSTIC, now, now);
+      const deleted = this.db.prepare(
+        "DELETE FROM session_operation_leases WHERE expires_at <= ?",
+      ).run(now);
+      return {
+        toolCallsMarkedUnknown: marked.changes,
+        expiredLeasesDeleted: deleted.changes,
+      };
+    });
+    return reconcile.immediate();
   }
 
   reconcileToolCallEvents(sessionId: string, executionToken: string): number {
@@ -1012,7 +1479,7 @@ export class SessionStore {
 
       const missing = this.db.prepare(`
         SELECT tc.* FROM tool_calls tc
-        WHERE tc.session_id = ? AND tc.call_id NOT IN (
+        WHERE tc.session_id = ? AND tc.state <> 'started' AND tc.call_id NOT IN (
           SELECT json_extract(e.payload_json, '$.callId')
           FROM session_events e
           WHERE e.session_id = ? AND e.kind IN ('tool_result', 'tool_denied')
@@ -1066,6 +1533,334 @@ export class SessionStore {
       "SELECT * FROM tool_calls WHERE session_id = ? AND call_id = ?",
     ).get(sessionId, callId) as ToolCallRow | undefined;
     return row ? toolCallFromRow(row) : null;
+  }
+
+  /**
+   * Return an aggregate-only session storage snapshot.  The queries below
+   * intentionally select no identifiers or payload columns; the tool-call
+   * lease check is used only to classify stale rows and is never returned.
+   */
+  getStats(
+    nowOrOptions: number | SessionStatsSnapshotOptions = Date.now(),
+    positionalStaleToolCallAgeMs?: number,
+  ): SessionStatsSnapshot {
+    const { now, staleToolCallAgeMs } = normalizeSessionStatsInput(
+      nowOrOptions,
+      positionalStaleToolCallAgeMs,
+    );
+    const sessions = this.db.prepare(`
+      SELECT COUNT(*) AS total,
+        COALESCE(SUM(CASE WHEN session_kind = 'interactive' THEN 1 ELSE 0 END), 0) AS interactive,
+        COALESCE(SUM(CASE WHEN session_kind = 'agent' THEN 1 ELSE 0 END), 0) AS agent,
+        COALESCE(SUM(CASE WHEN persistent = 1 THEN 1 ELSE 0 END), 0) AS persistent
+      FROM sessions
+    `).get() as {
+      total: number;
+      interactive: number;
+      agent: number;
+      persistent: number;
+    };
+    const events = this.db.prepare(`
+      SELECT COUNT(*) AS total,
+        COALESCE(SUM(CASE WHEN kind = 'user' THEN 1 ELSE 0 END), 0) AS user,
+        COALESCE(SUM(CASE WHEN kind = 'response' THEN 1 ELSE 0 END), 0) AS response,
+        COALESCE(SUM(CASE WHEN kind = 'tool_started' THEN 1 ELSE 0 END), 0) AS tool_started,
+        COALESCE(SUM(CASE WHEN kind = 'tool_result' THEN 1 ELSE 0 END), 0) AS tool_result,
+        COALESCE(SUM(CASE WHEN kind = 'tool_denied' THEN 1 ELSE 0 END), 0) AS tool_denied,
+        COALESCE(SUM(CASE WHEN kind = 'error' THEN 1 ELSE 0 END), 0) AS error,
+        COALESCE(SUM(CASE WHEN kind = 'note' THEN 1 ELSE 0 END), 0) AS note
+      FROM session_events
+    `).get() as {
+      total: number;
+      user: number;
+      response: number;
+      tool_started: number;
+      tool_result: number;
+      tool_denied: number;
+      error: number;
+      note: number;
+    };
+    const checkpoints = this.db.prepare(
+      "SELECT COUNT(*) AS total FROM context_checkpoints",
+    ).get() as { total: number };
+    const toolCalls = this.db.prepare(`
+      WITH parameters(snapshot_now, stale_age_ms) AS (VALUES (?, ?))
+      SELECT COUNT(*) AS total,
+        COALESCE(SUM(CASE WHEN state = 'started' THEN 1 ELSE 0 END), 0) AS started,
+        COALESCE(SUM(CASE WHEN state = 'completed' THEN 1 ELSE 0 END), 0) AS completed,
+        COALESCE(SUM(CASE WHEN state = 'denied' THEN 1 ELSE 0 END), 0) AS denied,
+        COALESCE(SUM(CASE WHEN state = 'failed' THEN 1 ELSE 0 END), 0) AS failed,
+        COALESCE(SUM(CASE WHEN state = 'unknown' THEN 1 ELSE 0 END), 0) AS unknown,
+        COALESCE(SUM(CASE WHEN state = 'started'
+          AND started_at <= p.snapshot_now
+          AND p.snapshot_now - started_at >= p.stale_age_ms
+          THEN 1 ELSE 0 END), 0) AS stale_started,
+        COALESCE(SUM(CASE WHEN state = 'started'
+          AND started_at <= p.snapshot_now
+          AND p.snapshot_now - started_at >= p.stale_age_ms
+          AND NOT EXISTS (
+            SELECT 1 FROM session_operation_leases lease
+            WHERE lease.session_id = tool_calls.session_id
+              AND lease.token = tool_calls.execution_token
+              AND lease.expires_at > p.snapshot_now
+          )
+          THEN 1 ELSE 0 END), 0) AS orphaned_started,
+        MAX(CASE WHEN state = 'started'
+          AND started_at <= p.snapshot_now
+          AND p.snapshot_now - started_at >= p.stale_age_ms
+          THEN p.snapshot_now - started_at END) AS oldest_stale_started_age_ms
+      FROM tool_calls CROSS JOIN parameters p
+    `).get(now, staleToolCallAgeMs) as {
+      total: number;
+      started: number;
+      completed: number;
+      denied: number;
+      failed: number;
+      unknown: number;
+      stale_started: number;
+      orphaned_started: number;
+      oldest_stale_started_age_ms: number | null;
+    };
+    const leases = this.db.prepare(`
+      SELECT COUNT(*) AS total,
+        COALESCE(SUM(CASE WHEN expires_at > ? THEN 1 ELSE 0 END), 0) AS active,
+        COALESCE(SUM(CASE WHEN expires_at <= ? THEN 1 ELSE 0 END), 0) AS stale,
+        MAX(CASE WHEN expires_at <= ? THEN ? - expires_at END) AS oldest_stale_age_ms
+      FROM session_operation_leases
+    `).get(now, now, now, now) as {
+      total: number;
+      active: number;
+      stale: number;
+      oldest_stale_age_ms: number | null;
+    };
+    return {
+      sessions: {
+        total: sessions.total,
+        interactive: sessions.interactive,
+        agent: sessions.agent,
+        persistent: sessions.persistent,
+      },
+      events: {
+        total: events.total,
+        user: events.user,
+        response: events.response,
+        toolStarted: events.tool_started,
+        toolResult: events.tool_result,
+        toolDenied: events.tool_denied,
+        error: events.error,
+        note: events.note,
+      },
+      checkpoints: { total: checkpoints.total },
+      toolCalls: {
+        total: toolCalls.total,
+        started: toolCalls.started,
+        completed: toolCalls.completed,
+        denied: toolCalls.denied,
+        failed: toolCalls.failed,
+        unknown: toolCalls.unknown,
+        staleStarted: toolCalls.stale_started,
+        orphanedStarted: toolCalls.orphaned_started,
+        oldestStaleStartedAgeMs: toolCalls.oldest_stale_started_age_ms,
+      },
+      leases: {
+        total: leases.total,
+        active: leases.active,
+        stale: leases.stale,
+        oldestStaleAgeMs: leases.oldest_stale_age_ms,
+      },
+    };
+  }
+
+  stats(
+    nowOrOptions: number | SessionStatsSnapshotOptions = Date.now(),
+    positionalStaleToolCallAgeMs?: number,
+  ): SessionStatsSnapshot {
+    return this.getStats(nowOrOptions, positionalStaleToolCallAgeMs);
+  }
+
+  getSessionStats(
+    nowOrOptions: number | SessionStatsSnapshotOptions = Date.now(),
+    positionalStaleToolCallAgeMs?: number,
+  ): SessionStatsSnapshot {
+    return this.getStats(nowOrOptions, positionalStaleToolCallAgeMs);
+  }
+
+  getOperationalStats(
+    nowOrOptions: number | SessionStatsSnapshotOptions = Date.now(),
+    positionalStaleToolCallAgeMs?: number,
+  ): SessionStatsSnapshot {
+    return this.getStats(nowOrOptions, positionalStaleToolCallAgeMs);
+  }
+
+  private buildAgentSessionRetentionPlan(
+    policy: AgentSessionRetentionPolicy,
+    now: number,
+  ): RetentionPlan {
+    const rows = this.readAgentSessionRetentionRows(now);
+    const agentRows = rows.filter((row) => row.session_kind === "agent");
+    const eligible = agentRows.filter(retentionRowIsEligible);
+    const ordered = [...eligible].sort(
+      (left, right) => left.updated_at - right.updated_at || left.id.localeCompare(right.id),
+    );
+    let remainingSessions = agentRows.length;
+    let remainingBytes = agentRows.reduce((sum, row) => sum + row.logical_bytes, 0);
+    const candidate: RetentionSessionRow[] = [];
+    for (const row of ordered) {
+      const age = now >= row.updated_at ? now - row.updated_at : -1;
+      const minimumAge = policy.minAgeMs ?? 0;
+      const oldEnough = age >= minimumAge
+        && policy.maxAgeMs !== undefined
+        && age > policy.maxAgeMs;
+      const quotaAge = age >= minimumAge;
+      const quotaNeeded = (policy.maxSessions !== undefined && remainingSessions > policy.maxSessions)
+        || (policy.maxLogicalBytes !== undefined && remainingBytes > policy.maxLogicalBytes);
+      if (!oldEnough && !(quotaAge && quotaNeeded)) continue;
+      candidate.push(row);
+      remainingSessions -= 1;
+      remainingBytes = Math.max(0, remainingBytes - row.logical_bytes);
+    }
+
+    const maxSessionsPerRun = policy.maxSessionsPerRun ?? Number.MAX_SAFE_INTEGER;
+    const maxBytesPerRun = policy.maxLogicalBytesPerRun ?? Number.MAX_SAFE_INTEGER;
+    let sessionBudget = maxSessionsPerRun;
+    let bytesBudget = maxBytesPerRun;
+    const selected: RetentionSessionRow[] = [];
+    for (const row of candidate) {
+      if (sessionBudget === 0) break;
+      if (row.logical_bytes > bytesBudget) continue;
+      selected.push(row);
+      sessionBudget -= 1;
+      bytesBudget -= row.logical_bytes;
+    }
+    return { rows, candidate, eligible, selected };
+  }
+
+  private readAgentSessionRetentionRows(now: number): RetentionSessionRow[] {
+    return this.db.prepare(`
+      WITH
+        agent_sessions AS MATERIALIZED (
+          SELECT * FROM sessions WHERE session_kind = 'agent'
+        ),
+        event_stats AS (
+          SELECT e.session_id, COUNT(*) AS events,
+            COALESCE(SUM(length(CAST(payload_json AS BLOB))), 0) AS logical_bytes
+          FROM session_events e JOIN agent_sessions a ON a.id = e.session_id
+          GROUP BY e.session_id
+        ),
+        tool_stats AS (
+          SELECT tc.session_id, COUNT(*) AS tool_calls,
+            COALESCE(SUM(
+              length(CAST(arguments_json AS BLOB))
+              + COALESCE(length(CAST(output_text AS BLOB)), 0)
+              + COALESCE(length(CAST(error_text AS BLOB)), 0)
+            ), 0) AS logical_bytes
+          FROM tool_calls tc JOIN agent_sessions a ON a.id = tc.session_id
+          GROUP BY tc.session_id
+        ),
+        checkpoint_stats AS (
+          SELECT c.session_id, COUNT(*) AS checkpoints,
+            COALESCE(SUM(length(CAST(compact_json AS BLOB))), 0) AS logical_bytes
+          FROM context_checkpoints c JOIN agent_sessions a ON a.id = c.session_id
+          GROUP BY c.session_id
+        ),
+        approval_stats AS (
+          SELECT p.session_id, COUNT(*) AS approvals,
+            COALESCE(SUM(length(CAST(signature AS BLOB))), 0) AS logical_bytes
+          FROM session_command_approvals p JOIN agent_sessions a ON a.id = p.session_id
+          GROUP BY p.session_id
+        ),
+        artifact_stats AS (
+          SELECT ar.session_id, COUNT(*) AS artifacts,
+            COALESCE(SUM(byte_count), 0) AS artifact_bytes
+          FROM artifacts ar JOIN agent_sessions a ON a.id = ar.session_id
+          GROUP BY ar.session_id
+        )
+      SELECT
+        s.id,
+        s.session_kind,
+        s.persistent,
+        s.updated_at,
+        COALESCE(es.events, 0) AS events,
+        COALESCE(cs.checkpoints, 0) AS checkpoints,
+        COALESCE(ts.tool_calls, 0) AS tool_calls,
+        COALESCE(as_.approvals, 0) AS approvals,
+        COALESCE(es.logical_bytes, 0)
+          + COALESCE(ts.logical_bytes, 0)
+          + COALESCE(cs.logical_bytes, 0)
+          + COALESCE(as_.logical_bytes, 0) AS logical_bytes,
+        COALESCE(ars.artifacts, 0) AS artifacts,
+        COALESCE(ars.artifact_bytes, 0) AS artifact_bytes,
+        CASE WHEN EXISTS (
+          WITH RECURSIVE ancestors(id) AS (
+            SELECT s.id
+            UNION ALL
+            SELECT parent.parent_session_id FROM sessions parent
+            JOIN ancestors child ON parent.id = child.id
+            WHERE parent.parent_session_id IS NOT NULL
+          )
+          SELECT 1 FROM session_operation_leases l
+          JOIN ancestors ON ancestors.id = l.session_id
+          WHERE l.expires_at > ?
+        ) THEN 1 ELSE 0 END AS active_lease,
+        CASE WHEN EXISTS (
+          SELECT 1 FROM scheduler_jobs j WHERE j.session_id = s.id
+        ) THEN 1 ELSE 0 END AS scheduler_jobs,
+        CASE WHEN EXISTS (
+          SELECT 1 FROM scheduler_occurrences o
+          JOIN scheduler_jobs j ON j.id = o.job_id
+          WHERE j.session_id = s.id AND o.state IN ('claimed', 'running')
+        ) THEN 1 ELSE 0 END AS active_schedule,
+        CASE WHEN EXISTS (
+          SELECT 1 FROM sessions child WHERE child.parent_session_id = s.id
+        ) THEN 1 ELSE 0 END AS child_sessions,
+        CASE WHEN EXISTS (
+          SELECT 1 FROM tool_calls call
+          WHERE call.session_id = s.id AND call.state IN ('started', 'unknown')
+        ) THEN 1 ELSE 0 END AS uncertain_tool_calls
+      FROM agent_sessions s
+      LEFT JOIN event_stats es ON es.session_id = s.id
+      LEFT JOIN tool_stats ts ON ts.session_id = s.id
+      LEFT JOIN checkpoint_stats cs ON cs.session_id = s.id
+      LEFT JOIN approval_stats as_ ON as_.session_id = s.id
+      LEFT JOIN artifact_stats ars ON ars.session_id = s.id
+      ORDER BY s.updated_at, s.id
+    `).all(now) as RetentionSessionRow[];
+  }
+
+  private buildAgentSessionRetentionReport(
+    policy: AgentSessionRetentionPolicy,
+    now: number,
+    mode: AgentSessionRetentionMode,
+  ): AgentSessionRetentionReport {
+    const plan = this.buildAgentSessionRetentionPlan(policy, now);
+    return this.buildAgentSessionRetentionReportFromPlan(policy, now, mode, plan);
+  }
+
+  private buildAgentSessionRetentionReportFromPlan(
+    policy: AgentSessionRetentionPolicy,
+    now: number,
+    mode: AgentSessionRetentionMode,
+    plan: RetentionPlan,
+  ): AgentSessionRetentionReport {
+    const agentRows = plan.rows.filter((row) => row.session_kind === "agent");
+    const total = retentionEstimate(agentRows);
+    const candidate = retentionEstimate(plan.candidate);
+    const eligible = retentionEstimate(plan.eligible);
+    const selected = retentionEstimate(plan.selected);
+    const protectedRows = agentRows.filter((row) => !retentionRowIsEligible(row));
+    return {
+      mode,
+      dryRun: mode === "dry-run",
+      now,
+      policy: { ...policy },
+      total,
+      candidate,
+      eligible,
+      protected: retentionEstimate(protectedRows),
+      selected,
+      remaining: subtractRetentionEstimate(total, selected),
+      batchLimited: plan.selected.length < plan.candidate.length,
+    };
   }
 
   private readDeletionSummary(id: string): SessionDeletionSummary {
@@ -1135,6 +1930,42 @@ export class SessionStore {
       kind,
       payload,
       createdAt,
+    };
+  }
+
+  private readOperationLeaseState(
+    sessionId: string,
+    owner: string | undefined,
+    token: string,
+    now: number,
+  ): OperationLeaseState {
+    const row = this.db.prepare(`
+      SELECT owner, token, acquired_at, renewed_at, expires_at
+      FROM session_operation_leases WHERE session_id = ?
+    `).get(sessionId) as OperationLeaseRow | undefined;
+    if (!row) {
+      return {
+        kind: "missing",
+        leaseDurationMs: null,
+        renewalAgeMs: null,
+        expiryOffsetMs: null,
+      };
+    }
+
+    const expiryOffsetMs = row.expires_at - now;
+    if (row.token !== token || (owner !== undefined && row.owner !== owner)) {
+      return {
+        kind: "replaced",
+        leaseDurationMs: null,
+        renewalAgeMs: null,
+        expiryOffsetMs: null,
+      };
+    }
+    return {
+      kind: expiryOffsetMs > 0 ? "active" : "expired",
+      leaseDurationMs: Math.max(0, row.expires_at - row.renewed_at),
+      renewalAgeMs: Math.max(0, now - row.renewed_at),
+      expiryOffsetMs,
     };
   }
 

@@ -19,7 +19,7 @@ test("renders Windows paths as safe PowerShell and XML literals", () => {
   const nodePath = `C:\\Program Files\\Node's & 100%.exe`;
   const cliPath = `C:\\Looking Glass\\it's & ready\\cli.js`;
   const dbPath = `C:\\Users\\A&B\\state's 100%.db`;
-  const launcher = renderLauncher(nodePath, cliPath, dbPath);
+  const launcher = renderLauncher(nodePath, cliPath, dbPath, {});
   assert.match(launcher, /Node''s & 100%\.exe/);
   assert.match(launcher, /LOOKING_GLASS_DB/);
   assert.match(launcher, /& \$node \$cli 'cron' 'daemon'/);
@@ -38,6 +38,38 @@ test("renders Windows paths as safe PowerShell and XML literals", () => {
   assert.match(xml, /LeastPrivilege/);
   assert.match(xml, /ExecutionTimeLimit>PT0S/);
   assert.match(xml, /RestartOnFailure/);
+});
+
+test("Windows launcher propagates only scheduler environment with PowerShell-safe literals", () => {
+  const nodePath = String.raw`C:\Program Files\node.exe`;
+  const cliPath = String.raw`C:\Looking Glass\cli.js`;
+  const dbPath = String.raw`C:\Looking Glass\state.db`;
+  const inheritedNames = [
+    "LOOKING_GLASS_CONFIG",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "APPDATA",
+    "LOCALAPPDATA",
+  ] as const;
+  const environment = {
+    LOOKING_GLASS_CONFIG: String.raw`C:\Users\A&B\it's\config.jsonc`,
+    XDG_CONFIG_HOME: String.raw`C:\Looking Glass\XDG Config`,
+    XDG_DATA_HOME: String.raw`C:\Looking Glass\XDG Data`,
+    APPDATA: String.raw`C:\Users\A&B\AppData\Roaming`,
+    LOCALAPPDATA: String.raw`C:\Users\A&B\AppData\Local`,
+    UNRELATED_SCHEDULER_ENV: "must-not-be-inherited",
+  };
+  const launcher = renderLauncher(nodePath, cliPath, dbPath, environment);
+
+  assert.deepEqual(
+    launcher.split("\r\n").filter((line) => line.startsWith("$env:")),
+    [
+      `$env:LOOKING_GLASS_DB = ${powerShellLiteral(dbPath)}`,
+      ...inheritedNames.map((name) => `$env:${name} = ${powerShellLiteral(environment[name])}`),
+    ],
+  );
+  assert.equal(launcher.includes("UNRELATED_SCHEDULER_ENV"), false);
+  assert.equal(launcher.includes("must-not-be-inherited"), false);
 });
 
 test("Windows scheduler dispatches without invoking a host scheduler", () => {

@@ -20,7 +20,7 @@ export interface StoredResponsePayload {
 export interface StoredToolResultPayload {
   name: string;
   callId: string;
-  item: ResponseInputItem;
+  item?: ResponseInputItem;
   output: string;
   artifactUri?: string;
   truncated?: boolean;

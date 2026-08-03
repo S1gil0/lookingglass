@@ -12,14 +12,20 @@ import { ConversationEngine } from "./engine/engine.js";
 import { AgentCoordinator } from "./agents/coordinator.js";
 import type { GatewayModel, GatewayProvider, GlassConfig, ModelInfo, SessionRecord } from "./types.js";
 import { SchedulerStore } from "./scheduler/store.js";
-import { isTransientProviderError } from "./errors.js";
-import { abortableRetryDelay, waitForTransientRetry, type RetryDelay } from "./retry.js";
+import {
+  abortableRetryDelay,
+  runWithTransientRetries,
+  type ProviderRetryBudgetOptions,
+  type RetryDelay,
+} from "./retry.js";
+import { runMaintenance as executeMaintenance, type MaintenanceMode, type MaintenanceReport } from "./maintenance.js";
 
 const MODEL_CATALOG_TIMEOUT_MS = 10_000;
 const INITIAL_SESSION_CATALOG_TIMEOUT_MS = 1_500;
 const MODEL_FAILURE_COOLDOWN_MS = 30_000;
 const MODEL_CACHE_TTL_MS = 30_000;
 const GATEWAY_PROBE_TIMEOUT_MS = 500;
+const STARTUP_MAINTENANCE_DATABASES = new Set<string>();
 
 async function waitWithSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
   signal?.throwIfAborted();
@@ -47,6 +53,8 @@ export class LookingGlassApp {
   client!: CodexLbClient;
   clients!: Map<GatewayProvider, CodexLbClient>;
   readonly scheduler: SchedulerStore;
+  maintenanceReport: MaintenanceReport | null = null;
+  maintenanceError: Error | null = null;
   tools!: ToolRegistry;
   agents!: AgentCoordinator;
   instructions!: LoadedInstructions;
@@ -58,7 +66,7 @@ export class LookingGlassApp {
   private readonly modelCatalogTimeoutMs = MODEL_CATALOG_TIMEOUT_MS;
   private readonly modelCacheTtlMs = MODEL_CACHE_TTL_MS;
 
-  constructor(cwd = process.cwd()) {
+  constructor(cwd = process.cwd(), options: { skipStartupMaintenance?: boolean } = {}) {
     ensureStateDirectories();
     this.workspace = findWorkspaceRoot(cwd);
     try {
@@ -67,14 +75,42 @@ export class LookingGlassApp {
       this.config = structuredClone(DEFAULT_CONFIG);
       this.configurationError = error instanceof Error ? error : new Error(String(error));
     }
-    this.db = openDatabase(stateDbPath());
+    const databasePath = stateDbPath();
+    this.db = openDatabase(databasePath);
     this.sessions = new SessionStore(this.db);
     this.artifacts = new ArtifactStore(this.db, artifactsDir());
-    this.scheduler = new SchedulerStore(this.db);
+    this.scheduler = new SchedulerStore(this.db, this.config.automation.scheduledTurnTimeoutMs);
+    if (!options.skipStartupMaintenance
+      && this.config.maintenance.runOnStartup
+      && !STARTUP_MAINTENANCE_DATABASES.has(databasePath)) {
+      // Mark first so a partial failure is not retried implicitly in this
+      // process. Operators can inspect or explicitly rerun maintenance.
+      STARTUP_MAINTENANCE_DATABASES.add(databasePath);
+      try {
+        this.maintenanceReport = this.runMaintenance("apply");
+      } catch (error) {
+        this.maintenanceError = error instanceof Error ? error : new Error(String(error));
+      }
+    }
     this.rebuildRuntime();
   }
 
+  runMaintenance(mode: MaintenanceMode = "dry-run", now = Date.now()): MaintenanceReport {
+    const report = executeMaintenance(
+      this.sessions,
+      this.artifacts,
+      this.scheduler,
+      this.config,
+      mode,
+      now,
+    );
+    this.maintenanceReport = report;
+    this.maintenanceError = null;
+    return report;
+  }
+
   private rebuildRuntime(): void {
+    this.scheduler.setSessionPromptTimeout(this.config.automation.scheduledTurnTimeoutMs);
     this.clients?.forEach((client) => client.close());
     const clients = new Map([this.config.gateway, ...this.config.gateways].map((gateway) => {
       const providerConfig = { ...this.config, gateway };
@@ -91,10 +127,13 @@ export class LookingGlassApp {
       (provider) => this.clientForProvider(provider),
       createWorkerToolRegistry(),
       () => this.instructions.text,
-      (id, provider, signal) => this.modelForTurn(
+      (id, provider, signal, retryBudget) => this.modelForTurn(
         id,
         provider,
         signal ?? new AbortController().signal,
+        undefined,
+        abortableRetryDelay,
+        retryBudget,
       ),
     );
     const tools = createCoreToolRegistry(this.scheduler, agents);
@@ -270,17 +309,26 @@ export class LookingGlassApp {
     signal: AbortSignal,
     onStatus?: (status: string) => void,
     delay: RetryDelay = abortableRetryDelay,
+    retryBudget?: ProviderRetryBudgetOptions,
   ): Promise<GatewayModel> {
-    let attempt = 0;
-    while (true) {
-      try {
-        return await this.catalogModel(id, provider, signal);
-      } catch (error) {
-        if (signal.aborted || !isTransientProviderError(error)) throw error;
-        attempt += 1;
-        await waitForTransientRetry(signal, attempt, onStatus, delay);
-      }
-    }
+    const budgetOptions = retryBudget
+      ? {
+          maxAttempts: retryBudget.maxAttempts,
+          maxElapsedMs: retryBudget.maxElapsedMs,
+        }
+      : {};
+    return runWithTransientRetries(
+      async (requestSignal, attempt) => {
+        // A failed catalog request is placed in a short cooldown for normal
+        // UI lookups. An automated logical operation must be allowed to spend
+        // its own independent retry budget, so clear that local cache marker
+        // before each retry attempt.
+        if (attempt > 1 && retryBudget) this.modelFailures?.delete(provider);
+        return this.catalogModel(id, provider, requestSignal);
+      },
+      signal,
+      { ...budgetOptions, ...(onStatus ? { onStatus } : {}), delay },
+    );
   }
 
   async model(id: string, signal?: AbortSignal, provider?: GatewayProvider): Promise<GatewayModel> {

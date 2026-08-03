@@ -9,11 +9,17 @@ import { configDir, stateDbPath } from "./paths.js";
 import { runTui } from "./ui/tui.js";
 import { resolveWorkspacePath } from "./tools/paths.js";
 import { resolveExecutableFromPath } from "./tools/executable.js";
-import { credentialEnvironmentNames } from "./security.js";
-import { schedulerDoctorCheck, type DoctorCheck } from "./doctor.js";
+import { configuredCredentialValues, credentialEnvironmentNames, redactSensitiveText } from "./security.js";
+import { operationalDoctorChecks, schedulerDoctorCheck, type DoctorCheck } from "./doctor.js";
 import { serializeConfig } from "./config.js";
+import { collectOperationalSnapshot, type OperationalSnapshot } from "./operations.js";
+import type { MaintenanceMode, MaintenanceReport } from "./maintenance.js";
 
-const VERSION = "0.6.0";
+export const VERSION = "0.7.0";
+
+function terminalText(value: string): string {
+  return value.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/gu, "�");
+}
 
 function usage(): string {
   return `Looking Glass ${VERSION}
@@ -25,8 +31,10 @@ Usage:
   glass sessions
   glass sessions persist ID on|off
   glass config
-  glass doctor
-  glass cron list|inbox|status
+  glass doctor [--json]
+  glass maintenance [dry-run|apply] [--json]
+  glass cron list|inbox
+  glass cron status [--json]
   glass cron reminder (--once ISO|--cron EXPR) [--timezone TZ] MESSAGE
   glass cron command  (--once ISO|--cron EXPR) [--timezone TZ] [--cwd PATH] "COMMAND"
   glass cron prompt   (--once ISO|--cron EXPR) [--session ID] PROMPT
@@ -46,7 +54,7 @@ Environment:
 `;
 }
 
-async function runDoctor(app: LookingGlassApp): Promise<void> {
+async function runDoctor(app: LookingGlassApp, json = false): Promise<void> {
   const checks: DoctorCheck[] = [];
   const integrity = app.db.pragma("integrity_check") as Array<{ integrity_check: string }>;
   checks.push({
@@ -67,15 +75,81 @@ async function runDoctor(app: LookingGlassApp): Promise<void> {
   for (const provider of app.configuredProviders()) {
     try {
       const models = await app.modelsForProvider(provider, true);
-      const gateway = [app.config.gateway, ...app.config.gateways].find((item) => item.provider === provider)!;
-      checks.push({ name: provider, ok: models.length > 0, detail: `${models.length} models at ${gateway.baseURL}` });
+      checks.push({ name: provider, ok: models.length > 0, detail: `${models.length} models` });
     } catch (error) {
       checks.push({ name: provider, ok: false, detail: error instanceof Error ? error.message : String(error) });
     }
   }
   checks.push(schedulerDoctorCheck(serviceStatus));
-  for (const check of checks) process.stdout.write(`${check.ok ? "ok" : "fail"}\t${check.name}\t${check.detail}\n`);
+  if (app.maintenanceError) {
+    checks.push({
+      name: "maintenance",
+      ok: false,
+      detail: redactSensitiveText(app.maintenanceError.message, configuredCredentialValues(app.config)),
+      fatal: false,
+    });
+  } else if (app.maintenanceReport) {
+    checks.push({
+      name: "maintenance",
+      ok: app.maintenanceReport.detachedArtifacts.errors === 0,
+      detail: `${app.maintenanceReport.mode}, ${app.maintenanceReport.agentSessions.selected.sessions} agent sessions, ${app.maintenanceReport.detachedArtifacts.deletedFiles} artifact files, ${app.maintenanceReport.schedulerHistory.occurrencesDeleted} scheduler runs removed`,
+      fatal: false,
+    });
+  }
+  const operational = collectOperationalSnapshot(app.db, app.sessions, app.artifacts, app.scheduler, VERSION);
+  checks.push(...operationalDoctorChecks(operational));
+  if (json) {
+    process.stdout.write(`${JSON.stringify({
+      operational,
+      checks: checks.map(({ name, ok, fatal = true }) => ({ name, ok, fatal })),
+    }, null, 2)}\n`);
+  } else {
+    for (const check of checks) process.stdout.write(`${check.ok ? "ok" : "fail"}\t${terminalText(check.name)}\t${terminalText(check.detail)}\n`);
+  }
   if (checks.some((check) => !check.ok && check.fatal !== false)) process.exitCode = 1;
+}
+
+function formatAge(value: number | null): string {
+  return value === null ? "none" : `${value}ms`;
+}
+
+function printOperationalStatus(snapshot: OperationalSnapshot): void {
+  process.stdout.write(`version=${snapshot.appVersion} telemetry=${snapshot.telemetrySchemaVersion} node=${snapshot.runtime.node} sqlite=${snapshot.sqlite.libraryVersion} schema=${snapshot.sqlite.schemaMigrationVersion}\n`);
+  process.stdout.write(`storage_db=${snapshot.sqlite.logicalUsedBytes}/${snapshot.sqlite.logicalAllocatedBytes}B artifacts=${snapshot.artifacts.total}/${snapshot.artifacts.logicalBytes}B detached=${snapshot.artifacts.detached}\n`);
+  process.stdout.write(`queue_pending=${snapshot.scheduler.occurrences.pending} claimed=${snapshot.scheduler.occurrences.claimed} running=${snapshot.scheduler.occurrences.running} unknown=${snapshot.scheduler.occurrences.unknown} oldest_pending=${formatAge(snapshot.scheduler.queueAges.pendingMs)}\n`);
+  process.stdout.write(`claims_stale=${snapshot.scheduler.staleClaims} terminal=${snapshot.scheduler.terminalClaims} session_calls_stale=${snapshot.sessions.toolCalls.staleStarted} orphaned=${snapshot.sessions.toolCalls.orphanedStarted}\n`);
+  process.stdout.write(`leases_active=${snapshot.scheduler.leases.active} stale=${snapshot.scheduler.leases.stale}\n`);
+}
+
+function parseMaintenanceArgs(args: string[]): { mode: MaintenanceMode; json: boolean } {
+  let mode: MaintenanceMode = "dry-run";
+  let selected = false;
+  let json = false;
+  for (const value of args) {
+    if (value === "--json") {
+      if (json) throw new Error("maintenance --json may be specified only once");
+      json = true;
+      continue;
+    }
+    const candidate = value === "--apply" ? "apply"
+      : value === "--dry-run" ? "dry-run"
+        : value;
+    if (candidate !== "apply" && candidate !== "dry-run") {
+      throw new Error(`Unknown maintenance option: ${value}`);
+    }
+    if (selected) throw new Error("Specify only one maintenance mode");
+    mode = candidate;
+    selected = true;
+  }
+  return { mode, json };
+}
+
+function printMaintenanceReport(report: MaintenanceReport): void {
+  process.stdout.write(`maintenance=${report.mode} schema=${report.schemaVersion} at=${new Date(report.now).toISOString()}\n`);
+  process.stdout.write(`orphaned_tools_pending=${report.orphanedTools.pending} reconciled=${report.orphanedTools.reconciled} expired_leases_deleted=${report.expiredLeasesDeleted}\n`);
+  process.stdout.write(`agent_sessions_selected=${report.agentSessions.selected.sessions} bytes=${report.agentSessions.selected.logicalBytes} remaining=${report.agentSessions.remaining.sessions}/${report.agentSessions.remaining.logicalBytes}B batch_limited=${report.agentSessions.batchLimited}\n`);
+  process.stdout.write(`detached_artifacts_selected=${report.detachedArtifacts.selected.artifacts} bytes=${report.detachedArtifacts.selected.bytes} deleted_files=${report.detachedArtifacts.deletedFiles} errors=${report.detachedArtifacts.errors} batch_limited=${report.detachedArtifacts.batchLimited}\n`);
+  process.stdout.write(`scheduler_output_bytes=${report.schedulerHistory.outputBytes} inbox_deleted=${report.schedulerHistory.inboxDeleted} occurrences_deleted=${report.schedulerHistory.occurrencesDeleted} jobs_deleted=${report.schedulerHistory.jobsDeleted} claims_scrubbed=${report.schedulerHistory.terminalClaimsScrubbed} batch_limited=${report.schedulerHistory.batchLimited}\n`);
 }
 
 interface ScheduleCliArgs {
@@ -137,15 +211,15 @@ function printJobs(app: LookingGlassApp): void {
   }
   for (const job of jobs) {
     const action = job.kind === "reminder" ? job.message : job.kind === "session_prompt" ? job.prompt : job.command;
-    process.stdout.write([
+    process.stdout.write(terminalText([
       job.id,
       job.enabled ? "enabled" : "disabled",
       job.kind,
       `${job.scheduleKind}:${job.schedule}`,
       job.nextDue === null ? "next:none" : `next:${new Date(job.nextDue).toISOString()}`,
-      action ?? "",
-      job.blockedReason ? `blocked:${job.blockedReason}` : "",
-    ].filter(Boolean).join("\t") + "\n");
+      terminalText(action ?? ""),
+      job.blockedReason ? `blocked:${terminalText(job.blockedReason)}` : "",
+    ].filter(Boolean).join("\t")) + "\n");
   }
 }
 
@@ -164,12 +238,23 @@ async function runSchedulerDaemon(app: LookingGlassApp): Promise<void> {
       if (!storedSession?.persistent) throw new Error("Session persistence is disabled");
       const scopedApp = storedSession.workspace === app.workspace ? app : new LookingGlassApp(storedSession.workspace);
       try {
+        const credentialValues = configuredCredentialValues(scopedApp.config);
         const scheduledSession = scopedApp.sessions.get(job.sessionId);
         if (!scheduledSession?.persistent) throw new Error("Session persistence is disabled");
         if (!scopedApp.hasProvider(scheduledSession.provider)) {
           throw new Error(`Session provider is not configured: ${scheduledSession.provider}`);
         }
-        const model = await scopedApp.modelForTurn(scheduledSession.model, scheduledSession.provider, signal);
+        const model = await scopedApp.modelForTurn(
+          scheduledSession.model,
+          scheduledSession.provider,
+          signal,
+          undefined,
+          undefined,
+          {
+            maxAttempts: scopedApp.config.automation.providerRetryMaxAttempts,
+            maxElapsedMs: scopedApp.config.automation.providerRetryMaxElapsedMs,
+          },
+        );
         const result = await scopedApp.engine.turnReserved(scheduledSession.id, job.prompt, {
           signal,
           modelInfo: model,
@@ -182,7 +267,26 @@ async function runSchedulerDaemon(app: LookingGlassApp): Promise<void> {
             },
           },
         }, reservation);
-        return result.text || `Scheduled session turn completed with ${result.toolCalls} tool call(s).`;
+        return redactSensitiveText(
+          result.text || `Scheduled session turn completed with ${result.toolCalls} tool call(s).`,
+          credentialValues,
+        );
+      } catch (error) {
+        const safe = new Error(redactSensitiveText(
+          error instanceof Error ? error.message : String(error),
+          configuredCredentialValues(scopedApp.config),
+        ));
+        if (error && typeof error === "object") {
+          const code = "code" in error ? (error as { code?: unknown }).code : undefined;
+          if (typeof code === "string" && /^[a-z][a-z0-9_]{0,63}$/u.test(code)) {
+            Object.assign(safe, { code });
+          }
+          if ("uncertainSideEffects" in error
+            && (error as { uncertainSideEffects?: unknown }).uncertainSideEffects === true) {
+            Object.assign(safe, { uncertainSideEffects: true });
+          }
+        }
+        throw safe;
       } finally {
         if (scopedApp !== app) scopedApp.close();
       }
@@ -200,24 +304,41 @@ async function runSchedulerDaemon(app: LookingGlassApp): Promise<void> {
 async function runCron(app: LookingGlassApp, args: string[]): Promise<void> {
   const action = args[0] ?? "list";
   if (action === "list") {
+    if (args.length > 1) throw new Error("cron list does not accept options");
     printJobs(app);
     return;
   }
   if (action === "inbox") {
-    const inbox = app.scheduler.listInbox({ unackedOnly: !args.includes("--all"), limit: 200 });
+    const options = args.slice(1);
+    if (options.some((value) => value !== "--all") || options.filter((value) => value === "--all").length > 1) {
+      throw new Error("cron inbox accepts only --all");
+    }
+    const inbox = app.scheduler.listInbox({ unackedOnly: !options.includes("--all"), limit: 200 });
     if (inbox.length === 0) process.stdout.write("Inbox is empty.\n");
     for (const item of inbox) {
-      process.stdout.write(`${item.id}\t${item.kind}\t${item.occurrence.state}\t${new Date(item.createdAt).toISOString()}\t${item.message}\n`);
-      if (item.occurrence.stdout.length > 0) process.stdout.write(`stdout:\n${item.occurrence.stdout.toString("utf8")}\n`);
-      if (item.occurrence.stderr.length > 0) process.stdout.write(`stderr:\n${item.occurrence.stderr.toString("utf8")}\n`);
+      process.stdout.write(`${item.id}\t${item.kind}\t${item.occurrence.state}\t${new Date(item.createdAt).toISOString()}\t${terminalText(item.message)}\n`);
+      if (item.occurrence.stdout.length > 0) process.stdout.write(`stdout:\n${terminalText(item.occurrence.stdout.toString("utf8"))}\n`);
+      if (item.occurrence.stderr.length > 0) process.stdout.write(`stderr:\n${terminalText(item.occurrence.stderr.toString("utf8"))}\n`);
     }
     return;
   }
   if (action === "status") {
-    process.stdout.write(`${serviceStatus()}\n`);
-    const lease = app.scheduler.getLease();
-    process.stdout.write(`lease=${lease ? `${lease.owner} until ${new Date(lease.expiresAt).toISOString()}` : "none"}\n`);
-    process.stdout.write(`jobs=${app.scheduler.listJobs().length} inbox=${app.scheduler.listInbox().length}\n`);
+    const options = args.slice(1);
+    if (options.some((value) => value !== "--json") || options.filter((value) => value === "--json").length > 1) {
+      throw new Error("cron status accepts only --json");
+    }
+    const operational = collectOperationalSnapshot(app.db, app.sessions, app.artifacts, app.scheduler, VERSION);
+    if (options.includes("--json")) {
+      const service = schedulerDoctorCheck(serviceStatus);
+      process.stdout.write(`${JSON.stringify({
+        operational,
+        service: { ok: service.ok, fatal: service.fatal ?? true },
+      }, null, 2)}\n`);
+      if (!service.ok && service.fatal !== false) process.exitCode = 1;
+      return;
+    }
+    process.stdout.write(`${terminalText(serviceStatus())}\n`);
+    printOperationalStatus(operational);
     return;
   }
   if (action === "daemon") {
@@ -255,6 +376,7 @@ async function runCron(app: LookingGlassApp, args: string[]): Promise<void> {
         schedule: parsed.schedule,
         timezone: parsed.timezone,
         startGraceMs: app.config.scheduler.commandStartGraceMs,
+        timeoutMs: app.config.automation.scheduledTurnTimeoutMs,
         outputBytes: app.config.scheduler.commandOutputBytes,
       });
       process.stdout.write(`Created session prompt ${job.id}; next ${new Date(job.nextDue ?? 0).toISOString()}\n`);
@@ -351,7 +473,7 @@ async function main(): Promise<void> {
     return;
   }
 
-  const app = new LookingGlassApp();
+  const app = new LookingGlassApp(process.cwd(), { skipStartupMaintenance: command === "maintenance" });
   try {
     if (command === "models") {
       const modelArgs = args.slice(1);
@@ -395,8 +517,20 @@ async function main(): Promise<void> {
       }, null, 2)}\n`);
       return;
     }
+    if (command === "maintenance") {
+      const { mode, json } = parseMaintenanceArgs(args.slice(1));
+      const report = app.runMaintenance(mode);
+      if (json) process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+      else printMaintenanceReport(report);
+      if (report.detachedArtifacts.errors > 0) process.exitCode = 1;
+      return;
+    }
     if (command === "doctor") {
-      await runDoctor(app);
+      const options = args.slice(1);
+      if (options.some((value) => value !== "--json") || options.filter((value) => value === "--json").length > 1) {
+        throw new Error("doctor accepts only --json");
+      }
+      await runDoctor(app, options.includes("--json"));
       return;
     }
     if (command === "run") {

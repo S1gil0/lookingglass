@@ -163,6 +163,90 @@ test("agent coordinator runs isolated tasks concurrently with configured model m
   assert.ok(children.every((child) => child.model === "gpt-luna" && child.reasoning_effort === "high"));
 });
 
+test("agent coordinator redacts credentials from successful aggregate and oversized results", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "looking-glass-agents-redaction-"));
+  const artifactDir = join(root, "artifacts");
+  mkdirSync(artifactDir);
+  const db = openDatabase(join(root, "state.db"));
+  const apiKeyEnv = "LOOKING_GLASS_AGENT_TEST_API_KEY";
+  const previousApiKey = process.env[apiKeyEnv];
+  const secret = "agent-result-secret-123456";
+  process.env[apiKeyEnv] = secret;
+  t.after(() => {
+    if (previousApiKey === undefined) delete process.env[apiKeyEnv];
+    else process.env[apiKeyEnv] = previousApiKey;
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+  const sessions = new SessionStore(db);
+  const artifacts = new ArtifactStore(db, artifactDir);
+  const parent = sessions.create({
+    workspace: root,
+    provider: "codex-lb",
+    model: "gpt-sol",
+    reasoningEffort: "medium",
+    agentProvider: "codex-lb",
+    agentModel: "gpt-luna",
+    agentReasoningEffort: "high",
+    verbosity: "low",
+    fast: false,
+    approvalMode: "unrestricted",
+  });
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.gateway.apiKeyEnv = apiKeyEnv;
+  const client = {
+    supportsResponseContinuity: () => true,
+    async stream(request: ResponseRequest) {
+      const input = JSON.stringify(request.input);
+      return input.includes("OVERSIZED_RESULT")
+        ? response("oversized", `${secret}\n${"large-result ".repeat(100)}`)
+        : response("aggregate", `successful leaf response: ${secret}`);
+    },
+  } as unknown as CodexLbClient;
+  const coordinator = new AgentCoordinator(
+    config,
+    root,
+    sessions,
+    artifacts,
+    () => client,
+    createWorkerToolRegistry(),
+    "main instructions",
+    async () => agentModel,
+  );
+  const context: ToolContext = {
+    workspace: root,
+    sessionId: parent.id,
+    config,
+    approvalMode: "unrestricted",
+    artifacts,
+    sessions,
+    signal: new AbortController().signal,
+    approve: async () => "deny",
+    ask: async () => "",
+  };
+
+  config.tools.maxOutputBytes = 2_048;
+  const aggregate = await coordinator.run({
+    tasks: [{ id: "aggregate", prompt: "Return the successful response." }],
+    concurrency: 1,
+  }, context);
+  assert.match(aggregate.output, /\[REDACTED\]/);
+  assert.equal(aggregate.output.includes(secret), false);
+  assert.equal(aggregate.artifactUri, undefined);
+
+  config.tools.maxOutputBytes = 128;
+  const oversized = await coordinator.run({
+    tasks: [{ id: "oversized", prompt: "OVERSIZED_RESULT" }],
+    concurrency: 1,
+  }, context);
+  assert.equal(oversized.truncated, true);
+  assert.ok(oversized.artifactUri);
+  assert.equal(oversized.output.includes(secret), false);
+  const artifactContents = artifacts.read(oversized.artifactUri!).toString("utf8");
+  assert.equal(artifactContents.includes(secret), false);
+  assert.match(artifactContents, /\[REDACTED\]/);
+});
+
 test("agent coordinator forwards child tool callbacks as agent progress actions", async (t) => {
   const root = mkdtempSync(join(tmpdir(), "looking-glass-agents-callbacks-"));
   const artifactDir = join(root, "artifacts");

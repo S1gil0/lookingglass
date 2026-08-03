@@ -185,15 +185,30 @@ export function windowsArgument(value: string): string {
 }
 
 /** Render the PowerShell process launcher used by the scheduled task. */
-export function renderLauncher(nodePath: string, cliPath: string, dbPath: string): string {
+export function renderLauncher(
+  nodePath: string,
+  cliPath: string,
+  dbPath: string,
+  environment: NodeJS.ProcessEnv = process.env,
+): string {
   requiredText(nodePath, "node path");
   requiredText(cliPath, "CLI path");
   requiredText(dbPath, "database path");
+  const inherited = [
+    "LOOKING_GLASS_CONFIG",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "APPDATA",
+    "LOCALAPPDATA",
+  ].flatMap((name) => environment[name]
+    ? [`$env:${name} = ${powerShellLiteral(environment[name])}`]
+    : []);
   return [
     "$ErrorActionPreference = 'Stop'",
     `$node = ${powerShellLiteral(nodePath)}`,
     `$cli = ${powerShellLiteral(cliPath)}`,
     `$env:LOOKING_GLASS_DB = ${powerShellLiteral(dbPath)}`,
+    ...inherited,
     "& $node $cli 'cron' 'daemon'",
     "exit $LASTEXITCODE",
     "",

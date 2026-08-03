@@ -380,6 +380,38 @@ test("unrestricted mode runs critical shell and patch operations without approva
   assert.equal(withoutCredential.TEST_API_KEY, undefined);
 });
 
+test("shellEnvironment strips common credential names on each platform", () => {
+  for (const platform of ["linux", "win32"] as const) {
+    const sanitized = shellEnvironment({
+      PATH: "/safe/bin",
+      Path: "C:\\safe\\bin",
+      PYTHONPATH: "/safe/python",
+      NORMAL_PATH: "/safe/path",
+      Api_Key: "api-secret",
+      ACCESS_TOKEN: "token-secret",
+      Client_Secret: "client-secret",
+      DB_PASSWORD: "password-secret",
+      PRIVATE_KEY: "private-key-secret",
+      AWS_ACCESS_KEY_ID: "access-key-secret",
+      SERVICE_CREDENTIALS: "credentials-secret",
+    }, [], platform);
+
+    assert.equal(sanitized.PATH, "/safe/bin");
+    assert.equal(sanitized.Path, "C:\\safe\\bin");
+    assert.equal(sanitized.PYTHONPATH, "/safe/python");
+    assert.equal(sanitized.NORMAL_PATH, "/safe/path");
+    for (const name of [
+      "Api_Key",
+      "ACCESS_TOKEN",
+      "Client_Secret",
+      "DB_PASSWORD",
+      "PRIVATE_KEY",
+      "AWS_ACCESS_KEY_ID",
+      "SERVICE_CREDENTIALS",
+    ]) assert.equal(sanitized[name], undefined, `${platform} should strip ${name}`);
+  }
+});
+
 test("sensitive mutation paths use POSIX slash semantics for Windows-style paths", () => {
   const windowsSeparator = String.fromCharCode(92);
   for (const path of [

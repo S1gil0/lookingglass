@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { loadConfig, persistGatewayConfig, writeSchedulerEnv } from "../src/config.js";
+import { loadConfig, persistGatewayConfig, writeGlobalConfig, writeSchedulerEnv } from "../src/config.js";
 
 test("repairs malformed global config without retaining gateway secrets", () => {
   const root = mkdtempSync(join(tmpdir(), "looking-glass-config-repair-"));
@@ -93,5 +93,57 @@ test("repairs malformed scheduler environment entries", () => {
     else process.env[environmentName] = previousEnvironmentValue;
     rmSync(root, { recursive: true, force: true });
     rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test("writeGlobalConfig rejects gateway URL query and fragment credentials", () => {
+  const root = mkdtempSync(join(tmpdir(), "looking-glass-config-url-"));
+  const previousConfigHome = process.env.XDG_CONFIG_HOME;
+  try {
+    process.env.XDG_CONFIG_HOME = root;
+    for (const baseURL of [
+      "https://gateway.invalid/v1?api_key=query-secret",
+      "https://gateway.invalid/v1#access_token=fragment-secret",
+    ]) {
+      assert.throws(() => writeGlobalConfig({ provider: "custom", baseURL }), /must not contain a query or fragment/);
+    }
+  } finally {
+    if (previousConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = previousConfigHome;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("writeSchedulerEnv removes duplicate assignments and rejects control characters", () => {
+  const root = mkdtempSync(join(tmpdir(), "looking-glass-env-write-"));
+  const previousConfigHome = process.env.XDG_CONFIG_HOME;
+  const environmentName = "LOOKING_GLASS_ENV_WRITE_KEY";
+  try {
+    process.env.XDG_CONFIG_HOME = root;
+    const configDirectory = join(root, "looking-glass");
+    mkdirSync(configDirectory, { recursive: true, mode: 0o700 });
+    writeFileSync(join(configDirectory, "scheduler.env"), [
+      "OTHER_KEY=keep",
+      `${environmentName}=old-one`,
+      `${environmentName}=old-two`,
+      "",
+    ].join("\n"), "utf8");
+
+    const path = writeSchedulerEnv(environmentName, "new-value");
+    const persisted = readFileSync(path, "utf8");
+    assert.equal(persisted.match(new RegExp(`^${environmentName}=`, "gm"))?.length, 1);
+    assert.match(persisted, new RegExp(`^${environmentName}=new-value$`, "m"));
+    assert.match(persisted, /^OTHER_KEY=keep$/m);
+
+    for (const control of ["\u0000", "\n", "\r", "\u001f", "\u007f"]) {
+      assert.throws(
+        () => writeSchedulerEnv(environmentName, `safe${control}value`),
+        /API key must not contain control characters/,
+      );
+    }
+  } finally {
+    if (previousConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = previousConfigHome;
+    rmSync(root, { recursive: true, force: true });
   }
 });

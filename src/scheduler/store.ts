@@ -3,7 +3,7 @@ import { statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import type { GlassDatabase } from "../storage/database.js";
 import { initialDue, nextCronDue, rejectNul } from "./schedule.js";
-import { sessionPromptReservation } from "./types.js";
+import { DEFAULT_SESSION_PROMPT_TIMEOUT_MS, sessionPromptReservation } from "./types.js";
 import type {
   ClaimedCommand,
   ClaimedSessionPrompt,
@@ -18,12 +18,37 @@ import type {
   OccurrenceState,
   ScheduleKind,
   SchedulerJob,
+  SchedulerRetentionMode,
+  SchedulerRetentionPolicy,
+  SchedulerRetentionReport,
+  SchedulerStats,
   SessionPromptCompletion,
 } from "./types.js";
 
 const MAX_DURATION_MS = 2_147_483_647;
+const MAX_SESSION_PROMPT_TIMEOUT_MS = MAX_DURATION_MS - 1;
 const MAX_OUTPUT_BYTES = 100 * 1024 * 1024;
+const MAX_DIAGNOSTIC_BYTES = 512;
+const MAX_INBOX_MESSAGE_BYTES = 2 * 1024;
+const DEFAULT_MAINTENANCE_BATCH_SIZE = 100;
+const MAX_MAINTENANCE_BATCH_SIZE = 100_000;
 const SESSION_PROMPT_COMMAND_SENTINEL = ":";
+
+const TERMINAL_STATES: readonly OccurrenceState[] = [
+  "succeeded",
+  "failed",
+  "timed_out",
+  "cancelled",
+  "skipped",
+  "unknown",
+];
+const RETAINABLE_TERMINAL_STATES: readonly OccurrenceState[] = [
+  "succeeded",
+  "failed",
+  "timed_out",
+  "cancelled",
+  "skipped",
+];
 
 interface JobRow {
   id: string;
@@ -45,6 +70,7 @@ interface JobRow {
   suspended_by_session: number;
   next_due: number | null;
   created_at: number;
+  deleted_at: number | null;
 }
 
 interface OccurrenceRow {
@@ -89,6 +115,44 @@ interface LeaseRow {
   expires_at: number;
 }
 
+interface RetentionOutputRow {
+  id: number;
+  stdout_stored_bytes: number | null;
+  stderr_stored_bytes: number | null;
+}
+
+interface RetentionInboxRow {
+  id: number;
+  message_bytes: number;
+}
+
+interface RetentionOccurrenceRow {
+  id: number;
+  stdout_bytes: number;
+  stderr_bytes: number;
+}
+
+interface RetentionPlan {
+  output: RetentionOutputRow[];
+  inbox: RetentionInboxRow[];
+  occurrences: RetentionOccurrenceRow[];
+  terminalClaims: number;
+  jobs: number;
+  batchLimited: boolean;
+}
+
+interface MaintenanceCounts {
+  terminalClaimsScrubbed: number;
+  stdoutScrubbed: number;
+  stderrScrubbed: number;
+  stdoutBytes: number;
+  stderrBytes: number;
+  inboxDeleted: number;
+  inboxBytes: number;
+  occurrencesDeleted: number;
+  jobsDeleted: number;
+}
+
 function finiteInteger(name: string, value: number, minimum: number, maximum = Number.MAX_SAFE_INTEGER): void {
   if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
     throw new Error(`${name} must be an integer between ${minimum} and ${maximum}`);
@@ -97,6 +161,35 @@ function finiteInteger(name: string, value: number, minimum: number, maximum = N
 
 function validateNow(now: number): void {
   finiteInteger("now", now, 0);
+}
+
+function sqlStateList(states: readonly OccurrenceState[]): string {
+  return states.map((state) => `'${state}'`).join(", ");
+}
+
+function sanitizedText(value: string): string {
+  if (typeof value !== "string") throw new Error("Diagnostic text must be a string");
+  return value.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g, "�");
+}
+
+function boundedText(value: string, maximumBytes: number): string {
+  return boundedUtf8(sanitizedText(value), maximumBytes).buffer.toString("utf8");
+}
+
+function boundedReason(value: string | null | undefined): string | null {
+  if (value === null || value === undefined) return null;
+  return boundedText(value, MAX_DIAGNOSTIC_BYTES);
+}
+
+function terminalClaimPredicate(alias = ""): string {
+  const prefix = alias.length > 0 ? `${alias}.` : "";
+  return `(${prefix}claim_token IS NOT NULL OR ${prefix}claim_owner IS NOT NULL
+    OR ${prefix}claim_boot_id IS NOT NULL OR ${prefix}claim_lease_expires_at IS NOT NULL)`;
+}
+
+function knownTerminalStatePredicate(alias = ""): string {
+  const prefix = alias.length > 0 ? `${alias}.` : "";
+  return `${prefix}state IN (${sqlStateList(RETAINABLE_TERMINAL_STATES)})`;
 }
 
 function jobFromRow(row: JobRow): SchedulerJob {
@@ -122,6 +215,7 @@ function jobFromRow(row: JobRow): SchedulerJob {
     suspendedBySession: row.suspended_by_session === 1,
     nextDue: row.next_due,
     createdAt: row.created_at,
+    deletedAt: row.deleted_at,
   };
 }
 
@@ -177,7 +271,8 @@ function validateEnvironment(env: Record<string, string>): void {
 
 function resultInboxMessage(job: SchedulerJob, state: OccurrenceState, reason: string | null): string {
   const subject = job.kind === "session_prompt" ? "Session turn" : "Command";
-  return reason ? `${subject} ${state}: ${reason}` : `${subject} ${state}`;
+  const bounded = boundedReason(reason);
+  return bounded ? `${subject} ${state}: ${bounded}` : `${subject} ${state}`;
 }
 
 function boundedUtf8(value: string, maximumBytes: number): { buffer: Buffer; bytes: number; truncated: boolean } {
@@ -194,8 +289,84 @@ function boundedUtf8(value: string, maximumBytes: number): { buffer: Buffer; byt
   return { buffer: full.subarray(0, end), bytes: full.byteLength, truncated: true };
 }
 
+const RETENTION_POLICY_KEYS = new Set<keyof SchedulerRetentionPolicy>([
+  "outputRetentionMs",
+  "occurrenceRetentionMs",
+  "acknowledgedInboxRetentionMs",
+  "deletedJobRetentionMs",
+  "minOccurrencesPerJob",
+  "batchSize",
+]);
+
+function validateRetentionPolicy(policy: SchedulerRetentionPolicy): SchedulerRetentionPolicy {
+  if (policy === null || typeof policy !== "object" || Array.isArray(policy)) {
+    throw new Error("Scheduler retention policy must be an object");
+  }
+  for (const key of Object.keys(policy) as Array<keyof SchedulerRetentionPolicy>) {
+    if (!RETENTION_POLICY_KEYS.has(key)) throw new Error(`Unknown scheduler retention policy field: ${key}`);
+  }
+  for (const key of RETENTION_POLICY_KEYS) {
+    const value = policy[key];
+    if (value !== undefined) {
+      finiteInteger(key, value, 0, key === "batchSize" ? MAX_MAINTENANCE_BATCH_SIZE : Number.MAX_SAFE_INTEGER);
+    }
+  }
+  if (policy.batchSize === 0) throw new Error("batchSize must be at least 1");
+  return { ...policy };
+}
+
+function maintenanceCounts(): MaintenanceCounts {
+  return {
+    terminalClaimsScrubbed: 0,
+    stdoutScrubbed: 0,
+    stderrScrubbed: 0,
+    stdoutBytes: 0,
+    stderrBytes: 0,
+    inboxDeleted: 0,
+    inboxBytes: 0,
+    occurrencesDeleted: 0,
+    jobsDeleted: 0,
+  };
+}
+
+function validateCommandCompletion(completion: CommandCompletion): void {
+  if (completion === null || typeof completion !== "object") {
+    throw new Error("Command completion must be an object");
+  }
+  if (!RETAINABLE_TERMINAL_STATES.includes(completion.state) && completion.state !== "unknown") {
+    throw new Error(`Invalid command completion state: ${String(completion.state)}`);
+  }
+  if (!Buffer.isBuffer(completion.stdout)) throw new Error("Command stdout must be a Buffer");
+  if (!Buffer.isBuffer(completion.stderr)) throw new Error("Command stderr must be a Buffer");
+  finiteInteger("stdoutBytes", completion.stdoutBytes, 0);
+  finiteInteger("stderrBytes", completion.stderrBytes, 0);
+  if (completion.exitCode !== null && !Number.isSafeInteger(completion.exitCode)) {
+    throw new Error("exitCode must be an integer or null");
+  }
+  if (completion.signal !== null && typeof completion.signal !== "string") {
+    throw new Error("signal must be a string or null");
+  }
+  if (completion.stdoutTruncated !== true && completion.stdoutTruncated !== false) {
+    throw new Error("stdoutTruncated must be a boolean");
+  }
+  if (completion.stderrTruncated !== true && completion.stderrTruncated !== false) {
+    throw new Error("stderrTruncated must be a boolean");
+  }
+  boundedReason(completion.reason);
+}
+
 export class SchedulerStore {
-  constructor(private readonly db: GlassDatabase) {}
+  constructor(
+    private readonly db: GlassDatabase,
+    private sessionPromptTimeoutMs = DEFAULT_SESSION_PROMPT_TIMEOUT_MS,
+  ) {
+    finiteInteger("sessionPromptTimeoutMs", sessionPromptTimeoutMs, 1, MAX_SESSION_PROMPT_TIMEOUT_MS);
+  }
+
+  setSessionPromptTimeout(timeoutMs: number): void {
+    finiteInteger("sessionPromptTimeoutMs", timeoutMs, 1, MAX_SESSION_PROMPT_TIMEOUT_MS);
+    this.sessionPromptTimeoutMs = timeoutMs;
+  }
 
   createReminder(input: CreateReminderInput, now = Date.now()): SchedulerJob {
     validateNow(now);
@@ -262,6 +433,8 @@ export class SchedulerStore {
     rejectNul(input.prompt, "prompt");
     if (input.prompt.trim().length === 0) throw new Error("prompt must not be empty");
     finiteInteger("startGraceMs", input.startGraceMs, 0, MAX_DURATION_MS);
+    const timeoutMs = input.timeoutMs ?? this.sessionPromptTimeoutMs;
+    finiteInteger("timeoutMs", timeoutMs, 1, MAX_SESSION_PROMPT_TIMEOUT_MS);
     finiteInteger("outputBytes", input.outputBytes, 0, MAX_OUTPUT_BYTES);
     const nextDue = initialDue(input.scheduleKind, input.schedule, input.timezone, now);
     const id = randomUUID();
@@ -285,7 +458,7 @@ export class SchedulerStore {
         SESSION_PROMPT_COMMAND_SENTINEL,
         session.workspace,
         input.startGraceMs,
-        MAX_DURATION_MS,
+        timeoutMs,
         input.outputBytes,
         nextDue,
         now,
@@ -425,9 +598,10 @@ export class SchedulerStore {
       this.requireJob(id);
       this.db.prepare(`
         UPDATE scheduler_jobs
-        SET enabled = 0, suspended_by_session = 0, blocked_reason = 'deleted'
+        SET enabled = 0, suspended_by_session = 0, blocked_reason = 'deleted',
+            deleted_at = COALESCE(deleted_at, ?)
         WHERE id = ?
-      `).run(id);
+      `).run(now, id);
       this.cancelUnstarted(id, "Job deleted", now);
       return this.requireJob(id);
     });
@@ -605,7 +779,7 @@ export class SchedulerStore {
           INSERT OR IGNORE INTO scheduler_occurrences(
             job_id, scheduled_at, state, created_at, started_at, finished_at, reason
           ) VALUES (?, ?, ?, ?, ?, ?, ?)
-        `).run(job.id, scheduledAt, state, now, terminalAt, terminalAt, reason);
+        `).run(job.id, scheduledAt, state, now, terminalAt, terminalAt, boundedReason(reason));
         if (insert.changes === 1) {
           const occurrenceId = Number(insert.lastInsertRowid);
           if (job.kind === "reminder") {
@@ -725,7 +899,9 @@ export class SchedulerStore {
       const overdue = this.db.prepare(`
         UPDATE scheduler_occurrences
         SET state = 'skipped', started_at = ?, finished_at = ?,
-            reason = 'Occurrence exceeded its command start grace period'
+            reason = 'Occurrence exceeded its command start grace period',
+            claim_token = NULL, claim_owner = NULL, claim_boot_id = NULL,
+            claim_lease_expires_at = NULL
         WHERE state = 'pending' AND id IN (
           SELECT o.id FROM scheduler_occurrences o
            JOIN scheduler_jobs j ON j.id = o.job_id
@@ -821,11 +997,16 @@ export class SchedulerStore {
 
       const row = this.db.prepare(`
         SELECT o.* FROM scheduler_occurrences o
-        WHERE o.id = ? AND o.claim_token = ? AND o.claim_owner = ? AND o.claim_boot_id = ?
-          AND o.claim_lease_expires_at > ?
-          AND EXISTS (
+        WHERE o.id = ? AND EXISTS (
             SELECT 1 FROM scheduler_jobs j
             WHERE j.id = o.job_id AND j.kind = 'command' AND j.session_id IS NULL
+          )
+          AND (
+            o.state IN ('cancelled', 'skipped')
+            OR (
+              o.claim_token = ? AND o.claim_owner = ? AND o.claim_boot_id = ?
+              AND o.claim_lease_expires_at > ?
+            )
           )
       `).get(occurrenceId, claimToken, owner, bootId, now) as OccurrenceRow | undefined;
       if (!row) return null;
@@ -837,7 +1018,9 @@ export class SchedulerStore {
         const reason = job.blockedReason === "deleted" ? "Job deleted" : "Job paused";
         const result = this.db.prepare(`
           UPDATE scheduler_occurrences
-          SET state = 'cancelled', finished_at = ?, reason = ?
+          SET state = 'cancelled', finished_at = ?, reason = ?,
+              claim_token = NULL, claim_owner = NULL, claim_boot_id = NULL,
+              claim_lease_expires_at = NULL
           WHERE id = ? AND state = 'claimed' AND claim_token = ?
             AND claim_owner = ? AND claim_boot_id = ? AND claim_lease_expires_at > ?
         `).run(now, reason, occurrenceId, claimToken, owner, bootId, now);
@@ -857,7 +1040,9 @@ export class SchedulerStore {
         const reason = "Occurrence exceeded its command start grace period";
         const result = this.db.prepare(`
           UPDATE scheduler_occurrences
-          SET state = 'skipped', started_at = ?, finished_at = ?, reason = ?
+          SET state = 'skipped', started_at = ?, finished_at = ?, reason = ?,
+              claim_token = NULL, claim_owner = NULL, claim_boot_id = NULL,
+              claim_lease_expires_at = NULL
           WHERE id = ? AND state = 'claimed' AND claim_token = ?
             AND claim_owner = ? AND claim_boot_id = ? AND claim_lease_expires_at > ?
         `).run(now, now, reason, occurrenceId, claimToken, owner, bootId, now);
@@ -928,8 +1113,8 @@ export class SchedulerStore {
     validateIdentity(owner, "owner");
     validateIdentity(bootId, "bootId");
     validateNow(now);
-    finiteInteger("stdoutBytes", completion.stdoutBytes, 0);
-    finiteInteger("stderrBytes", completion.stderrBytes, 0);
+    validateCommandCompletion(completion);
+    const reason = boundedReason(completion.reason);
     const finish = this.db.transaction(() => {
       const row = this.db.prepare(`
         SELECT j.* FROM scheduler_jobs j
@@ -951,7 +1136,9 @@ export class SchedulerStore {
         UPDATE scheduler_occurrences
         SET state = ?, finished_at = ?, exit_code = ?, signal = ?, reason = ?,
             stdout = ?, stderr = ?, stdout_bytes = ?, stderr_bytes = ?,
-            stdout_truncated = ?, stderr_truncated = ?
+            stdout_truncated = ?, stderr_truncated = ?,
+            claim_token = NULL, claim_owner = NULL, claim_boot_id = NULL,
+            claim_lease_expires_at = NULL
         WHERE id = ? AND state = 'running' AND claim_token = ?
           AND claim_owner = ? AND claim_boot_id = ? AND claim_lease_expires_at > ?
           AND EXISTS (
@@ -963,7 +1150,7 @@ export class SchedulerStore {
         now,
         completion.exitCode,
         completion.signal,
-        completion.reason,
+        reason,
         stdout,
         stderr,
         stdoutBytes,
@@ -1016,7 +1203,9 @@ export class SchedulerStore {
       const overdue = this.db.prepare(`
         UPDATE scheduler_occurrences
         SET state = 'skipped', started_at = ?, finished_at = ?,
-            reason = 'Occurrence exceeded its session prompt start grace period'
+            reason = 'Occurrence exceeded its session prompt start grace period',
+            claim_token = NULL, claim_owner = NULL, claim_boot_id = NULL,
+            claim_lease_expires_at = NULL
         WHERE state = 'pending' AND id IN (
           SELECT o.id FROM scheduler_occurrences o
           JOIN scheduler_jobs j ON j.id = o.job_id
@@ -1136,12 +1325,17 @@ export class SchedulerStore {
 
       const row = this.db.prepare(`
         SELECT o.* FROM scheduler_occurrences o
-        WHERE o.id = ? AND o.claim_token = ? AND o.claim_owner = ? AND o.claim_boot_id = ?
-          AND o.claim_lease_expires_at > ?
-          AND EXISTS (
+        WHERE o.id = ? AND EXISTS (
             SELECT 1 FROM scheduler_jobs j
             WHERE j.id = o.job_id AND j.kind = 'command'
               AND j.session_id IS NOT NULL AND j.prompt IS NOT NULL
+          )
+          AND (
+            o.state IN ('cancelled', 'skipped')
+            OR (
+              o.claim_token = ? AND o.claim_owner = ? AND o.claim_boot_id = ?
+              AND o.claim_lease_expires_at > ?
+            )
           )
       `).get(occurrenceId, claimToken, owner, bootId, now) as OccurrenceRow | undefined;
       if (!row) return null;
@@ -1158,7 +1352,9 @@ export class SchedulerStore {
             : "Job paused";
         const result = this.db.prepare(`
           UPDATE scheduler_occurrences
-          SET state = 'cancelled', finished_at = ?, reason = ?
+          SET state = 'cancelled', finished_at = ?, reason = ?,
+              claim_token = NULL, claim_owner = NULL, claim_boot_id = NULL,
+              claim_lease_expires_at = NULL
           WHERE id = ? AND state = 'claimed' AND claim_token = ?
             AND claim_owner = ? AND claim_boot_id = ? AND claim_lease_expires_at > ?
         `).run(now, reason, occurrenceId, claimToken, owner, bootId, now);
@@ -1192,7 +1388,9 @@ export class SchedulerStore {
         const reason = "Occurrence exceeded its session prompt start grace period";
         const result = this.db.prepare(`
           UPDATE scheduler_occurrences
-          SET state = 'skipped', started_at = ?, finished_at = ?, reason = ?
+          SET state = 'skipped', started_at = ?, finished_at = ?, reason = ?,
+              claim_token = NULL, claim_owner = NULL, claim_boot_id = NULL,
+              claim_lease_expires_at = NULL
           WHERE id = ? AND state = 'claimed' AND claim_token = ?
             AND claim_owner = ? AND claim_boot_id = ? AND claim_lease_expires_at > ?
         `).run(now, now, reason, occurrenceId, claimToken, owner, bootId, now);
@@ -1270,13 +1468,29 @@ export class SchedulerStore {
     validateIdentity(owner, "owner");
     validateIdentity(bootId, "bootId");
     validateNow(now);
-    if (!["succeeded", "failed", "cancelled", "unknown"].includes(completion.state)) {
+    if (completion === null || typeof completion !== "object") {
+      throw new Error("Session prompt completion must be an object");
+    }
+    if (!["succeeded", "failed", "timed_out", "cancelled", "unknown"].includes(completion.state)) {
       throw new Error(`Invalid session prompt completion state: ${String(completion.state)}`);
     }
     const output = completion.output ?? completion.result ?? "";
     const error = completion.error ?? "";
     if (typeof output !== "string") throw new Error("Session prompt output must be a string");
     if (typeof error !== "string") throw new Error("Session prompt error must be a string");
+    const outputBytes = Buffer.byteLength(output);
+    const sanitizedOutput = sanitizedText(output);
+    const errorBytes = Buffer.byteLength(error);
+    const boundedError = boundedText(error, MAX_DIAGNOSTIC_BYTES);
+    const code = completion.code;
+    if (code !== undefined && !/^[a-z][a-z0-9_]{0,63}$/u.test(code)) {
+      throw new Error("Session prompt completion code is invalid");
+    }
+    const reasonDetail = completion.reason
+      ?? (completion.state === "failed" && error ? error : null);
+    const reason = boundedReason(code
+      ? `[${code}]${reasonDetail ? ` ${reasonDetail}` : error ? ` ${error}` : ""}`
+      : reasonDetail);
     const finish = this.db.transaction(() => {
       const row = this.db.prepare(`
         SELECT j.* FROM scheduler_jobs j
@@ -1290,14 +1504,15 @@ export class SchedulerStore {
       if (!row) return null;
       const job = this.requireSessionPromptJob(row.id);
       const outputLimit = job.outputBytes ?? 0;
-      const stdout = boundedUtf8(output, outputLimit);
-      const stderr = boundedUtf8(error, outputLimit);
-      const reason = completion.reason ?? (completion.state === "failed" && error ? error : null);
+      const stdout = boundedUtf8(sanitizedOutput, outputLimit);
+      const stderr = boundedUtf8(boundedError, outputLimit);
       const result = this.db.prepare(`
         UPDATE scheduler_occurrences
         SET state = ?, finished_at = ?, exit_code = NULL, signal = NULL, reason = ?,
             stdout = ?, stderr = ?, stdout_bytes = ?, stderr_bytes = ?,
-            stdout_truncated = ?, stderr_truncated = ?
+            stdout_truncated = ?, stderr_truncated = ?,
+            claim_token = NULL, claim_owner = NULL, claim_boot_id = NULL,
+            claim_lease_expires_at = NULL
         WHERE id = ? AND state = 'running' AND claim_token = ?
           AND claim_owner = ? AND claim_boot_id = ? AND claim_lease_expires_at > ?
           AND EXISTS (
@@ -1310,10 +1525,10 @@ export class SchedulerStore {
         reason,
         stdout.buffer,
         stderr.buffer,
-        stdout.bytes,
-        stderr.bytes,
-        stdout.truncated ? 1 : 0,
-        stderr.truncated ? 1 : 0,
+        outputBytes,
+        errorBytes,
+        stdout.truncated || outputBytes > stdout.buffer.byteLength ? 1 : 0,
+        stderr.truncated || errorBytes > stderr.buffer.byteLength ? 1 : 0,
         occurrenceId,
         claimToken,
         owner,
@@ -1340,13 +1555,334 @@ export class SchedulerStore {
     return finish.immediate();
   }
 
+  /**
+   * Remove claim material left behind by an older scheduler version or an
+   * interrupted terminal transition. Active rows are deliberately excluded.
+   */
+  scrubTerminalClaims(nowOrBatchSize = Date.now(), requestedBatchSize?: number): number {
+    const batchSize = requestedBatchSize === undefined && nowOrBatchSize > MAX_MAINTENANCE_BATCH_SIZE
+      ? MAX_MAINTENANCE_BATCH_SIZE
+      : requestedBatchSize ?? nowOrBatchSize;
+    if (requestedBatchSize !== undefined || nowOrBatchSize <= MAX_MAINTENANCE_BATCH_SIZE) {
+      if (requestedBatchSize !== undefined) validateNow(nowOrBatchSize);
+      finiteInteger("batchSize", batchSize, 1, MAX_MAINTENANCE_BATCH_SIZE);
+    } else {
+      validateNow(nowOrBatchSize);
+    }
+    const scrub = this.db.transaction(() => {
+      const rows = this.db.prepare(`
+        UPDATE scheduler_occurrences
+        SET claim_token = NULL, claim_owner = NULL, claim_boot_id = NULL,
+            claim_lease_expires_at = NULL
+        WHERE id IN (
+          SELECT id FROM scheduler_occurrences
+          WHERE state IN (${sqlStateList(TERMINAL_STATES)})
+            AND ${terminalClaimPredicate()}
+          ORDER BY id LIMIT ?
+        )
+        RETURNING id
+      `).all(batchSize) as Array<{ id: number }>;
+      return rows.length;
+    });
+    return scrub.immediate();
+  }
+
+  getStats(now = Date.now()): SchedulerStats {
+    validateNow(now);
+    const jobs = this.db.prepare(`
+      SELECT COUNT(*) AS total,
+        COALESCE(SUM(CASE WHEN enabled = 1 THEN 1 ELSE 0 END), 0) AS enabled,
+        COALESCE(SUM(CASE WHEN blocked_reason IS NOT NULL THEN 1 ELSE 0 END), 0) AS blocked,
+        COALESCE(SUM(CASE WHEN blocked_reason = 'deleted' THEN 1 ELSE 0 END), 0) AS deleted
+      FROM scheduler_jobs
+    `).get() as { total: number; enabled: number; blocked: number; deleted: number };
+    const occurrences = this.db.prepare(`
+      SELECT COUNT(*) AS total,
+        COALESCE(SUM(CASE WHEN state = 'pending' THEN 1 ELSE 0 END), 0) AS pending,
+        COALESCE(SUM(CASE WHEN state = 'claimed' THEN 1 ELSE 0 END), 0) AS claimed,
+        COALESCE(SUM(CASE WHEN state = 'running' THEN 1 ELSE 0 END), 0) AS running,
+        COALESCE(SUM(CASE WHEN state NOT IN ('pending', 'claimed', 'running') THEN 1 ELSE 0 END), 0) AS terminal,
+        COALESCE(SUM(CASE WHEN state = 'unknown' THEN 1 ELSE 0 END), 0) AS unknown
+      FROM scheduler_occurrences
+    `).get() as {
+      total: number;
+      pending: number;
+      claimed: number;
+      running: number;
+      terminal: number;
+      unknown: number;
+    };
+    const inbox = this.db.prepare(`
+      SELECT COUNT(*) AS total,
+        COALESCE(SUM(CASE WHEN acknowledged_at IS NULL THEN 1 ELSE 0 END), 0) AS unread,
+        COALESCE(SUM(CASE WHEN acknowledged_at IS NOT NULL THEN 1 ELSE 0 END), 0) AS acknowledged
+      FROM scheduler_inbox
+    `).get() as { total: number; unread: number; acknowledged: number };
+    const lease = this.db.prepare(`
+      SELECT COUNT(*) AS daemon,
+        COALESCE(SUM(CASE WHEN expires_at > ? THEN 1 ELSE 0 END), 0) AS daemon_active,
+        COALESCE(SUM(CASE WHEN expires_at <= ? THEN 1 ELSE 0 END), 0) AS daemon_stale
+      FROM scheduler_daemon_lease
+    `).get(now, now) as { daemon: number; daemon_active: number; daemon_stale: number };
+    const operationLease = this.db.prepare(`
+      SELECT COUNT(*) AS total,
+        COALESCE(SUM(CASE WHEN expires_at > ? THEN 1 ELSE 0 END), 0) AS active,
+        COALESCE(SUM(CASE WHEN expires_at <= ? THEN 1 ELSE 0 END), 0) AS stale
+      FROM session_operation_leases
+    `).get(now, now) as { total: number; active: number; stale: number };
+    const claimCounts = this.db.prepare(`
+      SELECT
+        COALESCE(SUM(CASE WHEN state IN ('claimed', 'running')
+          AND (claim_lease_expires_at IS NULL OR claim_lease_expires_at <= ?) THEN 1 ELSE 0 END), 0) AS stale,
+        COALESCE(SUM(CASE WHEN state IN (${sqlStateList(TERMINAL_STATES)})
+          AND ${terminalClaimPredicate()} THEN 1 ELSE 0 END), 0) AS terminal
+      FROM scheduler_occurrences
+    `).get(now) as { stale: number; terminal: number };
+    const queueAges = this.db.prepare(`
+      SELECT
+        MAX(CASE WHEN state = 'pending'
+          THEN CASE WHEN scheduled_at <= ? THEN ? - scheduled_at ELSE 0 END END) AS pending_ms,
+        MAX(CASE WHEN state = 'claimed'
+          THEN CASE WHEN COALESCE(claimed_at, scheduled_at) <= ?
+            THEN ? - COALESCE(claimed_at, scheduled_at) ELSE 0 END END) AS claimed_ms,
+        MAX(CASE WHEN state = 'running'
+          THEN CASE WHEN COALESCE(started_at, claimed_at, scheduled_at) <= ?
+            THEN ? - COALESCE(started_at, claimed_at, scheduled_at) ELSE 0 END END) AS running_ms
+      FROM scheduler_occurrences
+    `).get(now, now, now, now, now, now) as {
+      pending_ms: number | null;
+      claimed_ms: number | null;
+      running_ms: number | null;
+    };
+    const output = this.db.prepare(`
+      SELECT
+        COALESCE(SUM(stdout_bytes), 0) AS stdout_bytes,
+        COALESCE(SUM(stderr_bytes), 0) AS stderr_bytes,
+        COALESCE(SUM(length(stdout)), 0) AS stdout_stored_bytes,
+        COALESCE(SUM(length(stderr)), 0) AS stderr_stored_bytes,
+        COALESCE(SUM(CASE WHEN stdout_truncated = 1 THEN 1 ELSE 0 END), 0) AS stdout_truncated,
+        COALESCE(SUM(CASE WHEN stderr_truncated = 1 THEN 1 ELSE 0 END), 0) AS stderr_truncated
+      FROM scheduler_occurrences
+    `).get() as {
+      stdout_bytes: number;
+      stderr_bytes: number;
+      stdout_stored_bytes: number;
+      stderr_stored_bytes: number;
+      stdout_truncated: number;
+      stderr_truncated: number;
+    };
+    const leases = {
+      daemon: lease.daemon,
+      sessionOperations: operationLease.total,
+      total: lease.daemon + operationLease.total,
+      active: lease.daemon_active + operationLease.active,
+      stale: lease.daemon_stale + operationLease.stale,
+    };
+    const outputStats = {
+      stdoutBytes: output.stdout_bytes,
+      stderrBytes: output.stderr_bytes,
+      bytes: output.stdout_bytes + output.stderr_bytes,
+      stdoutStoredBytes: output.stdout_stored_bytes,
+      stderrStoredBytes: output.stderr_stored_bytes,
+      storedBytes: output.stdout_stored_bytes + output.stderr_stored_bytes,
+      stdoutTruncated: output.stdout_truncated,
+      stderrTruncated: output.stderr_truncated,
+      truncated: output.stdout_truncated + output.stderr_truncated,
+    };
+    return {
+      jobs,
+      occurrences,
+      inbox,
+      leases,
+      staleClaims: claimCounts.stale,
+      terminalClaims: claimCounts.terminal,
+      queueAges: {
+        pendingMs: queueAges.pending_ms,
+        claimedMs: queueAges.claimed_ms,
+        runningMs: queueAges.running_ms,
+      },
+      output: outputStats,
+    };
+  }
+
+  stats(now = Date.now()): SchedulerStats {
+    return this.getStats(now);
+  }
+
+  getSchedulerStats(now = Date.now()): SchedulerStats {
+    return this.getStats(now);
+  }
+
+  planSchedulerRetention(
+    policy: SchedulerRetentionPolicy,
+    now = Date.now(),
+  ): SchedulerRetentionReport {
+    const checkedPolicy = validateRetentionPolicy(policy);
+    validateNow(now);
+    return this.schedulerRetentionReport(checkedPolicy, now, "dry-run", this.buildSchedulerRetentionPlan(checkedPolicy, now));
+  }
+
+  previewSchedulerRetention(
+    policy: SchedulerRetentionPolicy,
+    now = Date.now(),
+  ): SchedulerRetentionReport {
+    return this.planSchedulerRetention(policy, now);
+  }
+
+  applySchedulerRetention(
+    policy: SchedulerRetentionPolicy,
+    now = Date.now(),
+  ): SchedulerRetentionReport {
+    const checkedPolicy = validateRetentionPolicy(policy);
+    validateNow(now);
+    const apply = this.db.transaction(() => {
+      // Plan under the same immediate writer lock used for mutation. SQLite
+      // integer row ids can be reused after deletion, so carrying a plan
+      // across a concurrent writer boundary is unsafe.
+      const plan = this.buildSchedulerRetentionPlan(checkedPolicy, now);
+      const counts = maintenanceCounts();
+      const batchSize = checkedPolicy.batchSize ?? DEFAULT_MAINTENANCE_BATCH_SIZE;
+      counts.terminalClaimsScrubbed = this.scrubTerminalClaimsInTransaction(batchSize);
+
+      if (checkedPolicy.outputRetentionMs !== undefined) {
+        const outputCutoff = this.retentionCutoff(now, checkedPolicy.outputRetentionMs);
+        for (const row of plan.output) {
+          const base = `
+            id = ? AND ${knownTerminalStatePredicate()}
+            AND COALESCE(finished_at, created_at) <= ?
+          `;
+          const stdoutResult = this.db.prepare(`
+            UPDATE scheduler_occurrences SET stdout = NULL
+            WHERE ${base} AND stdout IS NOT NULL AND length(stdout) = ?
+          `).run(row.id, outputCutoff, row.stdout_stored_bytes);
+          if (stdoutResult.changes === 1) {
+            counts.stdoutScrubbed += 1;
+            counts.stdoutBytes += row.stdout_stored_bytes ?? 0;
+          }
+          const stderrResult = this.db.prepare(`
+            UPDATE scheduler_occurrences SET stderr = NULL
+            WHERE ${base} AND stderr IS NOT NULL AND length(stderr) = ?
+          `).run(row.id, outputCutoff, row.stderr_stored_bytes);
+          if (stderrResult.changes === 1) {
+            counts.stderrScrubbed += 1;
+            counts.stderrBytes += row.stderr_stored_bytes ?? 0;
+          }
+        }
+      }
+
+      if (checkedPolicy.acknowledgedInboxRetentionMs !== undefined) {
+        const inboxCutoff = this.retentionCutoff(now, checkedPolicy.acknowledgedInboxRetentionMs);
+        for (const row of plan.inbox) {
+          const deleted = this.db.prepare(`
+            DELETE FROM scheduler_inbox
+            WHERE id = ? AND acknowledged_at IS NOT NULL AND acknowledged_at <= ?
+              AND NOT EXISTS (
+                SELECT 1 FROM scheduler_occurrences o
+                WHERE o.id = scheduler_inbox.occurrence_id
+                  AND o.state NOT IN (${sqlStateList(RETAINABLE_TERMINAL_STATES)})
+              )
+              AND length(CAST(message AS BLOB)) = ?
+          `).run(row.id, inboxCutoff, row.message_bytes);
+          if (deleted.changes === 1) {
+            counts.inboxDeleted += 1;
+            counts.inboxBytes += row.message_bytes;
+          }
+        }
+      }
+
+      if (checkedPolicy.occurrenceRetentionMs !== undefined) {
+        const occurrenceCutoff = this.retentionCutoff(now, checkedPolicy.occurrenceRetentionMs);
+        const minimum = checkedPolicy.minOccurrencesPerJob ?? 0;
+        for (const row of plan.occurrences) {
+          const deleted = this.db.prepare(`
+            DELETE FROM scheduler_occurrences
+            WHERE id = ? AND ${knownTerminalStatePredicate()}
+              AND COALESCE(finished_at, created_at) <= ?
+              AND NOT EXISTS (
+                SELECT 1 FROM scheduler_inbox i WHERE i.occurrence_id = scheduler_occurrences.id
+              )
+              AND (
+                SELECT COUNT(*) FROM scheduler_occurrences newer
+                WHERE newer.job_id = scheduler_occurrences.job_id
+                  AND newer.state IN (${sqlStateList(TERMINAL_STATES)})
+                  AND (
+                    newer.scheduled_at > scheduler_occurrences.scheduled_at
+                    OR (newer.scheduled_at = scheduler_occurrences.scheduled_at
+                      AND newer.id > scheduler_occurrences.id)
+                  )
+              ) >= ?
+          `).run(row.id, occurrenceCutoff, minimum);
+          if (deleted.changes === 1) counts.occurrencesDeleted += 1;
+        }
+      }
+
+      if (checkedPolicy.deletedJobRetentionMs !== undefined) {
+        const jobCutoff = this.retentionCutoff(now, checkedPolicy.deletedJobRetentionMs);
+        const jobs = this.db.prepare(`
+          SELECT id FROM scheduler_jobs
+          WHERE blocked_reason = 'deleted' AND deleted_at IS NOT NULL AND deleted_at <= ?
+            AND NOT EXISTS (SELECT 1 FROM scheduler_occurrences o WHERE o.job_id = scheduler_jobs.id)
+            AND NOT EXISTS (SELECT 1 FROM scheduler_inbox i WHERE i.job_id = scheduler_jobs.id)
+          ORDER BY deleted_at, id LIMIT ?
+        `).all(jobCutoff, batchSize) as Array<{ id: string }>;
+        for (const row of jobs) {
+          const deleted = this.db.prepare(`
+            DELETE FROM scheduler_jobs
+            WHERE id = ? AND blocked_reason = 'deleted'
+              AND deleted_at IS NOT NULL AND deleted_at <= ?
+              AND NOT EXISTS (SELECT 1 FROM scheduler_occurrences o WHERE o.job_id = scheduler_jobs.id)
+              AND NOT EXISTS (SELECT 1 FROM scheduler_inbox i WHERE i.job_id = scheduler_jobs.id)
+          `).run(row.id, jobCutoff);
+          if (deleted.changes === 1) counts.jobsDeleted += 1;
+        }
+      }
+      return { counts, plan };
+    });
+    const { counts, plan } = apply.immediate();
+    return this.schedulerRetentionReport(checkedPolicy, now, "apply", {
+      ...plan,
+      terminalClaims: counts.terminalClaimsScrubbed,
+      output: [],
+      inbox: [],
+      occurrences: [],
+      jobs: counts.jobsDeleted,
+      batchLimited: plan.batchLimited,
+    }, counts);
+  }
+
+  schedulerRetention(
+    policy: SchedulerRetentionPolicy,
+    mode: SchedulerRetentionMode = "dry-run",
+    now = Date.now(),
+  ): SchedulerRetentionReport {
+    if (mode === "dry-run") return this.planSchedulerRetention(policy, now);
+    if (mode === "apply") return this.applySchedulerRetention(policy, now);
+    throw new Error("Scheduler retention mode must be dry-run or apply");
+  }
+
+  pruneScheduler(
+    policy: SchedulerRetentionPolicy,
+    now = Date.now(),
+  ): SchedulerRetentionReport {
+    return this.applySchedulerRetention(policy, now);
+  }
+
+  pruneSchedulerRetention(
+    policy: SchedulerRetentionPolicy,
+    now = Date.now(),
+  ): SchedulerRetentionReport {
+    return this.applySchedulerRetention(policy, now);
+  }
+
   private cancelUnstarted(jobId: string, reason: string, now: number): void {
     const rows = this.db.prepare(`
       UPDATE scheduler_occurrences
-      SET state = 'cancelled', finished_at = ?, reason = ?
+      SET state = 'cancelled', finished_at = ?, reason = ?,
+          claim_token = NULL, claim_owner = NULL, claim_boot_id = NULL,
+          claim_lease_expires_at = NULL
       WHERE job_id = ? AND state IN ('pending', 'claimed')
       RETURNING id
-    `).all(now, reason, jobId) as { id: number }[];
+    `).all(now, boundedReason(reason), jobId) as { id: number }[];
     const job = this.requireJob(jobId);
     if (job.kind === "reminder") return;
     for (const row of rows) {
@@ -1357,7 +1893,9 @@ export class SchedulerStore {
   private recoverInterrupted(now: number): void {
     const interrupted = this.db.prepare(`
       UPDATE scheduler_occurrences
-      SET state = 'unknown', finished_at = ?, reason = 'Daemon lease expired before the result was recorded'
+      SET state = 'unknown', finished_at = ?, reason = 'Daemon lease expired before the result was recorded',
+          claim_token = NULL, claim_owner = NULL, claim_boot_id = NULL,
+          claim_lease_expires_at = NULL
       WHERE state IN ('claimed', 'running')
       RETURNING id, job_id
     `).all(now) as { id: number; job_id: string }[];
@@ -1371,21 +1909,9 @@ export class SchedulerStore {
           resultInboxMessage(job, "unknown", "Daemon lease expired before the result was recorded"),
           now,
         );
+        this.blockUnknownJob(job.id);
       }
     }
-    this.db.prepare(`
-      UPDATE scheduler_jobs
-      SET enabled = 0, blocked_reason = 'An occurrence has an unknown outcome'
-      WHERE kind = 'command' AND schedule_kind = 'cron' AND id IN (
-        SELECT job_id FROM scheduler_occurrences WHERE state = 'unknown'
-      )
-    `).run();
-    this.db.prepare(`
-      UPDATE scheduler_jobs SET enabled = 0
-      WHERE kind = 'command' AND schedule_kind = 'once' AND id IN (
-        SELECT job_id FROM scheduler_occurrences WHERE state = 'unknown'
-      )
-    `).run();
   }
 
   private disableCompletedOneShot(jobId: string): void {
@@ -1406,6 +1932,170 @@ export class SchedulerStore {
     `).run(jobId);
   }
 
+  private retentionCutoff(now: number, retentionMs: number): number {
+    return Math.max(Number.MIN_SAFE_INTEGER, now - retentionMs);
+  }
+
+  private scrubTerminalClaimsInTransaction(batchSize: number): number {
+    const rows = this.db.prepare(`
+      UPDATE scheduler_occurrences
+      SET claim_token = NULL, claim_owner = NULL, claim_boot_id = NULL,
+          claim_lease_expires_at = NULL
+      WHERE id IN (
+        SELECT id FROM scheduler_occurrences
+        WHERE state IN (${sqlStateList(TERMINAL_STATES)})
+          AND ${terminalClaimPredicate()}
+        ORDER BY id LIMIT ?
+      )
+      RETURNING id
+    `).all(batchSize) as Array<{ id: number }>;
+    return rows.length;
+  }
+
+  private buildSchedulerRetentionPlan(
+    policy: SchedulerRetentionPolicy,
+    now: number,
+  ): RetentionPlan {
+    const batchSize = policy.batchSize ?? DEFAULT_MAINTENANCE_BATCH_SIZE;
+    let batchLimited = false;
+    const output: RetentionOutputRow[] = [];
+    if (policy.outputRetentionMs !== undefined) {
+      const cutoff = this.retentionCutoff(now, policy.outputRetentionMs);
+      const rows = this.db.prepare(`
+        SELECT id, length(stdout) AS stdout_stored_bytes,
+          length(stderr) AS stderr_stored_bytes
+        FROM scheduler_occurrences
+        WHERE ${knownTerminalStatePredicate()}
+          AND COALESCE(finished_at, created_at) <= ?
+          AND (stdout IS NOT NULL OR stderr IS NOT NULL)
+        ORDER BY COALESCE(finished_at, created_at), id LIMIT ?
+      `).all(cutoff, batchSize + 1) as RetentionOutputRow[];
+      if (rows.length > batchSize) batchLimited = true;
+      output.push(...rows.slice(0, batchSize));
+    }
+
+    const inbox: RetentionInboxRow[] = [];
+    if (policy.acknowledgedInboxRetentionMs !== undefined) {
+      const cutoff = this.retentionCutoff(now, policy.acknowledgedInboxRetentionMs);
+      const rows = this.db.prepare(`
+        SELECT i.id, length(CAST(i.message AS BLOB)) AS message_bytes
+        FROM scheduler_inbox i
+        JOIN scheduler_occurrences o ON o.id = i.occurrence_id
+        WHERE i.acknowledged_at IS NOT NULL AND i.acknowledged_at <= ?
+          AND o.state IN (${sqlStateList(RETAINABLE_TERMINAL_STATES)})
+        ORDER BY i.acknowledged_at, i.id LIMIT ?
+      `).all(cutoff, batchSize + 1) as RetentionInboxRow[];
+      if (rows.length > batchSize) batchLimited = true;
+      inbox.push(...rows.slice(0, batchSize));
+    }
+
+    const occurrences: RetentionOccurrenceRow[] = [];
+    if (policy.occurrenceRetentionMs !== undefined) {
+      const cutoff = this.retentionCutoff(now, policy.occurrenceRetentionMs);
+      const minimum = policy.minOccurrencesPerJob ?? 0;
+      const inboxProtection = policy.acknowledgedInboxRetentionMs === undefined
+        ? `AND NOT EXISTS (
+            SELECT 1 FROM scheduler_inbox i WHERE i.occurrence_id = o.id
+          )`
+        : `AND NOT EXISTS (
+            SELECT 1 FROM scheduler_inbox i
+            WHERE i.occurrence_id = o.id
+              AND (i.acknowledged_at IS NULL OR i.acknowledged_at > ?)
+          )`;
+      const parameters: number[] = [cutoff];
+      if (policy.acknowledgedInboxRetentionMs !== undefined) {
+        parameters.push(this.retentionCutoff(now, policy.acknowledgedInboxRetentionMs));
+      }
+      parameters.push(minimum, batchSize + 1);
+      const rows = this.db.prepare(`
+        SELECT o.id, COALESCE(length(o.stdout), 0) AS stdout_bytes,
+          COALESCE(length(o.stderr), 0) AS stderr_bytes
+        FROM scheduler_occurrences o
+        WHERE ${knownTerminalStatePredicate("o")}
+          AND COALESCE(o.finished_at, o.created_at) <= ?
+          ${inboxProtection}
+          AND (
+            SELECT COUNT(*) FROM scheduler_occurrences newer
+            WHERE newer.job_id = o.job_id
+              AND newer.state IN (${sqlStateList(TERMINAL_STATES)})
+              AND (
+                newer.scheduled_at > o.scheduled_at
+                OR (newer.scheduled_at = o.scheduled_at AND newer.id > o.id)
+              )
+          ) >= ?
+        ORDER BY COALESCE(o.finished_at, o.created_at), o.id LIMIT ?
+      `).all(...parameters) as RetentionOccurrenceRow[];
+      if (rows.length > batchSize) batchLimited = true;
+      occurrences.push(...rows.slice(0, batchSize));
+    }
+
+    const claimCount = this.db.prepare(`
+      SELECT COUNT(*) AS count FROM scheduler_occurrences
+      WHERE state IN (${sqlStateList(TERMINAL_STATES)}) AND ${terminalClaimPredicate()}
+    `).get() as { count: number };
+    if (claimCount.count > batchSize) batchLimited = true;
+    const terminalClaims = Math.min(claimCount.count, batchSize);
+
+    let jobs = 0;
+    if (policy.deletedJobRetentionMs !== undefined) {
+      const cutoff = this.retentionCutoff(now, policy.deletedJobRetentionMs);
+      const rows = this.db.prepare(`
+        SELECT id FROM scheduler_jobs
+        WHERE blocked_reason = 'deleted' AND deleted_at IS NOT NULL AND deleted_at <= ?
+          AND NOT EXISTS (SELECT 1 FROM scheduler_occurrences o WHERE o.job_id = scheduler_jobs.id)
+          AND NOT EXISTS (SELECT 1 FROM scheduler_inbox i WHERE i.job_id = scheduler_jobs.id)
+        ORDER BY deleted_at, id LIMIT ?
+      `).all(cutoff, batchSize + 1) as Array<{ id: string }>;
+      if (rows.length > batchSize) batchLimited = true;
+      jobs = Math.min(rows.length, batchSize);
+    }
+    return { output, inbox, occurrences, terminalClaims, jobs, batchLimited };
+  }
+
+  private schedulerRetentionReport(
+    policy: SchedulerRetentionPolicy,
+    now: number,
+    mode: SchedulerRetentionMode,
+    plan: RetentionPlan,
+    applied?: MaintenanceCounts,
+  ): SchedulerRetentionReport {
+    const counts = applied ?? maintenanceCounts();
+    if (applied === undefined) {
+      counts.terminalClaimsScrubbed = plan.terminalClaims;
+      counts.stdoutScrubbed = plan.output.reduce(
+        (total, row) => total + (row.stdout_stored_bytes !== null ? 1 : 0),
+        0,
+      );
+      counts.stderrScrubbed = plan.output.reduce(
+        (total, row) => total + (row.stderr_stored_bytes !== null ? 1 : 0),
+        0,
+      );
+      counts.stdoutBytes = plan.output.reduce((total, row) => total + (row.stdout_stored_bytes ?? 0), 0);
+      counts.stderrBytes = plan.output.reduce((total, row) => total + (row.stderr_stored_bytes ?? 0), 0);
+      counts.inboxDeleted = plan.inbox.length;
+      counts.inboxBytes = plan.inbox.reduce((total, row) => total + row.message_bytes, 0);
+      counts.occurrencesDeleted = plan.occurrences.length;
+      counts.jobsDeleted = plan.jobs;
+    }
+    return {
+      mode,
+      dryRun: mode === "dry-run",
+      now,
+      policy: { ...policy },
+      terminalClaimsScrubbed: counts.terminalClaimsScrubbed,
+      stdoutScrubbed: counts.stdoutScrubbed,
+      stderrScrubbed: counts.stderrScrubbed,
+      stdoutBytes: counts.stdoutBytes,
+      stderrBytes: counts.stderrBytes,
+      outputBytes: counts.stdoutBytes + counts.stderrBytes,
+      inboxDeleted: counts.inboxDeleted,
+      inboxBytes: counts.inboxBytes,
+      occurrencesDeleted: counts.occurrencesDeleted,
+      jobsDeleted: counts.jobsDeleted,
+      batchLimited: plan.batchLimited,
+    };
+  }
+
   private insertOccurrence(
     jobId: string,
     scheduledAt: number,
@@ -1418,7 +2108,7 @@ export class SchedulerStore {
       INSERT INTO scheduler_occurrences(
         job_id, scheduled_at, state, created_at, started_at, finished_at, reason
       ) VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(jobId, scheduledAt, state, createdAt, finishedAt, finishedAt, reason);
+    `).run(jobId, scheduledAt, state, createdAt, finishedAt, finishedAt, boundedReason(reason));
     return Number(result.lastInsertRowid);
   }
 
@@ -1432,7 +2122,7 @@ export class SchedulerStore {
     this.db.prepare(`
       INSERT OR IGNORE INTO scheduler_inbox(kind, job_id, occurrence_id, message, created_at)
       VALUES (?, ?, ?, ?, ?)
-    `).run(kind, job.id, occurrenceId, message, now);
+    `).run(kind, job.id, occurrenceId, boundedText(message, MAX_INBOX_MESSAGE_BYTES), now);
   }
 
   private hasActiveOccurrence(jobId: string): boolean {

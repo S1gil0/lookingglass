@@ -39,6 +39,10 @@ export type {
   OccurrenceState,
   ScheduleKind,
   SchedulerJob,
+  SchedulerRetentionMode,
+  SchedulerRetentionPolicy,
+  SchedulerRetentionReport,
+  SchedulerStats,
   SessionPromptCompletion,
   SessionPromptHandler,
 } from "./types.js";

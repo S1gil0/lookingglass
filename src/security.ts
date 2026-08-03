@@ -7,7 +7,7 @@ export function credentialEnvironmentNames(config: GlassConfig): string[] {
 export function configuredCredentialValues(config: GlassConfig): string[] {
   return credentialEnvironmentNames(config)
     .map((name) => process.env[name])
-    .filter((value): value is string => typeof value === "string" && value.length >= 8);
+    .filter((value): value is string => typeof value === "string" && value.length > 0);
 }
 
 export function redactSensitiveText(value: string, secrets: readonly string[]): string {

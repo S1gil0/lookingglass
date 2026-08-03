@@ -34,6 +34,14 @@ function normalizeCompactionOutput(items: unknown[]): ResponseInputItem[] {
   );
 }
 
+function toolResultItem(payload: StoredToolResultPayload): ResponseInputItem {
+  return payload.item ?? {
+    type: "function_call_output",
+    call_id: payload.callId,
+    output: payload.output,
+  };
+}
+
 function itemsFromEvent(event: SessionEvent): ResponseInputItem[] {
   switch (event.kind) {
     case "user":
@@ -44,7 +52,7 @@ function itemsFromEvent(event: SessionEvent): ResponseInputItem[] {
     }
     case "tool_result":
     case "tool_denied":
-      return [(event.payload as StoredToolResultPayload).item];
+      return [toolResultItem(event.payload as StoredToolResultPayload)];
     default:
       return [];
   }

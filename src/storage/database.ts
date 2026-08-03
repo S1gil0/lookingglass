@@ -395,6 +395,19 @@ CREATE INDEX sessions_workspace_provider_updated ON sessions(workspace, provider
 CREATE INDEX sessions_parent_kind ON sessions(parent_session_id, session_kind, created_at);
 `;
 
+const MAINTENANCE_SCHEMA = `
+ALTER TABLE scheduler_jobs ADD COLUMN deleted_at INTEGER;
+CREATE INDEX scheduler_jobs_deleted_at
+ON scheduler_jobs(blocked_reason, deleted_at)
+WHERE blocked_reason = 'deleted';
+CREATE INDEX scheduler_occurrences_terminal_finished
+ON scheduler_occurrences(state, finished_at)
+WHERE state IN ('succeeded', 'failed', 'timed_out', 'cancelled', 'skipped', 'unknown');
+CREATE INDEX scheduler_inbox_acknowledged
+ON scheduler_inbox(acknowledged_at)
+WHERE acknowledged_at IS NOT NULL;
+`;
+
 function migrateBashApprovalScopes(db: GlassDatabase): void {
   const rows = db.prepare(`
     SELECT session_id, signature, approved_at
@@ -534,6 +547,22 @@ export function openDatabase(path: string, platform: NodeJS.Platform = process.p
     if (!sessionCustomProviderMigration) {
       db.exec(SESSION_CUSTOM_PROVIDER_SCHEMA);
       db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (16, ?)").run(Date.now());
+    }
+    const maintenanceMigration = db.prepare("SELECT 1 FROM schema_migrations WHERE version = 17").get();
+    if (!maintenanceMigration) {
+      const now = Date.now();
+      db.exec(MAINTENANCE_SCHEMA);
+      db.prepare(`
+        UPDATE scheduler_jobs SET deleted_at = ?
+        WHERE blocked_reason = 'deleted' AND deleted_at IS NULL
+      `).run(now);
+      db.prepare(`
+        UPDATE scheduler_occurrences
+        SET claim_token = NULL, claim_owner = NULL, claim_boot_id = NULL,
+            claim_lease_expires_at = NULL
+        WHERE state IN ('succeeded', 'failed', 'timed_out', 'cancelled', 'skipped', 'unknown')
+      `).run();
+      db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (17, ?)").run(now);
     }
   });
   const sessionsRebuildMigrationPending = !db.prepare(

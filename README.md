@@ -66,11 +66,12 @@ Looking Glass is designed for one local operator. It is not a hosted service, mu
 The npm package targets Linux and native Windows (`win32`); macOS is not a
 supported install target.
 
-On Windows, use Windows Terminal or another modern terminal. Looking Glass
-invokes the system Windows PowerShell directly and runs shell tools and
-scheduled commands noninteractively; use PowerShell syntax for those commands.
-Linux uses noninteractive Bash. Windows support is covered by the GitHub Actions
-matrix; no additional local-platform validation is implied here.
+On Windows, use Windows Terminal (or another terminal that provides Windows
+PowerShell, `powershell.exe`, on `PATH`). Looking Glass runs its shell tool and
+scheduled commands through noninteractive Windows PowerShell; use PowerShell
+syntax for those commands. Linux uses noninteractive Bash. Windows support is
+covered by the GitHub Actions matrix; no additional local-platform validation
+is implied here.
 
 For a local LM Studio setup, the gateway URL is:
 
@@ -114,7 +115,7 @@ You can run directly from TypeScript during development with `npm run dev`, but 
 Looking Glass supports the built-in codex-lb and LM Studio Responses profiles, OpenRouter's Chat Completions profile, and a custom OpenAI-compatible gateway profile. The optional API key is read from the environment variable named by `gateway.apiKeyEnv`:
 
 ```bash
-export LM_STUDIO_API_KEY=your-token
+export LM_STUDIO_API_KEY=replace-with-your-token
 ```
 
 In Windows PowerShell, use `$env:LM_STUDIO_API_KEY = 'your-token'` instead.
@@ -130,7 +131,8 @@ Windows: %APPDATA%\looking-glass\config.jsonc
 <workspace>/.looking-glass.json
 ```
 
-Set `LOOKING_GLASS_CONFIG` to use a different explicit JSON or JSONC file. On
+Set `LOOKING_GLASS_CONFIG` to add a final, highest-priority explicit JSON or
+JSONC file. On
 Windows, `APPDATA` and `LOCALAPPDATA` provide the roaming configuration and
 local state roots respectively. `XDG_CONFIG_HOME` and `XDG_DATA_HOME` can
 override those platform defaults. Workspace settings are applied after global
@@ -166,11 +168,48 @@ Example configuration:
     "commandStartGraceMs": 60000,
     "commandTimeoutMs": 600000,
     "commandOutputBytes": 65536
+  },
+  "automation": {
+    "providerRetryMaxAttempts": 8,
+    "providerRetryMaxElapsedMs": 900000,
+    "agentTurnTimeoutMs": 2700000,
+    "scheduledTurnTimeoutMs": 7200000
+  },
+  "maintenance": {
+    "runOnStartup": true,
+    "reconcileOrphanedTools": true,
+    "agentSessions": {
+      "maxAgeMs": 2592000000,
+      "minAgeMs": 3600000,
+      "maxSessions": 500,
+      "maxLogicalBytes": 536870912,
+      "maxSessionsPerRun": 25,
+      "maxLogicalBytesPerRun": 67108864
+    },
+    "detachedArtifacts": {
+      "maxAgeMs": 2592000000,
+      "minAgeMs": 3600000,
+      "maxArtifacts": 1000,
+      "maxBytes": 1073741824,
+      "maxArtifactsPerRun": 100,
+      "maxBytesPerRun": 134217728
+    },
+    "schedulerHistory": {
+      "outputRetentionMs": 2592000000,
+      "occurrenceRetentionMs": 7776000000,
+      "acknowledgedInboxRetentionMs": 2592000000,
+      "deletedJobRetentionMs": 2592000000,
+      "minOccurrencesPerJob": 20,
+      "batchSize": 500
+    }
   }
 }
 ```
 
 The default approval mode is `code`.
+Automation durations and maintenance ages are milliseconds. The automation
+retry and timeout limits apply to automated agent and scheduled turns; they do
+not impose a retry budget on interactive turns.
 
 ### Built-in and Custom OpenAI-Compatible Gateways
 
@@ -186,7 +225,7 @@ For an authenticated gateway, set the environment variable named by
 token when that variable is unset:
 
 ```bash
-export LM_STUDIO_API_KEY=your-token
+export LM_STUDIO_API_KEY=replace-with-your-token
 ```
 
 ```jsonc
@@ -238,11 +277,13 @@ Select `protocol: "chat"` when the gateway provides `GET /models` and
 
 When omitted, a custom gateway defaults to `protocol: "responses"` and
 `apiKeyEnv: "CUSTOM_API_KEY"`. Both custom protocols use standard bearer
-authentication and stateless local replay: Looking Glass sends the durable
-conversation context on each request rather than relying on remote response
-continuity. Custom model catalog entries use conservative capability defaults;
-choose this profile only when the gateway matches the expected OpenAI-compatible
-request and streaming response shapes.
+authentication (`Authorization: Bearer ...`) and stateless local replay:
+Looking Glass sends the durable conversation context on each request rather
+than relying on remote response continuity. Custom model catalog entries use
+conservative capability defaults: reasoning, images, parallel tool calls, and
+fast service are not advertised; an omitted context limit is estimated at
+32,768 tokens. Choose this profile only when the gateway
+matches the expected OpenAI-compatible request and streaming response shapes.
 
 For OpenRouter, use `https://openrouter.ai/api/v1`; selecting the provider
 defaults `apiKeyEnv` to `OPENROUTER_API_KEY`:
@@ -286,9 +327,14 @@ glass models --free           List only free models
 glass sessions                List durable interactive sessions
 glass sessions persist ID on|off
 glass config                  Print paths, instruction files, and effective config
-glass doctor                  Check SQLite, ripgrep, providers, and scheduler status
+glass doctor [--json]        Check SQLite, ripgrep, providers, and scheduler status
+glass maintenance [dry-run|apply] [--json]
+glass cron status [--json]   Show scheduler service and aggregate state
 glass cron ...                Create and manage reminders, commands, and session prompts
 ```
+
+`glass maintenance` is a dry-run unless `apply` (or `--apply`) is selected;
+`--json` is supported by maintenance, `doctor`, and `cron status`.
 
 ### Start an Interactive Session
 
@@ -331,12 +377,38 @@ glass doctor
 
 `glass config` is useful when a session is using an unexpected model or gateway. It prints the workspace, state database, loaded instruction files, truncation status, and effective configuration without printing API-key values.
 
-If configuration is missing, malformed, or the configured gateway is offline,
-the CLI still starts with safe defaults. Use `/config` inside the interactive
-session to choose a provider, endpoint, API-key environment variable, and model.
-The wizard stores non-secret settings in the global config, stores the entered
-key in the protected scheduler environment file, reloads the runtime
-immediately, and can recover from a damaged configuration layer.
+If configuration is missing, malformed, or the configured gateway is offline, the CLI still starts with safe defaults. Use `/config` inside the interactive session to choose a provider, endpoint, API-key environment variable, and model. The wizard probes the model catalog when available, stores non-secret settings in the global config, stores the entered key in the protected scheduler environment file, reloads the runtime immediately, and can be used to recover from a damaged configuration layer.
+
+## Maintenance and Operations
+
+`glass maintenance` previews cleanup without changing state (dry-run is the
+default). Use `apply` to make one bounded cleanup pass, and `--json` for the
+aggregate report:
+
+```bash
+glass maintenance
+glass maintenance --json
+glass maintenance apply
+glass maintenance apply --json
+```
+
+Startup cleanup is enabled by default. It runs at most one apply pass per state
+database in a process, and each pass is bounded by the `*PerRun` maintenance
+limits and `schedulerHistory.batchSize`. A nested `agentSessions`,
+`detachedArtifacts`, or `schedulerHistory` report with `batchLimited: true`
+means a later startup or explicit `glass maintenance apply` can continue the
+work; startup never loops without a bound. Set
+`maintenance.runOnStartup` to `false` to disable it, or override the
+maintenance sections in global or explicit JSON/JSONC configuration to
+customize its age, quota, and per-run limits. Workspace maintenance overrides
+are ignored because retention operates on the shared state database. Set
+`maintenance.reconcileOrphanedTools` to `false` when orphaned-tool
+reconciliation is not wanted.
+
+`glass doctor --json` and `glass cron status --json` expose health and scheduler
+state as aggregate, privacy-safe diagnostics. Maintenance `--json` reports
+counts and policy values only: these outputs contain no row identifiers, paths,
+prompts, commands, inbox text, or stored output payloads.
 
 ## Sessions: Durable Project Memory
 
@@ -356,6 +428,7 @@ Inside the TUI:
 /new
 /sessions
 /sessions SESSION_ID
+/config
 ```
 
 Use `/new` for a separate task, even in the same folder. This keeps unrelated context from contaminating one another. Use `/sessions` when you want to browse titles, models, approval modes, persistence state, schedule counts, and last activity.
@@ -391,7 +464,6 @@ Enter slash commands inside `glass`:
 | `/fork` | Fork the current session and switch to the independent copy |
 | `/sessions [ID]` | Browse sessions or switch directly to an ID |
 | `/session` | Open session management, rename, persistence, schedules, or approvals |
-| `/config` | Configure or recover the active gateway and model |
 | `/persist [on\|off]` | Enable or disable persistence for this session |
 | `/model [ID]` | Select a primary model; without an ID, open the model picker |
 | `/reasoning [effort]` | Select primary model reasoning effort |
@@ -406,9 +478,16 @@ Enter slash commands inside `glass`:
 | `/inbox` | Show unread scheduler records and mark them read |
 | `/exit` | Exit the TUI |
 
-The transcript supports mouse-wheel scrolling, `PageUp`, and `PageDown`. Dragging across text selects and copies it through OSC52 with a native clipboard fallback. `Ctrl+C` cancels the active turn or exits when no turn is running.
+The transcript supports mouse-wheel scrolling, `PageUp`, and `PageDown`. Dragging across text selects and copies it through OSC52 with a native clipboard fallback. To keep very large sessions responsive, the TUI renders the latest 1,000 transcript events while retaining the complete durable history and model context. Press `Esc` twice within 10 seconds to stop an active operation without leaving the TUI. Press `Ctrl+C` twice within 10 seconds to exit; if an operation is active, exiting stops it. Exiting does not hand an active turn to background processing, even when persistence is enabled.
 
-Before any visible model output, transient connectivity, rate-limit, and temporary provider/model availability failures keep the current turn alive. Looking Glass retries indefinitely with exponential backoff capped at 30 seconds, preserving the session, task plan, and operation lease; press `Ctrl+C` to stop waiting normally. Failures after visible output are not retried because replaying them could duplicate or mix streamed text.
+For interactive turns, before any visible model output, transient connectivity,
+rate-limit, and temporary provider/model availability failures keep the current
+turn alive. Looking Glass retries indefinitely with exponential backoff capped
+at 30 seconds, preserving the session, task plan, and operation lease; press
+`Esc` twice to stop waiting without exiting. These retries remain
+user-controlled and are not governed by the automation retry or timeout
+limits. Failures after visible output are not retried because replaying them
+could duplicate or mix streamed text.
 
 ## The Main Automation Workflow
 
@@ -556,7 +635,9 @@ interactive token and least privilege. The task is not a Windows service.
 
 Both schedulers use the current user's state database, take one durable daemon
 lease, claim occurrences safely, and preserve scheduler state across
-uninstallation:
+uninstallation. Installation captures active `LOOKING_GLASS_CONFIG`,
+`XDG_CONFIG_HOME`, and `XDG_DATA_HOME` overrides (plus Windows app-data roots)
+so background turns use the same config, artifacts, and state locations:
 
 ```bash
 glass cron uninstall
@@ -621,17 +702,18 @@ The model can use these built-in tools:
 | `glob` | Find files with bounded `ripgrep` searches |
 | `grep` | Search workspace text with bounded regular expressions |
 | `apply_patch` | Apply atomic workspace patches |
-| `bash` | Run bounded noninteractive host-shell commands |
+| `bash` | Run bounded commands through the host shell |
 | `ask_user` | Ask the interactive operator a question |
 | `run_agents` | Run isolated leaf-agent tasks concurrently |
 | `schedule_create` | Create reminders, deterministic commands, or session prompts |
 | `schedule_list` | List schedules and scoped scheduler inbox records |
 | `schedule_manage` | Pause, resume, delete, run, resolve, or acknowledge schedules |
 
-File tools are workspace-bound and symlink-aware. The shell tool disables startup
-profiles, bounds captured output, stores oversized results as artifacts, and
-terminates process groups on cancellation or timeout. It runs noninteractive
-Bash on Linux or Windows PowerShell (`powershell.exe`) on Windows.
+File tools are workspace-bound and symlink-aware. The `bash` tool is
+platform-aware: it disables startup profiles and runs noninteractive Bash on
+Linux, or Windows PowerShell (`powershell.exe`) on Windows. It bounds captured
+output, stores oversized results as artifacts, and terminates process groups on
+cancellation or timeout.
 
 ## Approval Modes
 
@@ -673,7 +755,7 @@ Default platform paths:
 | Global config | `~/.config/looking-glass/` | `%APPDATA%\looking-glass\` | `XDG_CONFIG_HOME` |
 | SQLite state | `~/.local/share/looking-glass/state.db` | `%LOCALAPPDATA%\looking-glass\state.db` | `LOOKING_GLASS_DB` |
 | Artifacts | `~/.local/share/looking-glass/artifacts/` | `%LOCALAPPDATA%\looking-glass\artifacts\` | `XDG_DATA_HOME` |
-| Scheduler environment | `~/.config/looking-glass/scheduler.env` | `%APPDATA%\looking-glass\scheduler.env` | follows `XDG_CONFIG_HOME` |
+| Scheduler environment | `~/.config/looking-glass/scheduler.env` | `%APPDATA%\looking-glass\scheduler.env` | `XDG_CONFIG_HOME` |
 
 On Windows, `APPDATA` and `LOCALAPPDATA` select the roaming configuration and
 local data roots (with a home-directory fallback if unset). State directories
@@ -681,6 +763,22 @@ use mode `0700` where POSIX permissions are available. Large tool output is
 retained as a durable artifact and referenced from the model result. Do not
 commit the database, artifacts, credentials, `.env` files, or local
 configuration.
+
+### Retention and protection
+
+Maintenance only auto-prunes old non-persistent leaf-agent sessions (or the
+oldest eligible sessions needed to satisfy configured quotas), detached
+artifacts, acknowledged inbox records, and known terminal scheduler history
+and stored outputs after their retention periods. Interactive sessions,
+persistent sessions, sessions with schedules, active leases, active schedules,
+unread inbox items, and unknown outcomes are protected. Orphaned started tool
+calls are marked `unknown` rather than deleted; expired leases may be removed
+when `reconcileOrphanedTools` is enabled. Session deletion can detach attached
+artifacts, which are then subject to the detached-artifact policy.
+
+Maintenance reports and the `doctor --json`/`cron status --json` operational
+snapshots are aggregate and privacy-safe: they contain counts, ages, and byte
+metadata, not identifiers, paths, prompts, commands, or stored content.
 
 Looking Glass loads instruction files in this order:
 
@@ -697,15 +795,20 @@ Check the effective environment:
 ```bash
 glass config
 glass doctor
+glass doctor --json
+glass cron status --json
+glass maintenance --json
 glass models
 ```
 
 Common fixes:
 
 - If the model list is empty, verify the gateway URL and API key environment variable.
-- If a scheduled prompt does not run, verify the session is persistent and `glass cron status` shows an active daemon.
+- If a scheduled prompt does not run, verify the session is persistent and `glass cron status --json` shows an active daemon and no unknown occurrence.
 - If LM Studio schedules fail after the TUI exits, put the token in the platform scheduler environment file (`~/.config/looking-glass/scheduler.env` on Linux or `%APPDATA%\looking-glass\scheduler.env` on Windows).
 - If a recurring job is blocked, inspect `glass cron list`, review the unknown outcome, then run `glass cron resolve JOB_ID` deliberately.
+- If a nested maintenance report has `batchLimited: true`, rerun `glass maintenance apply` deliberately; per-run caps intentionally spread cleanup across bounded passes.
+- If startup cleanup is unexpected, inspect `glass config` and set `maintenance.runOnStartup` to `false` or customize the maintenance policy in global or explicit config. Workspace maintenance overrides are ignored because the state database is shared.
 - If a resumed session appears to have lost context, confirm you used `--session ID` and are looking at the same workspace and state database.
 - After source changes, run `npm run build` before using the installed `glass` command or reinstalling the scheduler service.
 
@@ -733,6 +836,8 @@ src/
   app.ts                 Application wiring and workspace discovery
   cli.ts                 CLI entry point and scheduler commands
   config.ts              Global/workspace configuration loading
+  maintenance.ts         Bounded retention and orphan reconciliation
+  operations.ts          Aggregate, privacy-safe operational snapshots
   engine/                Conversation execution and context projection
   model/                OpenAI-compatible gateway client integrations
   scheduler/             Persistent jobs, leases, claims, runner, daemon

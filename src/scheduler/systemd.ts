@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, unlinkSy
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { configDir } from "../paths.js";
 
 export const SERVICE_NAME = "looking-glass-scheduler.service";
 
@@ -22,9 +23,16 @@ export function userUnitPath(): string {
   return join(homedir(), ".config", "systemd", "user", SERVICE_NAME);
 }
 
-export function renderUnit(cliPath: string, dbPath: string): string {
+export function renderUnit(
+  cliPath: string,
+  dbPath: string,
+  environment: NodeJS.ProcessEnv = process.env,
+): string {
   const nodePath = realpathSync(process.execPath);
   const resolvedCli = realpathSync(cliPath);
+  const inherited = ["LOOKING_GLASS_CONFIG", "XDG_CONFIG_HOME", "XDG_DATA_HOME"]
+    .flatMap((name) => environment[name] ? [`Environment=${quote(`${name}=${environment[name]}`)}`] : [])
+    .join("\n");
   return `[Unit]
 Description=Looking Glass persistent scheduler
 After=local-fs.target
@@ -35,7 +43,7 @@ StartLimitBurst=5
 Type=exec
 ExecStart=${quote(nodePath)} ${quote(resolvedCli)} cron daemon
 Environment=${quote(`LOOKING_GLASS_DB=${dbPath}`)}
-EnvironmentFile=-%h/.config/looking-glass/scheduler.env
+${inherited ? `${inherited}\n` : ""}EnvironmentFile=-${quote(join(configDir(), "scheduler.env"))}
 WorkingDirectory=%h
 Restart=on-failure
 RestartSec=25s

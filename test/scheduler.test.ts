@@ -112,7 +112,7 @@ test("installs current migrations and validates scheduler definitions", (t) => {
   const { db, root, store } = fixture(t);
   const now = Date.parse("2026-01-01T00:00:30Z");
   const versions = db.prepare("SELECT version FROM schema_migrations ORDER BY version").all() as { version: number }[];
-  assert.deepEqual(versions.map((row) => row.version), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+  assert.deepEqual(versions.map((row) => row.version), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]);
   const sessionId = createSession(db, root, true);
   const approval = db.prepare("SELECT approval_mode FROM sessions WHERE id = ?").get(sessionId) as { approval_mode: string };
   assert.equal(approval.approval_mode, "review");
@@ -1037,6 +1037,47 @@ test("lease takeover marks claimed and running commands unknown and blocks recur
   assert.equal(store.claimCommands("daemon-a", "boot-a", due + 101, 100, 2).length, 0);
 });
 
+test("resolving a historical unknown survives daemon lease recovery", (t) => {
+  const { root, store } = fixture(t);
+  const createdAt = Date.parse("2026-01-01T00:00:30Z");
+  const due = Date.parse("2026-01-01T00:01:00Z");
+  const historical = store.createCommand(commandInput(root, successCommand(), "* * * * *", {
+    scheduleKind: "cron",
+  }), createdAt);
+  assert.equal(store.materialize(due).length, 1);
+  assert.equal(store.acquireLease("history-old", "history-old-boot", due, 100), true);
+  const oldClaim = store.claimCommands("history-old", "history-old-boot", due, 100, 1)[0];
+  assert.ok(oldClaim);
+  assert.equal(oldClaim.job.id, historical.id);
+
+  assert.equal(store.acquireLease("history-new", "history-new-boot", due + 100, 1_000), true);
+  assert.equal(store.listRuns(historical.id)[0]?.state, "unknown");
+  const resolved = store.acknowledgeUnknown(historical.id, due + 200);
+  assert.equal(resolved.enabled, true);
+  assert.equal(resolved.blockedReason, null);
+
+  const recoveryDue = due + 300;
+  const recoveryJob = store.createCommand(commandInput(
+    root,
+    successCommand(),
+    new Date(recoveryDue).toISOString(),
+    { startGraceMs: 60_000 },
+  ), due + 200);
+  assert.equal(store.materialize(recoveryDue).filter((run) => run.jobId === recoveryJob.id).length, 1);
+  const recoveryClaim = store.claimCommands("history-new", "history-new-boot", recoveryDue, 1_000, 1)[0];
+  assert.ok(recoveryClaim);
+  assert.equal(recoveryClaim.job.id, recoveryJob.id);
+
+  assert.equal(store.releaseLease("history-new", "history-new-boot", recoveryDue + 1), true);
+  assert.equal(store.acquireLease("history-recovery", "history-recovery-boot", recoveryDue + 2, 1_000), true);
+  assert.equal(store.listRuns(recoveryJob.id)[0]?.state, "unknown");
+  assert.equal(store.listRuns(historical.id)[0]?.state, "unknown");
+  const afterRecovery = store.getJob(historical.id);
+  assert.equal(afterRecovery?.enabled, true);
+  assert.equal(afterRecovery?.blockedReason, null);
+  assert.equal(store.listInbox().filter((item) => item.jobId === historical.id).length, 1);
+});
+
 test("command runner records success, nonzero exit, timeout, and bounded output", async (t) => {
   const { root, store } = fixture(t);
   const owner = "runner-daemon";
@@ -1066,7 +1107,7 @@ test("command runner records success, nonzero exit, timeout, and bounded output"
     env: { SCHED_VALUE: "from-env" },
   });
   assert.equal(success.result.state, "succeeded");
-  assert.equal(success.result.stdout.toString(), "from-env");
+  assert.equal(success.result.stdout.toString(), "[REDACTED]");
   assert.equal(success.result.stderr.toString(), "warning");
   assert.equal(success.result.exitCode, 0);
 

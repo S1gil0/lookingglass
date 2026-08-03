@@ -21,6 +21,7 @@ import {
   parseTerminalMouse,
   parseSessionSchedule,
   ReasoningSummary,
+  RepeatedPressConfirmation,
   selectedScreenText,
   sessionMetadataLine,
   shouldAutoDisplayInbox,
@@ -30,6 +31,20 @@ import {
 import { terminalSafe } from "../src/ui/stdio.js";
 import type { InboxRecord, SchedulerJob } from "../src/scheduler/types.js";
 import type { TaskPlanSnapshot } from "../src/task-plan.js";
+
+test("requires a repeated interrupt key press within the confirmation window", () => {
+  const confirmation = new RepeatedPressConfirmation(10_000);
+
+  assert.equal(confirmation.press(1_000), false);
+  assert.equal(confirmation.press(11_000), true);
+  assert.equal(confirmation.press(12_000), false);
+  assert.equal(confirmation.press(22_001), false);
+  assert.equal(confirmation.press(23_000), true);
+
+  assert.equal(confirmation.press(30_000), false);
+  confirmation.reset();
+  assert.equal(confirmation.press(30_001), false);
+});
 
 test("parses one-shot and quoted or unquoted cron session schedules", () => {
   assert.deepEqual(parseSessionSchedule("once 2026-07-20T12:00:00Z inspect services"), {
@@ -600,6 +615,203 @@ test("hides completed task plans so resumed transcript content is not pushed bel
   const plain = root.render(40).map(stripVTControlCharacters);
   assert.ok(plain.some((line) => line.includes("The turn has resumed.")));
   assert.equal(plain.some((line) => line.includes("Task plan")), false);
+});
+
+test("refreshes a mutable transcript entry without rerendering session history", () => {
+  const terminal = { rows: 12, columns: 40 } as never;
+  const editor = {
+    invalidate() {},
+    render() { return ["editor input"]; },
+  } as never;
+  const panel = new TaskPlanPanel();
+  const root = new FullHeightRoot(terminal, editor, panel, () => "activity", () => "metadata");
+  let historyRenders = 0;
+  let liveRenders = 0;
+  let tailRenders = 0;
+  let liveLines = ["running"];
+  const history = {
+    invalidate() {},
+    render() {
+      historyRenders += 1;
+      return ["historical entry"];
+    },
+  };
+  const live = {
+    invalidate() {},
+    render() {
+      liveRenders += 1;
+      return liveLines;
+    },
+  };
+  const tail = {
+    invalidate() {},
+    render() {
+      tailRenders += 1;
+      return ["tail entry"];
+    },
+  };
+  root.addEntry(history);
+  root.addEntry(live);
+  root.addEntry(tail);
+
+  root.render(40);
+  assert.deepEqual([historyRenders, liveRenders, tailRenders], [1, 1, 1]);
+  liveLines = ["updated progress", "second progress line"];
+  root.refreshEntry(live);
+  const updated = root.render(40).map(stripVTControlCharacters);
+  assert.deepEqual([historyRenders, liveRenders, tailRenders], [1, 2, 1]);
+  assert.ok(updated.some((line) => line.includes("updated progress")));
+  assert.ok(updated.some((line) => line.includes("second progress line")));
+  assert.ok(updated.some((line) => line.includes("tail entry")));
+
+  root.invalidate();
+  root.render(40);
+  assert.deepEqual([historyRenders, liveRenders, tailRenders], [2, 3, 2]);
+});
+
+test("large transcripts keep frequent progress refreshes bounded to the live entry", () => {
+  const terminal = { rows: 12, columns: 40 } as never;
+  const editor = {
+    invalidate() {},
+    render() { return ["editor input"]; },
+  } as never;
+  const root = new FullHeightRoot(
+    terminal,
+    editor,
+    new TaskPlanPanel(),
+    () => "activity",
+    () => "metadata",
+  );
+  let historyRenders = 0;
+  const historyEntries = 10_000;
+  for (let index = 0; index < historyEntries; index += 1) {
+    root.addEntry({
+      invalidate() {},
+      render() {
+        historyRenders += 1;
+        return [`history ${index}`];
+      },
+    });
+  }
+  let progressRenders = 0;
+  let progress = 0;
+  const live = {
+    invalidate() {},
+    render() {
+      progressRenders += 1;
+      return [`progress ${progress}`];
+    },
+  };
+  root.addEntry(live);
+  root.render(40);
+
+  for (progress = 1; progress <= 250; progress += 1) root.refreshEntry(live);
+  const frame = root.render(40).map(stripVTControlCharacters);
+  assert.equal(historyRenders, historyEntries);
+  assert.equal(progressRenders, 251);
+  assert.ok(frame.some((line) => line.includes("progress 250")));
+});
+
+test("evicts the oldest transcript entries before and after the render cache is built", () => {
+  const terminal = { rows: 12, columns: 40 } as never;
+  const editor = {
+    invalidate() {},
+    render() { return ["editor input"]; },
+  } as never;
+  const evicted: string[] = [];
+  const entry = (text: string) => ({
+    invalidate() {},
+    render() { return [text]; },
+  });
+  const first = entry("first");
+  const second = entry("second");
+  const third = entry("third");
+  const fourth = entry("fourth");
+  const root = new FullHeightRoot(
+    terminal,
+    editor,
+    new TaskPlanPanel(),
+    () => "activity",
+    () => "metadata",
+    { maxEntries: 2, onEvict: (component) => evicted.push(component === first ? "first" : "second") },
+  );
+  root.addEntry(first);
+  root.addEntry(second);
+  root.addEntry(third);
+  let frame = root.render(40).map(stripVTControlCharacters);
+  assert.deepEqual(evicted, ["first"]);
+  assert.equal(frame.some((line) => line.includes("first")), false);
+  assert.ok(frame.some((line) => line.includes("second")));
+  assert.ok(frame.some((line) => line.includes("third")));
+
+  root.addEntry(fourth);
+  frame = root.render(40).map(stripVTControlCharacters);
+  assert.deepEqual(evicted, ["first", "second"]);
+  assert.equal(frame.some((line) => line.includes("second")), false);
+  assert.ok(frame.some((line) => line.includes("third")));
+  assert.ok(frame.some((line) => line.includes("fourth")));
+});
+
+test("live transcript eviction preserves a scrolled viewport anchor", () => {
+  const terminal = { rows: 12, columns: 40 } as never;
+  const editor = {
+    invalidate() {},
+    render() { return ["editor input"]; },
+  } as never;
+  const root = new FullHeightRoot(
+    terminal,
+    editor,
+    new TaskPlanPanel(),
+    () => "activity",
+    () => "metadata",
+    { maxEntries: 20 },
+  );
+  for (let index = 0; index < 20; index += 1) {
+    root.addEntry({ invalidate() {}, render() { return [`entry ${index}`]; } });
+  }
+  root.render(40);
+  root.scrollPage(-1);
+  const before = root.render(40).map(stripVTControlCharacters);
+  const anchoredRow = before.findIndex((line) => line.includes("entry 10"));
+  assert.ok(anchoredRow >= 0);
+
+  root.addEntry({ invalidate() {}, render() { return ["entry 20"]; } });
+  const after = root.render(40).map(stripVTControlCharacters);
+  assert.equal(after.findIndex((line) => line.includes("entry 10")), anchoredRow);
+});
+
+test("refreshing an evicted mutable entry does not invalidate retained history", () => {
+  const terminal = { rows: 12, columns: 40 } as never;
+  const editor = {
+    invalidate() {},
+    render() { return ["editor input"]; },
+  } as never;
+  let retainedRenders = 0;
+  const mutable = { invalidate() {}, render() { return ["mutable"]; } };
+  const retained = {
+    invalidate() {},
+    render() {
+      retainedRenders += 1;
+      return ["retained"];
+    },
+  };
+  const root = new FullHeightRoot(
+    terminal,
+    editor,
+    new TaskPlanPanel(),
+    () => "activity",
+    () => "metadata",
+    { maxEntries: 2 },
+  );
+  root.addEntry(mutable);
+  root.addEntry(retained);
+  root.render(40);
+  root.addEntry({ invalidate() {}, render() { return ["new tail"]; } });
+  assert.equal(retainedRenders, 1);
+
+  root.refreshEntry(mutable);
+  root.render(40);
+  assert.equal(retainedRenders, 1);
 });
 
 test("renders task-plan checkmarks without status or priority text", () => {

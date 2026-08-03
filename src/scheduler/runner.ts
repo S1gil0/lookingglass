@@ -12,10 +12,20 @@ import type {
   SessionPromptCompletion,
   SessionPromptHandler,
 } from "./types.js";
-import { sessionPromptReservation } from "./types.js";
+import { DEFAULT_SESSION_PROMPT_TIMEOUT_MS, sessionPromptReservation } from "./types.js";
 import { SchedulerStore } from "./store.js";
 import type { ApprovalMode } from "../types.js";
 import { redactSensitiveText } from "../security.js";
+import { AutomatedTurnTimeoutError } from "../retry.js";
+
+const SESSION_OPERATION_LEASE_ERROR_CODES = new Set([
+  "session_operation_lease_lost",
+  "session_operation_lease_unavailable",
+]);
+
+function sanitizedOutput(value: string): string {
+  return value.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/gu, "�");
+}
 
 export function scheduledSessionReadOnly(approvalMode: ApprovalMode): boolean {
   return approvalMode !== "unrestricted";
@@ -119,16 +129,17 @@ export class CommandRunner {
         else if (state === "timed_out") reason = `Command exceeded its ${job.timeoutMs ?? 0}ms timeout`;
         else if (state === "failed" && result.signal) reason = `Command terminated by ${result.signal}`;
         else if (state === "failed") reason = `Command exited with code ${result.exitCode ?? "unknown"}`;
-        const secrets = this.sensitiveEnvKeys
-          .map((key) => process.env[key])
-          .filter((value): value is string => typeof value === "string" && value.length >= 8);
+        const secrets = [
+          ...this.sensitiveEnvKeys.map((key) => process.env[key]),
+          ...Object.values(job.env),
+        ].filter((value): value is string => typeof value === "string" && value.length > 0);
         completion = {
           state,
           exitCode: result.exitCode,
           signal: result.signal,
           reason,
-          stdout: Buffer.from(redactSensitiveText(result.stdout.toString("utf8"), secrets)),
-          stderr: Buffer.from(redactSensitiveText(result.stderr.toString("utf8"), secrets)),
+          stdout: Buffer.from(sanitizedOutput(redactSensitiveText(result.stdout.toString("utf8"), secrets))),
+          stderr: Buffer.from(sanitizedOutput(redactSensitiveText(result.stderr.toString("utf8"), secrets))),
           stdoutBytes: result.stdoutBytes,
           stderrBytes: result.stderrBytes,
           stdoutTruncated: result.stdoutTruncated,
@@ -174,45 +185,106 @@ export class SessionPromptRunner {
       occurrence.claimBootId,
       occurrence.claimToken,
     );
-    const handlerSignal = signal ?? new AbortController().signal;
+    // Legacy rows used the command duration sentinel as an unbounded prompt.
+    // Keep those rows bounded while new rows persist the configured timeout.
+    const configuredTimeout = job.timeoutMs ?? DEFAULT_SESSION_PROMPT_TIMEOUT_MS;
+    const timeoutMs = configuredTimeout >= 2_147_483_647
+      ? DEFAULT_SESSION_PROMPT_TIMEOUT_MS
+      : Math.max(1, configuredTimeout);
+    const deadline = new AbortController();
+    let deadlineFired = false;
+    const deadlineTimer = setTimeout(() => {
+      deadlineFired = true;
+      deadline.abort(new AutomatedTurnTimeoutError(timeoutMs));
+    }, timeoutMs);
+    const handlerSignal = signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal;
     let completion: SessionPromptCompletion;
     try {
       if (handlerSignal.aborted) {
-        completion = {
-          state: "cancelled",
-          reason: "Scheduler daemon stopped before the session prompt started",
-        };
+        if (deadlineFired && !signal?.aborted) {
+          const timeout = new AutomatedTurnTimeoutError(timeoutMs);
+          completion = { state: "timed_out", error: timeout.message, reason: timeout.message, code: timeout.code };
+        } else {
+          completion = {
+            state: "cancelled",
+            reason: "Scheduler daemon stopped before the session prompt started",
+            code: "scheduler_cancelled",
+          };
+        }
       } else {
         try {
           const secrets = this.sensitiveEnvKeys
             .map((key) => process.env[key])
-            .filter((value): value is string => typeof value === "string" && value.length >= 8);
+            .filter((value): value is string => typeof value === "string" && value.length > 0);
           const output = redactSensitiveText(await this.handler(job, handlerSignal, reservation), secrets);
-          completion = handlerSignal.aborted
-            ? {
-                state: "unknown",
-                reason: "Scheduler daemon stopped while the session prompt was running; its outcome is unknown",
-              }
-            : { state: "succeeded", output, reason: null };
+          if (signal?.aborted) {
+            completion = {
+              state: "unknown",
+              reason: "Scheduler daemon stopped while the session prompt was running; its outcome is unknown",
+              code: "scheduler_cancelled",
+            };
+          } else if (deadlineFired) {
+            completion = {
+              state: "unknown",
+              error: "Automated turn completed after its deadline; side effects may have occurred",
+              reason: "Scheduled session prompt exceeded its deadline with an unknown outcome [automated_turn_timeout]",
+              code: "automated_turn_timeout",
+            };
+          } else {
+            completion = { state: "succeeded", output, reason: null };
+          }
         } catch (error) {
           const secrets = this.sensitiveEnvKeys
             .map((key) => process.env[key])
-            .filter((value): value is string => typeof value === "string" && value.length >= 8);
+            .filter((value): value is string => typeof value === "string" && value.length > 0);
           const message = redactSensitiveText(error instanceof Error ? error.message : String(error), secrets);
-          completion = handlerSignal.aborted
-            ? {
-                state: "unknown",
-                error: message,
-                reason: "Scheduler daemon stopped while the session prompt was running; its outcome is unknown",
-              }
-            : {
-                state: "failed",
-                error: message,
-                reason: `Session prompt failed: ${message}`,
-              };
+          const code = error && typeof error === "object" && "code" in error
+            && typeof (error as { code?: unknown }).code === "string"
+            && /^[a-z][a-z0-9_]{0,63}$/u.test((error as { code: string }).code)
+            ? (error as { code: string }).code
+            : undefined;
+          if (signal?.aborted) {
+            completion = {
+              state: "unknown",
+              error: message,
+              reason: "Scheduler daemon stopped while the session prompt was running; its outcome is unknown",
+              code: "scheduler_cancelled",
+            };
+          } else if (code && SESSION_OPERATION_LEASE_ERROR_CODES.has(code)) {
+            completion = {
+              state: "unknown",
+              error: message,
+              reason: "Scheduled session lease was lost; its outcome is unknown",
+              code,
+            };
+          } else if (deadlineFired && !(error && typeof error === "object"
+            && "uncertainSideEffects" in error && (error as { uncertainSideEffects?: unknown }).uncertainSideEffects === true)) {
+            const timeout = new AutomatedTurnTimeoutError(timeoutMs);
+            completion = {
+              state: "timed_out",
+              error: timeout.message,
+              reason: timeout.message,
+              code: timeout.code,
+            };
+          } else if (deadlineFired) {
+            completion = {
+              state: "unknown",
+              error: message,
+              reason: "Scheduled session prompt timed out with an uncertain outcome",
+              code: "automated_turn_timeout",
+            };
+          } else {
+            completion = {
+              state: "failed",
+              error: message,
+              reason: `Session prompt failed: ${message}`,
+              ...(code ? { code } : {}),
+            };
+          }
         }
       }
     } finally {
+      clearTimeout(deadlineTimer);
       this.store.releaseSessionPromptReservation(job.sessionId, reservation.owner, reservation.token);
     }
 

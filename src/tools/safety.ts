@@ -313,5 +313,12 @@ export function shellEnvironment(
   for (const key of Object.keys(env)) {
     if (excluded.has(windows ? key.toLowerCase() : key)) delete env[key];
   }
+  // Coding commands need a normal execution environment, but credentials do
+  // not need to be inherited. Strip common secret-bearing names even when a
+  // gateway did not explicitly declare them.
+  const sensitiveName = /(?:^|_)(?:api_?key|token|secret|password|passwd|credentials?|private_?key|access_?key)(?:$|_)/iu;
+  for (const key of Object.keys(env)) {
+    if (sensitiveName.test(key)) delete env[key];
+  }
   return env;
 }

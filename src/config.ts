@@ -42,6 +42,48 @@ export const DEFAULT_CONFIG: GlassConfig = {
     commandTimeoutMs: 10 * 60_000,
     commandOutputBytes: 64 * 1024,
   },
+  automation: {
+    providerRetryMaxAttempts: 8,
+    providerRetryMaxElapsedMs: 15 * 60_000,
+    agentTurnTimeoutMs: 45 * 60_000,
+    scheduledTurnTimeoutMs: 2 * 60 * 60_000,
+  },
+  maintenance: {
+    runOnStartup: true,
+    reconcileOrphanedTools: true,
+    agentSessions: {
+      maxAgeMs: 30 * 24 * 60 * 60_000,
+      minAgeMs: 60 * 60_000,
+      maxSessions: 500,
+      maxLogicalBytes: 512 * 1024 * 1024,
+      maxSessionsPerRun: 25,
+      maxLogicalBytesPerRun: 64 * 1024 * 1024,
+    },
+    detachedArtifacts: {
+      maxAgeMs: 30 * 24 * 60 * 60_000,
+      minAgeMs: 60 * 60_000,
+      maxArtifacts: 1_000,
+      maxBytes: 1024 * 1024 * 1024,
+      maxArtifactsPerRun: 100,
+      maxBytesPerRun: 128 * 1024 * 1024,
+    },
+    schedulerHistory: {
+      outputRetentionMs: 30 * 24 * 60 * 60_000,
+      occurrenceRetentionMs: 90 * 24 * 60 * 60_000,
+      acknowledgedInboxRetentionMs: 30 * 24 * 60 * 60_000,
+      deletedJobRetentionMs: 30 * 24 * 60 * 60_000,
+      minOccurrencesPerJob: 20,
+      batchSize: 500,
+    },
+  },
+};
+
+type PartialMaintenanceConfig = {
+  runOnStartup?: boolean;
+  reconcileOrphanedTools?: boolean;
+  agentSessions?: Partial<GlassConfig["maintenance"]["agentSessions"]>;
+  detachedArtifacts?: Partial<GlassConfig["maintenance"]["detachedArtifacts"]>;
+  schedulerHistory?: Partial<GlassConfig["maintenance"]["schedulerHistory"]>;
 };
 
 type PartialConfig = {
@@ -54,6 +96,8 @@ type PartialConfig = {
   instructions?: string[];
   tools?: Partial<GlassConfig["tools"]>;
   scheduler?: Partial<GlassConfig["scheduler"]>;
+  automation?: Partial<GlassConfig["automation"]>;
+  maintenance?: PartialMaintenanceConfig;
 };
 
 type GatewayConfigInput = Partial<GlassConfig["gateway"]> & Pick<GlassConfig["gateway"], "provider" | "baseURL">;
@@ -68,6 +112,26 @@ export function defaultApiKeyEnv(provider: GlassConfig["gateway"]["provider"]): 
 export function defaultProtocol(provider: GlassConfig["gateway"]["provider"]): GatewayProtocol {
   return provider === "openrouter" ? "chat" : "responses";
 }
+
+function assertGatewayBaseURL(baseURL: string): void {
+  if (typeof baseURL !== "string" || !/^https?:\/\//.test(baseURL)) {
+    throw new Error("gateway baseURL must be HTTP or HTTPS");
+  }
+  const url = new URL(baseURL);
+  if (url.username || url.password) throw new Error("gateway baseURL must not contain credentials");
+  if (url.search || url.hash) throw new Error("gateway baseURL must not contain a query or fragment");
+}
+
+const AGENT_SESSION_MAINTENANCE_KEYS = [
+  "maxAgeMs", "minAgeMs", "maxSessions", "maxLogicalBytes", "maxSessionsPerRun", "maxLogicalBytesPerRun",
+] as const;
+const DETACHED_ARTIFACT_MAINTENANCE_KEYS = [
+  "maxAgeMs", "minAgeMs", "maxArtifacts", "maxBytes", "maxArtifactsPerRun", "maxBytesPerRun",
+] as const;
+const SCHEDULER_HISTORY_MAINTENANCE_KEYS = [
+  "outputRetentionMs", "occurrenceRetentionMs", "acknowledgedInboxRetentionMs",
+  "deletedJobRetentionMs", "minOccurrencesPerJob", "batchSize",
+] as const;
 
 function parseConfigFile(path: string): PartialConfig {
   const errors: ParseError[] = [];
@@ -122,7 +186,42 @@ function parseConfigFile(path: string): PartialConfig {
     "commandTimeoutMs", "commandOutputBytes",
   ]);
   if (scheduler) result.scheduler = scheduler;
+  const automation = nested("automation", [
+    "providerRetryMaxAttempts", "providerRetryMaxElapsedMs", "agentTurnTimeoutMs", "scheduledTurnTimeoutMs",
+  ]);
+  if (automation) result.automation = automation;
+  const maintenanceValue = object.maintenance;
+  if (maintenanceValue !== undefined) {
+    if (!isObject(maintenanceValue)) throw new Error(`Invalid config ${path}: maintenance expected an object`);
+    const maintenance = pick(maintenanceValue, ["runOnStartup", "reconcileOrphanedTools"]);
+    const maintenanceSections: ReadonlyArray<readonly [string, readonly string[]]> = [
+      ["agentSessions", AGENT_SESSION_MAINTENANCE_KEYS],
+      ["detachedArtifacts", DETACHED_ARTIFACT_MAINTENANCE_KEYS],
+      ["schedulerHistory", SCHEDULER_HISTORY_MAINTENANCE_KEYS],
+    ];
+    for (const [name, keys] of maintenanceSections) {
+      const sectionValue = maintenanceValue[name];
+      if (sectionValue === undefined) continue;
+      if (!isObject(sectionValue)) throw new Error(`Invalid config ${path}: maintenance.${name} expected an object`);
+      maintenance[name] = pick(sectionValue, keys);
+    }
+    result.maintenance = maintenance as PartialMaintenanceConfig;
+  }
   return result as PartialConfig;
+}
+
+function mergeMaintenance(
+  base: GlassConfig["maintenance"],
+  override: PartialMaintenanceConfig | undefined,
+): GlassConfig["maintenance"] {
+  if (!override) return base;
+  return {
+    ...base,
+    ...override,
+    agentSessions: { ...base.agentSessions, ...override.agentSessions },
+    detachedArtifacts: { ...base.detachedArtifacts, ...override.detachedArtifacts },
+    schedulerHistory: { ...base.schedulerHistory, ...override.schedulerHistory },
+  };
 }
 
 function merge(base: GlassConfig, override: PartialConfig): GlassConfig {
@@ -155,6 +254,8 @@ function merge(base: GlassConfig, override: PartialConfig): GlassConfig {
       : base.gateways,
     tools: { ...base.tools, ...override.tools },
     scheduler: { ...base.scheduler, ...override.scheduler },
+    automation: { ...base.automation, ...override.automation },
+    maintenance: mergeMaintenance(base.maintenance, override.maintenance),
   };
 }
 
@@ -174,11 +275,7 @@ function validate(config: GlassConfig): void {
     if (gateway.provider !== "custom" && gateway.protocol !== defaultProtocol(gateway.provider)) {
       throw new Error(`gateway protocol ${gateway.protocol} is not supported for ${gateway.provider}`);
     }
-    if (typeof gateway.baseURL !== "string" || !/^https?:\/\//.test(gateway.baseURL)) {
-      throw new Error("gateway baseURL must be HTTP or HTTPS");
-    }
-    const url = new URL(gateway.baseURL);
-    if (url.username || url.password) throw new Error("gateway baseURL must not contain credentials");
+    assertGatewayBaseURL(gateway.baseURL);
     if (typeof gateway.apiKeyEnv !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(gateway.apiKeyEnv)) {
       throw new Error("gateway apiKeyEnv must be a valid environment variable name");
     }
@@ -204,6 +301,42 @@ function validate(config: GlassConfig): void {
   for (const [name, value] of Object.entries(config.scheduler)) {
     if (name !== "timezone" && (typeof value !== "number" || !Number.isFinite(value) || value < 0)) {
       throw new Error(`scheduler.${name} must be a non-negative number`);
+    }
+  }
+  for (const [name, value] of Object.entries(config.automation)) {
+    if (!Number.isSafeInteger(value) || value < 1 || value > 2_147_483_646) {
+      throw new Error(`automation.${name} must be a positive safe integer no greater than 2147483646`);
+    }
+  }
+  if (typeof config.maintenance.runOnStartup !== "boolean") {
+    throw new Error("maintenance.runOnStartup must be a boolean");
+  }
+  if (typeof config.maintenance.reconcileOrphanedTools !== "boolean") {
+    throw new Error("maintenance.reconcileOrphanedTools must be a boolean");
+  }
+  const maintenanceSections = [
+    ["agentSessions", config.maintenance.agentSessions],
+    ["detachedArtifacts", config.maintenance.detachedArtifacts],
+    ["schedulerHistory", config.maintenance.schedulerHistory],
+  ] as const;
+  for (const [sectionName, section] of maintenanceSections) {
+    for (const [name, value] of Object.entries(section)) {
+      if (!Number.isSafeInteger(value) || value < 0) {
+        throw new Error(`maintenance.${sectionName}.${name} must be a non-negative safe integer`);
+      }
+    }
+  }
+  for (const [sectionName, keys] of [
+    ["agentSessions", ["maxSessionsPerRun", "maxLogicalBytesPerRun"]],
+    ["detachedArtifacts", ["maxArtifactsPerRun", "maxBytesPerRun"]],
+    ["schedulerHistory", ["batchSize"]],
+  ] as const) {
+    const section = config.maintenance[sectionName];
+    for (const name of keys) {
+      const value = (section as unknown as Record<string, number>)[name];
+      if (value === undefined || value < 1) {
+        throw new Error(`maintenance.${sectionName}.${name} must be at least 1`);
+      }
     }
   }
   new Intl.DateTimeFormat("en-US", { timeZone: config.scheduler.timezone }).format(0);
@@ -242,10 +375,19 @@ export function loadConfig(workspace: string): GlassConfig {
   const explicit = process.env.LOOKING_GLASS_CONFIG ? resolve(process.env.LOOKING_GLASS_CONFIG) : null;
 
   let config = structuredClone(DEFAULT_CONFIG);
-  for (const path of [...globalPaths, ...projectPaths, ...(explicit ? [explicit] : [])]) {
+  const layers = [
+    ...globalPaths.map((path) => ({ path, allowMaintenance: true })),
+    ...projectPaths.map((path) => ({ path, allowMaintenance: false })),
+    ...(explicit ? [{ path: explicit, allowMaintenance: true }] : []),
+  ];
+  for (const { path, allowMaintenance } of layers) {
     if (!existsSync(path)) continue;
     try {
-      const candidate = merge(config, parseConfigFile(path));
+      const override = parseConfigFile(path);
+      // Retention operates on the shared state database, not one workspace.
+      // Project files therefore cannot choose policy for other workspaces.
+      if (!allowMaintenance) delete override.maintenance;
+      const candidate = merge(config, override);
       validate(candidate);
       config = candidate;
     } catch {
@@ -280,12 +422,91 @@ export interface PersistedGatewayConfig {
   apiKeyEnv?: string;
   model?: string | null;
   apiKey?: string;
+  automation?: Partial<GlassConfig["automation"]>;
+  maintenance?: PartialMaintenanceConfig;
 }
 
 function assertApiKeyEnv(apiKeyEnv: string): void {
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(apiKeyEnv)) {
     throw new Error("gateway apiKeyEnv must be a valid environment variable name");
   }
+}
+
+const AUTOMATION_CONFIG_KEYS = [
+  "providerRetryMaxAttempts",
+  "providerRetryMaxElapsedMs",
+  "agentTurnTimeoutMs",
+  "scheduledTurnTimeoutMs",
+] as const;
+
+function sanitizedAutomation(
+  value: unknown,
+  rejectInvalid: boolean,
+): Partial<GlassConfig["automation"]> | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    if (rejectInvalid) throw new Error("automation must be an object");
+    return undefined;
+  }
+  const result: Partial<GlassConfig["automation"]> = {};
+  for (const key of AUTOMATION_CONFIG_KEYS) {
+    const candidate = (value as Record<string, unknown>)[key];
+    if (candidate === undefined) continue;
+    if (typeof candidate !== "number"
+      || !Number.isSafeInteger(candidate) || candidate < 1 || candidate > 2_147_483_646) {
+      if (rejectInvalid) throw new Error(`automation.${key} must be a positive safe integer no greater than 2147483646`);
+      continue;
+    }
+    result[key] = candidate;
+  }
+  return result;
+}
+
+function sanitizedMaintenance(value: unknown, rejectInvalid: boolean): PartialMaintenanceConfig | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    if (rejectInvalid) throw new Error("maintenance must be an object");
+    return undefined;
+  }
+  const object = value as Record<string, unknown>;
+  const result: PartialMaintenanceConfig = {};
+  for (const key of ["runOnStartup", "reconcileOrphanedTools"] as const) {
+    const candidate = object[key];
+    if (candidate === undefined) continue;
+    if (typeof candidate !== "boolean") {
+      if (rejectInvalid) throw new Error(`maintenance.${key} must be a boolean`);
+      continue;
+    }
+    result[key] = candidate;
+  }
+  const sections = [
+    ["agentSessions", AGENT_SESSION_MAINTENANCE_KEYS],
+    ["detachedArtifacts", DETACHED_ARTIFACT_MAINTENANCE_KEYS],
+    ["schedulerHistory", SCHEDULER_HISTORY_MAINTENANCE_KEYS],
+  ] as const;
+  for (const [sectionName, keys] of sections) {
+    const sectionValue = object[sectionName];
+    if (sectionValue === undefined) continue;
+    if (!sectionValue || typeof sectionValue !== "object" || Array.isArray(sectionValue)) {
+      if (rejectInvalid) throw new Error(`maintenance.${sectionName} must be an object`);
+      continue;
+    }
+    const section: Record<string, number> = {};
+    for (const key of keys) {
+      const candidate = (sectionValue as Record<string, unknown>)[key];
+      if (candidate === undefined) continue;
+      const minimum = key.endsWith("PerRun") || (sectionName === "schedulerHistory" && key === "batchSize") ? 1 : 0;
+      if (typeof candidate !== "number" || !Number.isSafeInteger(candidate) || candidate < minimum) {
+        if (rejectInvalid) {
+          throw new Error(`maintenance.${sectionName}.${key} must be a ${minimum === 1 ? "positive" : "non-negative"} safe integer`);
+        }
+        continue;
+      }
+      section[key] = candidate;
+    }
+    result[sectionName] = section;
+  }
+  return result;
 }
 
 /** Return only fields that are safe and declared in the effective config. */
@@ -321,23 +542,71 @@ export function serializeConfig(config: GlassConfig): GlassConfig {
       commandTimeoutMs: config.scheduler.commandTimeoutMs,
       commandOutputBytes: config.scheduler.commandOutputBytes,
     },
+    automation: {
+      providerRetryMaxAttempts: config.automation.providerRetryMaxAttempts,
+      providerRetryMaxElapsedMs: config.automation.providerRetryMaxElapsedMs,
+      agentTurnTimeoutMs: config.automation.agentTurnTimeoutMs,
+      scheduledTurnTimeoutMs: config.automation.scheduledTurnTimeoutMs,
+    },
+    maintenance: {
+      runOnStartup: config.maintenance.runOnStartup,
+      reconcileOrphanedTools: config.maintenance.reconcileOrphanedTools,
+      agentSessions: {
+        maxAgeMs: config.maintenance.agentSessions.maxAgeMs,
+        minAgeMs: config.maintenance.agentSessions.minAgeMs,
+        maxSessions: config.maintenance.agentSessions.maxSessions,
+        maxLogicalBytes: config.maintenance.agentSessions.maxLogicalBytes,
+        maxSessionsPerRun: config.maintenance.agentSessions.maxSessionsPerRun,
+        maxLogicalBytesPerRun: config.maintenance.agentSessions.maxLogicalBytesPerRun,
+      },
+      detachedArtifacts: {
+        maxAgeMs: config.maintenance.detachedArtifacts.maxAgeMs,
+        minAgeMs: config.maintenance.detachedArtifacts.minAgeMs,
+        maxArtifacts: config.maintenance.detachedArtifacts.maxArtifacts,
+        maxBytes: config.maintenance.detachedArtifacts.maxBytes,
+        maxArtifactsPerRun: config.maintenance.detachedArtifacts.maxArtifactsPerRun,
+        maxBytesPerRun: config.maintenance.detachedArtifacts.maxBytesPerRun,
+      },
+      schedulerHistory: {
+        outputRetentionMs: config.maintenance.schedulerHistory.outputRetentionMs,
+        occurrenceRetentionMs: config.maintenance.schedulerHistory.occurrenceRetentionMs,
+        acknowledgedInboxRetentionMs: config.maintenance.schedulerHistory.acknowledgedInboxRetentionMs,
+        deletedJobRetentionMs: config.maintenance.schedulerHistory.deletedJobRetentionMs,
+        minOccurrencesPerJob: config.maintenance.schedulerHistory.minOccurrencesPerJob,
+        batchSize: config.maintenance.schedulerHistory.batchSize,
+      },
+    },
   };
 }
 
 function atomicWrite(path: string, contents: string, mode = 0o600): void {
   mkdirSync(configDir(), shouldEnforcePosixPermissions() ? { recursive: true, mode: 0o700 } : { recursive: true });
-  if (!shouldEnforcePosixPermissions()) {
-    writeFileSync(path, contents, "utf8");
-    return;
-  }
   const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  const backup = `${path}.${process.pid}.${randomUUID()}.bak`;
   try {
     writeFileSync(temporary, contents, shouldEnforcePosixPermissions() ? { encoding: "utf8", mode } : "utf8");
     if (shouldEnforcePosixPermissions()) chmodSync(temporary, mode);
-    renameSync(temporary, path);
+    try {
+      renameSync(temporary, path);
+    } catch (error) {
+      if (process.platform !== "win32" || !existsSync(path)) throw error;
+      renameSync(path, backup);
+      try {
+        renameSync(temporary, path);
+        unlinkSync(backup);
+      } catch (replacementError) {
+        try {
+          if (!existsSync(path) && existsSync(backup)) renameSync(backup, path);
+        } catch {
+          // Preserve the replacement failure.
+        }
+        throw replacementError;
+      }
+    }
   } catch (error) {
     try {
       if (existsSync(temporary)) unlinkSync(temporary);
+      if (existsSync(backup) && !existsSync(path)) renameSync(backup, path);
     } catch {
       // Ignore cleanup failures.
     }
@@ -361,6 +630,7 @@ export function writeGlobalConfig(input: PersistedGatewayConfig): string {
     ? existing.gateway as Record<string, unknown>
     : {};
   const provider = input.provider;
+  assertGatewayBaseURL(input.baseURL);
   if (input.apiKeyEnv !== undefined) assertApiKeyEnv(input.apiKeyEnv);
   const previousApiKeyEnv = previousGateway.provider === provider && typeof previousGateway.apiKeyEnv === "string"
     && /^[A-Za-z_][A-Za-z0-9_]*$/.test(previousGateway.apiKeyEnv)
@@ -375,7 +645,27 @@ export function writeGlobalConfig(input: PersistedGatewayConfig): string {
     apiKeyEnv: input.apiKeyEnv ?? previousApiKeyEnv ?? defaultApiKeyEnv(provider),
     ...(typeof previousGateway.timeoutMs === "number" ? { timeoutMs: previousGateway.timeoutMs } : {}),
   };
-  const updated: Record<string, unknown> = { ...existing, gateway };
+  const previousAutomation = sanitizedAutomation(existing.automation, false) ?? {};
+  const incomingAutomation = input.automation === undefined
+    ? undefined
+    : sanitizedAutomation(input.automation, true);
+  const automation = input.automation === undefined
+    ? previousAutomation
+    : sanitizedAutomation({ ...previousAutomation, ...incomingAutomation }, true);
+  const previousMaintenance = sanitizedMaintenance(existing.maintenance, false) ?? {};
+  const incomingMaintenance = input.maintenance === undefined
+    ? undefined
+    : sanitizedMaintenance(input.maintenance, true);
+  const maintenance = mergeMaintenance(
+    mergeMaintenance(DEFAULT_CONFIG.maintenance, previousMaintenance),
+    incomingMaintenance,
+  );
+  const updated: Record<string, unknown> = {
+    ...existing,
+    gateway,
+    maintenance,
+    ...(automation && Object.keys(automation).length > 0 ? { automation } : {}),
+  };
   if (input.model !== undefined) updated.model = input.model;
   atomicWrite(path, `${JSON.stringify(updated, null, 2)}\n`);
   return path;
@@ -394,6 +684,9 @@ export function persistGatewayConfig(input: PersistedGatewayConfig & { apiKey: s
 
 export function writeSchedulerEnv(apiKeyEnv: string, apiKey: string): string {
   assertApiKeyEnv(apiKeyEnv);
+  if (/[\u0000-\u001f\u007f-\u009f]/u.test(apiKey)) {
+    throw new Error("API key must not contain control characters");
+  }
   const path = schedulerEnvPath();
   const lines = existsSync(path)
     ? readFileSync(path, "utf8").replace(/^\uFEFF/, "").split(/\r?\n/).map((line) => line.trim()).filter((line) => {
@@ -402,12 +695,10 @@ export function writeSchedulerEnv(apiKeyEnv: string, apiKey: string): string {
     : [];
   const assignment = apiKeyEnv + "=" + apiKey.replace(/[\r\n]/g, "");
   const escaped = apiKeyEnv.replace(/[.*+?^\\${}()|[\]\\]/g, "\\$&");
-  const index = lines.findIndex((line) => new RegExp("^" + escaped + "=", process.platform === "win32" ? "i" : "").test(line));
-  if (index >= 0) lines[index] = assignment;
-  else {
-    while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
-    lines.push(assignment);
-  }
-  atomicWrite(path, lines.join("\n") + "\n");
+  const pattern = new RegExp("^" + escaped + "=", process.platform === "win32" ? "i" : "");
+  const retained = lines.filter((line) => !pattern.test(line));
+  while (retained.length > 0 && retained[retained.length - 1] === "") retained.pop();
+  retained.push(assignment);
+  atomicWrite(path, retained.join("\n") + "\n");
   return path;
 }

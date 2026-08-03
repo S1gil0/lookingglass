@@ -58,8 +58,30 @@ const INBOX_POLL_MS = 2_000;
 const MODEL_AVAILABILITY_RETRY_MS = 30_000;
 const MAX_TOOL_PREVIEW = 320;
 const ACTIVITY_RENDER_MS = 1_000;
+const INTERRUPT_CONFIRM_MS = 10_000;
+const TRANSCRIPT_EVENT_LIMIT = 1_000;
+const TRANSCRIPT_ENTRY_LIMIT = TRANSCRIPT_EVENT_LIMIT * 2 + 1;
 const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 const DELETE_SELECTION_PREFIX = "\0delete:";
+
+export class RepeatedPressConfirmation {
+  private armedUntil = 0;
+
+  constructor(private readonly windowMs = INTERRUPT_CONFIRM_MS) {}
+
+  press(now = Date.now()): boolean {
+    if (this.armedUntil > 0 && now <= this.armedUntil) {
+      this.reset();
+      return true;
+    }
+    this.armedUntil = now + this.windowMs;
+    return false;
+  }
+
+  reset(): void {
+    this.armedUntil = 0;
+  }
+}
 
 export function defaultGatewayBaseURL(provider: GatewayProvider): string {
   if (provider === "lm-studio") return "http://127.0.0.1:1234/v1";
@@ -150,6 +172,10 @@ function displaySafe(text: string): string {
     .replace(/[\x00-\x08\x0b-\x1f\x7f]/g, (character) => {
       return `\\x${character.charCodeAt(0).toString(16).padStart(2, "0")}`;
     });
+}
+
+function operationStatus(text: string): string {
+  return displaySafe(text).replaceAll("Press Ctrl+C to stop.", "Press Esc twice to stop.");
 }
 
 function oneLine(text: string, limit = MAX_TOOL_PREVIEW): string {
@@ -756,6 +782,7 @@ export class FullHeightRoot extends Container {
   private readonly entries: Component[] = [];
   private transcriptCache: string[] | null = null;
   private transcriptCacheWidth = 0;
+  private readonly transcriptSpans = new Map<Component, { index: number; start: number; count: number }>();
   private scrollFromBottom = 0;
   private lastTranscriptLines = 0;
   private lastWidth = 0;
@@ -765,6 +792,8 @@ export class FullHeightRoot extends Container {
   private selectionFocus: ScreenPoint | null = null;
   private lastFrame: string[] = [];
   private selectableRows = 0;
+  private readonly maxEntries: number;
+  private readonly onEvict: ((component: Component) => void) | undefined;
 
   constructor(
     private readonly terminal: AlternateScreenTerminal,
@@ -772,18 +801,80 @@ export class FullHeightRoot extends Container {
     private readonly taskPlanPanel: TaskPlanPanel,
     private readonly activityText: () => string,
     private readonly metadataText: (width: number) => string,
+    options: { maxEntries?: number; onEvict?: (component: Component) => void } = {},
   ) {
     super();
+    this.maxEntries = typeof options.maxEntries === "number" && Number.isFinite(options.maxEntries)
+      ? Math.max(1, Math.floor(options.maxEntries))
+      : Number.POSITIVE_INFINITY;
+    this.onEvict = options.onEvict;
     this.addChild(editor);
   }
 
   addEntry(component: Component): void {
+    const index = this.entries.length;
     this.entries.push(component);
-    this.invalidateTranscript();
+    if (!this.transcriptCache || this.transcriptCacheWidth <= 0) {
+      this.invalidateTranscript();
+      this.trimEntries();
+      return;
+    }
+    const lines = component.render(this.transcriptCacheWidth)
+      .map((line) => fit(line, this.transcriptCacheWidth));
+    this.transcriptSpans.set(component, {
+      index,
+      start: this.transcriptCache.length,
+      count: lines.length,
+    });
+    this.transcriptCache.push(...lines);
+    this.trimEntries();
+  }
+
+  refreshEntry(component: Component): void {
+    if (!this.transcriptCache || this.transcriptCacheWidth <= 0) return;
+    const span = this.transcriptSpans.get(component);
+    if (!span) {
+      if (!this.entries.includes(component)) return;
+      this.invalidateTranscript();
+      return;
+    }
+    const lines = component.render(this.transcriptCacheWidth)
+      .map((line) => fit(line, this.transcriptCacheWidth));
+    this.transcriptCache.splice(span.start, span.count, ...lines);
+    const delta = lines.length - span.count;
+    span.count = lines.length;
+    if (delta === 0) return;
+    for (let index = span.index + 1; index < this.entries.length; index += 1) {
+      const following = this.transcriptSpans.get(this.entries[index]!);
+      if (following) following.start += delta;
+    }
   }
 
   invalidateTranscript(): void {
     this.transcriptCache = null;
+    this.transcriptSpans.clear();
+  }
+
+  private trimEntries(): void {
+    const excess = this.entries.length - this.maxEntries;
+    if (excess <= 0) return;
+    const removed = this.entries.splice(0, excess);
+    let removedLines = 0;
+    for (const entry of removed) {
+      removedLines += this.transcriptSpans.get(entry)?.count ?? 0;
+      this.transcriptSpans.delete(entry);
+      entry.invalidate();
+      this.onEvict?.(entry);
+    }
+    if (!this.transcriptCache) return;
+    this.transcriptCache.splice(0, removedLines);
+    this.lastTranscriptLines = Math.max(0, this.lastTranscriptLines - removedLines);
+    for (const [index, entry] of this.entries.entries()) {
+      const span = this.transcriptSpans.get(entry);
+      if (!span) continue;
+      span.index = index;
+      span.start -= removedLines;
+    }
   }
 
   clearTranscript(): void {
@@ -889,7 +980,14 @@ export class FullHeightRoot extends Container {
     this.viewportRows = Math.max(0, height - editorLines.length - taskPlanLines.length - 2);
 
     if (!this.transcriptCache || this.transcriptCacheWidth !== safeWidth) {
-      this.transcriptCache = this.entries.flatMap((entry) => entry.render(safeWidth).map((line) => fit(line, safeWidth)));
+      const transcript: string[] = [];
+      this.transcriptSpans.clear();
+      for (const [index, entry] of this.entries.entries()) {
+        const lines = entry.render(safeWidth).map((line) => fit(line, safeWidth));
+        this.transcriptSpans.set(entry, { index, start: transcript.length, count: lines.length });
+        transcript.push(...lines);
+      }
+      this.transcriptCache = transcript;
       this.transcriptCacheWidth = safeWidth;
     }
     const transcript = this.transcriptCache;
@@ -1398,6 +1496,8 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
   let unavailableModelKey: string | null = null;
   let nextModelAvailabilityCheckAt = 0;
   let resolveStopped: (() => void) | null = null;
+  const exitConfirmation = new RepeatedPressConfirmation();
+  const cancelConfirmation = new RepeatedPressConfirmation();
   const stopped = new Promise<void>((resolve) => {
     resolveStopped = resolve;
   });
@@ -1411,7 +1511,18 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
   );
   const editor = new TurnEditor(tui, editorTheme, { paddingX: 1, autocompleteMaxVisible: 7 });
   const taskPlanPanel = new TaskPlanPanel();
-  const root = new FullHeightRoot(terminal, editor, taskPlanPanel, activityText, metadataText);
+  const root = new FullHeightRoot(terminal, editor, taskPlanPanel, activityText, metadataText, {
+    maxEntries: TRANSCRIPT_ENTRY_LIMIT,
+    onEvict(component) {
+      if (component instanceof ToolCard && toolCards.get(component.callId) === component) {
+        toolCards.delete(component.callId);
+      }
+      if (component instanceof StreamingAssistant) {
+        streaming.delete(component);
+        component.dispose();
+      }
+    },
+  });
   tui.addChild(root);
   tui.setFocus(editor);
   tui.setClearOnShrink(true);
@@ -1419,8 +1530,9 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
   const requestRender = (): void => {
     if (!stopping) tui.requestRender();
   };
-  const requestTranscriptRender = (): void => {
-    root.invalidateTranscript();
+  const requestTranscriptRender = (component?: Component): void => {
+    if (component) root.refreshEntry(component);
+    else root.invalidateTranscript();
     requestRender();
   };
 
@@ -1590,7 +1702,16 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
     taskPlanPanel.setSnapshot(null);
     root.clearTranscript();
     toolCards.clear();
-    for (const event of app.sessions.events(session.id)) {
+    const eventCount = app.sessions.eventCount(session.id);
+    const events = app.sessions.recentEvents(session.id, TRANSCRIPT_EVENT_LIMIT);
+    if (eventCount > events.length) {
+      root.addEntry(new Notice(
+        "history",
+        `Showing the latest ${events.length} of ${eventCount} transcript events. Older events remain stored and available to the model.`,
+        cyan,
+      ));
+    }
+    for (const event of events) {
       if (event.kind === "user") {
         const text = userText(event);
         if (text) root.addEntry(new UserMessage(text));
@@ -1639,14 +1760,16 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
     return {
       onResponseStart(round) {
         currentAssistant?.flush();
-        currentAssistant = new StreamingAssistant(requestTranscriptRender);
+        const assistant = new StreamingAssistant(() => requestTranscriptRender(assistant));
+        currentAssistant = assistant;
         streaming.add(currentAssistant);
         add(currentAssistant);
         if (round > 0) engineStatus = `Response round ${round + 1}`;
       },
       onTextDelta(delta) {
         if (!currentAssistant) {
-          currentAssistant = new StreamingAssistant(requestTranscriptRender);
+          const assistant = new StreamingAssistant(() => requestTranscriptRender(assistant));
+          currentAssistant = assistant;
           streaming.add(currentAssistant);
           add(currentAssistant);
         }
@@ -1656,7 +1779,7 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
         add(new ReasoningSummary(summary));
       },
       onStatus(status) {
-        engineStatus = displaySafe(status);
+        engineStatus = operationStatus(status);
         requestRender();
       },
       onWarning(message) {
@@ -1675,8 +1798,10 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
       },
       onToolProgress(notice) {
         const card = toolCards.get(notice.callId);
-        if (card && notice.output) card.progress(notice.output);
-        requestTranscriptRender();
+        if (card && notice.output) {
+          card.progress(notice.output);
+          requestTranscriptRender(card);
+        }
       },
       onToolFinish(notice) {
         let card = toolCards.get(notice.callId);
@@ -1690,12 +1815,13 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
           taskPlanPanel.setSnapshot(app.sessions.latestTaskPlan(session.id));
           requestRender();
         }
-        requestTranscriptRender();
+        requestTranscriptRender(card);
       },
     };
   };
 
   const beginOperation = (status: string): AbortController => {
+    cancelConfirmation.reset();
     activeOperation = true;
     activeController = new AbortController();
     engineStatus = status;
@@ -1706,6 +1832,7 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
   };
 
   const endOperation = (): void => {
+    cancelConfirmation.reset();
     activeController = null;
     activeOperation = false;
     engineStatus = "Ready";
@@ -2588,6 +2715,8 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
   function requestStop(): void {
     if (stopping) return;
     stopping = true;
+    exitConfirmation.reset();
+    cancelConfirmation.reset();
     cancelActiveInteraction();
     if (pollTimer) clearInterval(pollTimer);
     if (activityTimer) clearInterval(activityTimer);
@@ -2650,11 +2779,26 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
     if (matchesKey(data, Key.ctrl("c"))) {
       root.clearSelection();
       selectionDragging = false;
-      if (activeOperation) {
-        activeController?.abort();
-        activeModal?.cancel();
-      } else {
+      cancelConfirmation.reset();
+      if (exitConfirmation.press()) {
         requestStop();
+      } else {
+        addNotice(
+          "exit",
+          activeOperation
+            ? "Press Ctrl+C again within 10 seconds to exit and stop the active operation."
+            : "Press Ctrl+C again within 10 seconds to exit.",
+          yellow,
+        );
+      }
+      return { consume: true };
+    }
+    if (activeOperation && matchesKey(data, Key.escape)) {
+      exitConfirmation.reset();
+      if (cancelConfirmation.press()) {
+        cancelActiveInteraction();
+      } else {
+        addNotice("stop", "Press Esc again within 10 seconds to stop the active operation.", yellow);
       }
       return { consume: true };
     }

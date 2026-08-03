@@ -6,6 +6,8 @@ import { ToolPreflightError, type ToolRegistry } from "../tools/registry.js";
 import type { AgentBatchRunner, AgentTaskInput, RunAgentsArgs } from "../tools/agents.js";
 import type { ToolContext, ToolResult } from "../tools/types.js";
 import { ConversationEngine } from "../engine/engine.js";
+import { AutomatedTurnTimeoutError, type ProviderRetryBudgetOptions } from "../retry.js";
+import { configuredCredentialValues, redactSensitiveText } from "../security.js";
 
 interface AgentTaskResult {
   id: string;
@@ -15,6 +17,7 @@ interface AgentTaskResult {
   reasoningEffort: string;
   text?: string;
   error?: string;
+  code?: string;
 }
 
 const LEAF_INSTRUCTIONS = `You are a leaf coding agent delegated one self-contained task by a parent model.
@@ -36,6 +39,12 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function errorCode(error: unknown): string | undefined {
+  if (!error || typeof error !== "object" || !("code" in error)) return undefined;
+  const value = (error as { code?: unknown }).code;
+  return typeof value === "string" && /^[A-Za-z][A-Za-z0-9_.:-]{0,63}$/u.test(value) ? value : undefined;
+}
+
 function progressDetail(value: string | undefined): string | undefined {
   if (!value) return undefined;
   const compact = value.replace(/\s+/gu, " ").trim();
@@ -50,9 +59,9 @@ function reportAgentAction(
   detail?: string,
 ): void {
   const suffix = progressDetail(detail);
-  context.reportProgress?.(
-    `${identity} | agent ${JSON.stringify(taskId)} [${action}]${suffix ? `: ${suffix}` : ""}`,
-  );
+  const message = `${identity} | agent ${JSON.stringify(taskId)} [${action}]${suffix ? `: ${suffix}` : ""}`;
+  context.reportProgress?.(redactSensitiveText(message, configuredCredentialValues(context.config))
+    .replace(/[\u0000-\u001f\u007f-\u009f]+/gu, " "));
 }
 
 function utf8Prefix(text: string, maxBytes: number): string {
@@ -78,7 +87,12 @@ export class AgentCoordinator implements AgentBatchRunner {
     private readonly clientFor: (provider: GatewayProvider) => CodexLbClient,
     private readonly workerTools: ToolRegistry,
     private readonly instructions: string | (() => string),
-    private readonly modelFor: (id: string, provider: GatewayProvider, signal?: AbortSignal) => Promise<GatewayModel>,
+    private readonly modelFor: (
+      id: string,
+      provider: GatewayProvider,
+      signal?: AbortSignal,
+      retryBudget?: ProviderRetryBudgetOptions,
+    ) => Promise<GatewayModel>,
   ) {}
 
   private createEngine(): ConversationEngine {
@@ -104,10 +118,24 @@ export class AgentCoordinator implements AgentBatchRunner {
     if (!parent) throw new ToolPreflightError(`Parent session not found: ${context.sessionId}`);
     let model: GatewayModel;
     try {
-      model = await this.modelFor(parent.agentModel, parent.agentProvider, context.signal);
+      model = await this.modelFor(
+        parent.agentModel,
+        parent.agentProvider,
+        context.signal,
+        {
+          maxAttempts: this.config.automation.providerRetryMaxAttempts,
+          maxElapsedMs: this.config.automation.providerRetryMaxElapsedMs,
+        },
+      );
     } catch (error) {
       if (context.signal.aborted) throw error;
-      throw new ToolPreflightError(`Agent model could not be resolved: ${errorMessage(error)}`);
+      throw new ToolPreflightError(
+        `Agent model could not be resolved: ${redactSensitiveText(
+          errorMessage(error),
+          configuredCredentialValues(this.config),
+        )}`,
+        errorCode(error),
+      );
     }
     const concurrency = Math.min(args.concurrency ?? 4, args.tasks.length);
     const results = new Array<AgentTaskResult>(args.tasks.length);
@@ -134,9 +162,17 @@ export class AgentCoordinator implements AgentBatchRunner {
         parentSessionId: parent.id,
       });
       this.sessions.rename(child.id, `Agent ${task.id}`);
+      const timeoutMs = this.config.automation?.agentTurnTimeoutMs ?? 45 * 60_000;
+      const timeout = new AbortController();
+      let timedOut = false;
+      const timeoutTimer = setTimeout(() => {
+        timedOut = true;
+        timeout.abort(new AutomatedTurnTimeoutError(timeoutMs));
+      }, timeoutMs);
+      const childSignal = AbortSignal.any([context.signal, timeout.signal]);
       try {
         const turn = await this.createEngine().turn(child.id, taskPrompt(task), {
-          signal: context.signal,
+          signal: childSignal,
           interaction: {
             approve: async () => "deny",
             ask: async () => "",
@@ -170,6 +206,7 @@ export class AgentCoordinator implements AgentBatchRunner {
           readOnly: context.readOnly || parent.approvalMode === "review",
           authorizationSessionId: context.authorizationSessionId ?? parent.id,
         });
+        if (timedOut) throw timeout.signal.reason ?? new AutomatedTurnTimeoutError(timeoutMs);
         results[index] = {
           id: task.id,
           childSessionId: child.id,
@@ -181,15 +218,25 @@ export class AgentCoordinator implements AgentBatchRunner {
         reportAgentAction(context, identity, task.id, "done");
       } catch (error) {
         if (context.signal.aborted) throw error;
+        const timeoutError = timedOut || error instanceof AutomatedTurnTimeoutError;
+        const code = timeoutError ? "automated_turn_timeout" : errorCode(error);
+        const message = timeoutError
+          ? "Automated leaf task timed out."
+          : redactSensitiveText(errorMessage(error), configuredCredentialValues(this.config))
+            .replace(/[\u0000-\u001f\u007f-\u009f]+/gu, " ").trim().slice(0, 512)
+            || "Automated leaf task failed.";
         results[index] = {
           id: task.id,
           childSessionId: child.id,
           status: "failed",
           model: `${model.provider}:${model.id}`,
           reasoningEffort: parent.agentReasoningEffort,
-          error: errorMessage(error),
+          error: message,
+          ...(code ? { code } : {}),
         };
-        reportAgentAction(context, identity, task.id, "failed", errorMessage(error));
+        reportAgentAction(context, identity, task.id, timeoutError ? "timed out" : "failed", message);
+      } finally {
+        clearTimeout(timeoutTimer);
       }
     };
     const workers = Array.from({ length: concurrency }, async () => {
@@ -205,16 +252,16 @@ export class AgentCoordinator implements AgentBatchRunner {
     context.signal.throwIfAborted();
     const failedWorker = settled.find((result): result is PromiseRejectedResult => result.status === "rejected");
     if (failedWorker) throw failedWorker.reason;
-    const fullOutput = [
+    const fullOutput = redactSensitiveText([
       `Agent batch completed with ${model.provider}:${model.id} | reasoning ${parent.agentReasoningEffort}`,
       ...results.map((result) => [
         `\n## ${result.id} [${result.status}]`,
         `child_session_id: ${result.childSessionId}`,
         `model: ${result.model}`,
         `reasoning: ${result.reasoningEffort}`,
-        result.status === "succeeded" ? result.text : `error: ${result.error}`,
+        result.status === "succeeded" ? result.text : `error${result.code ? ` [${result.code}]` : ""}: ${result.error}`,
       ].join("\n")),
-    ].join("\n");
+    ].join("\n"), configuredCredentialValues(this.config));
     const limit = this.config.tools.maxOutputBytes;
     if (Buffer.byteLength(fullOutput) <= limit) {
       return { output: fullOutput, metadata: { agentTasksAttempted: attempted } };

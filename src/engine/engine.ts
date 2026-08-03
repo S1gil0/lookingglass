@@ -7,7 +7,7 @@ import { randomUUID } from "node:crypto";
 import type { CodexLbClient } from "../model/codex-lb.js";
 import { isStaleResponseError } from "../model/codex-lb.js";
 import type { ArtifactStore } from "../storage/artifact-store.js";
-import type { SessionStore } from "../storage/session-store.js";
+import type { OperationLeaseState, SessionStore } from "../storage/session-store.js";
 import type { GatewayProvider, GlassConfig, ModelInfo, SessionRecord } from "../types.js";
 import type { SessionPromptReservation } from "../scheduler/types.js";
 import type { ApprovalDecision, ApprovalRequest, QuestionRequest, ToolContext, ToolResult } from "../tools/types.js";
@@ -17,13 +17,86 @@ import { formatTaskPlanInstructions } from "../task-plan.js";
 import { projectContext } from "./context.js";
 import { configuredCredentialValues, redactSensitiveText, redactSensitiveValue } from "../security.js";
 import { isTransientProviderError } from "../errors.js";
-import { abortableRetryDelay, waitForTransientRetry, type RetryDelay } from "../retry.js";
+import {
+  abortableRetryDelay,
+  AutomatedTurnTimeoutError,
+  composeRetryBudgetSignal,
+  createRetryBudget,
+  markRetryAttempt,
+  retryBudgetCanRetry,
+  retryBudgetError,
+  retryBudgetExpired,
+  waitForTransientRetry,
+  type RetryDelay,
+} from "../retry.js";
 import type {
   StoredErrorPayload,
   StoredResponsePayload,
-  StoredToolResultPayload,
   StoredUserPayload,
 } from "./types.js";
+
+const OPERATION_LEASE_MS = 30_000;
+const OPERATION_HEARTBEAT_MS = Math.max(1, Math.floor(OPERATION_LEASE_MS / 3));
+
+export type SessionOperationLeaseLossPhase =
+  | "reserved operation assertion"
+  | "operation acquisition"
+  | "heartbeat renewal"
+  | "final assertion"
+  | "continuity recovery"
+  | "recording the user message"
+  | "recording the response"
+  | "saving compacted context"
+  | "stale-anchor recovery"
+  | "tool execution assertion"
+  | "tool reconciliation"
+  | "tool state persistence";
+
+export interface SessionOperationLeaseLossDiagnostic {
+  phase: SessionOperationLeaseLossPhase;
+  kind: Exclude<OperationLeaseState["kind"], "active">;
+  leaseMs: number;
+  heartbeatMs: number;
+  leaseDurationMs: number | null;
+  renewalAgeMs: number | null;
+  expiryOffsetMs: number | null;
+}
+
+/** Format only safe lease classification and timing data for operator-facing errors. */
+export function formatOperationLeaseLoss(diagnostic: SessionOperationLeaseLossDiagnostic): string {
+  const timing = [
+    `lease duration ${diagnostic.leaseMs}ms`,
+    `heartbeat every ${diagnostic.heartbeatMs}ms`,
+    ...(diagnostic.leaseDurationMs !== null && diagnostic.leaseDurationMs !== diagnostic.leaseMs
+      ? [`observed duration ${diagnostic.leaseDurationMs}ms`]
+      : []),
+    ...(diagnostic.renewalAgeMs !== null ? [`last renewal ${diagnostic.renewalAgeMs}ms ago`] : []),
+  ].join("; ");
+  const detail = diagnostic.kind === "expired"
+    ? `the same lease expired ${Math.max(0, -(diagnostic.expiryOffsetMs ?? 0))}ms ago`
+    : diagnostic.kind === "missing"
+      ? "the lease row is missing"
+      : "lease ownership changed and the previous lease was replaced";
+  return `Session operation lease lost during ${diagnostic.phase}: ${detail} (${timing}). Retry the operation.`;
+}
+
+export class SessionOperationLeaseError extends Error {
+  readonly code = "session_operation_lease_lost";
+
+  constructor(readonly diagnostic: SessionOperationLeaseLossDiagnostic) {
+    super(formatOperationLeaseLoss(diagnostic));
+    this.name = "SessionOperationLeaseError";
+  }
+}
+
+function formatLeaseUnavailable(phase: SessionOperationLeaseLossPhase): string {
+  return `Session operation lease could not be verified during ${phase}; the operation stopped to preserve lease fencing `
+    + `(lease duration ${OPERATION_LEASE_MS}ms; heartbeat every ${OPERATION_HEARTBEAT_MS}ms). Retry the operation.`;
+}
+
+function isStoreLeaseLoss(error: unknown): boolean {
+  return /^Session operation lease was lost\b/u.test(errorMessage(error));
+}
 
 export interface ToolExecutionNotice {
   callId: string;
@@ -76,6 +149,9 @@ export interface TurnMetrics {
   responseStatus: string;
   refusalNotice?: string;
   incompleteReason?: string;
+  providerRetries?: number;
+  termination?: string;
+  errorCode?: string;
   durationMs: number;
 }
 
@@ -89,6 +165,9 @@ interface TurnMetricsState {
   responseStatus?: string;
   refusalNotice?: string;
   incompleteReason?: string;
+  providerRetries: number;
+  termination?: string;
+  errorCode?: string;
 }
 
 function userItem(text: string): ResponseInputItem {
@@ -128,7 +207,7 @@ function errorMessage(error: unknown): string {
 function errorCode(error: unknown): string | undefined {
   if (!error || typeof error !== "object" || !("code" in error)) return undefined;
   const value = (error as { code?: unknown }).code;
-  return typeof value === "string" ? value : undefined;
+  return typeof value === "string" && /^[A-Za-z][A-Za-z0-9_.:-]{0,63}$/u.test(value) ? value : undefined;
 }
 
 function errorField(error: unknown, field: string): string | undefined {
@@ -271,16 +350,27 @@ export class ConversationEngine {
       toolCalls: 0,
       leafAgents: 0,
       compactions: 0,
+      providerRetries: 0,
     };
     try {
       const result = await this.withOperationLease(sessionId, "turn", options.signal, async (signal, executionToken) => {
         return this.turnLocked(sessionId, text, { ...options, signal }, executionToken, state);
       }, reservation);
+      state.termination = "completed";
       const metrics = this.completeMetrics(state, startedAt, state.responseStatus ?? result.response.status ?? "completed");
       this.notifyTurnComplete(options.callbacks, metrics);
       return { ...result, metrics };
     } catch (error) {
       state.responseStatus = failedResponseStatus(error);
+      const code = errorCode(error);
+      if (code) state.errorCode = code;
+      state.termination = state.errorCode === "automated_turn_timeout"
+        ? "timed_out"
+        : options.signal.aborted
+          ? "cancelled"
+          : state.errorCode === "automated_provider_retry_exhausted"
+            ? "retry_exhausted"
+            : "failed";
       const incompleteReason = errorField(error, "incompleteReason");
       if (incompleteReason) state.incompleteReason = boundedNotice(
         incompleteReason,
@@ -302,6 +392,9 @@ export class ConversationEngine {
       responseStatus,
       ...(state.refusalNotice ? { refusalNotice: state.refusalNotice } : {}),
       ...(state.incompleteReason ? { incompleteReason: state.incompleteReason } : {}),
+      ...(state.providerRetries > 0 ? { providerRetries: state.providerRetries } : { providerRetries: 0 }),
+      ...(state.termination ? { termination: state.termination } : {}),
+      ...(state.errorCode ? { errorCode: state.errorCode } : {}),
       durationMs: Math.max(0, Date.now() - startedAt),
     };
   }
@@ -321,10 +414,17 @@ export class ConversationEngine {
     executionToken: string,
     metrics: TurnMetricsState,
   ): Promise<TurnResult> {
-    this.store.reconcileToolCallEvents(sessionId, executionToken);
+    try {
+      this.store.reconcileToolCallEvents(sessionId, executionToken);
+    } catch (error) {
+      if (isStoreLeaseLoss(error)) {
+        throw this.operationLeaseError(sessionId, executionToken, "tool reconciliation");
+      }
+      throw this.operationLeaseUnavailableError("tool reconciliation");
+    }
     if (this.store.hasUnanchoredContext(sessionId) && this.store.get(sessionId)?.lastResponseId) {
       if (!this.store.resetContinuityFenced(sessionId, executionToken)) {
-        throw new Error("Session operation lease was lost during continuity recovery");
+        throw this.operationLeaseError(sessionId, executionToken, "continuity recovery");
       }
     }
     const session = this.requireSession(sessionId);
@@ -335,7 +435,7 @@ export class ConversationEngine {
     if (!this.store.appendUserAndSetTitleFenced<StoredUserPayload>(
       sessionId, executionToken, storedText, { item: userItem(storedText) },
     )) {
-      throw new Error("Session operation lease was lost before recording the user message");
+      throw this.operationLeaseError(sessionId, executionToken, "recording the user message");
     }
 
     const responseContinuity = client.supportsResponseContinuity?.() !== false;
@@ -385,7 +485,7 @@ export class ConversationEngine {
           },
         };
         if (!this.store.appendResponseAndSetContinuityFenced(sessionId, executionToken, payload, response.id)) {
-          throw new Error("Session operation lease was lost before recording the response");
+          throw this.operationLeaseError(sessionId, executionToken, "recording the response");
         }
         if (reasoningSummary) options.callbacks?.onReasoningSummary?.(reasoningSummary);
 
@@ -428,6 +528,11 @@ export class ConversationEngine {
       }
       throw new Error(`Stopped after ${this.config.tools.maxToolRounds} tool rounds`);
     } catch (error) {
+      if (!(error instanceof SessionOperationLeaseError)
+        && errorCode(error) !== "session_operation_lease_unavailable"
+        && isStoreLeaseLoss(error)) {
+        throw this.operationLeaseError(sessionId, executionToken, "tool state persistence");
+      }
       const code = errorCode(error);
       const payload: StoredErrorPayload = {
         message: redactSensitiveText(errorMessage(error), secrets),
@@ -439,7 +544,7 @@ export class ConversationEngine {
     }
   }
 
-  async compactNow(sessionId: string, options: Pick<TurnOptions, "signal" | "callbacks">): Promise<void> {
+  async compactNow(sessionId: string, options: Pick<TurnOptions, "signal" | "callbacks" | "automated">): Promise<void> {
     return this.withOperationLease(sessionId, "compact", options.signal, async (signal, executionToken) => {
       return this.compactLocked(sessionId, { ...options, signal }, executionToken);
     });
@@ -447,7 +552,7 @@ export class ConversationEngine {
 
   private async compactLocked(
     sessionId: string,
-    options: Pick<TurnOptions, "signal" | "callbacks">,
+    options: Pick<TurnOptions, "signal" | "callbacks" | "automated">,
     executionToken: string,
     metrics?: TurnMetricsState,
     essential = true,
@@ -455,26 +560,49 @@ export class ConversationEngine {
     const session = this.requireSession(sessionId);
     const context = projectContext(this.store, sessionId);
     if (context.input.length === 0) return;
-    let retryAttempt = 0;
+    const retryBudget = createRetryBudget(options.automated
+      ? {
+          maxAttempts: this.config.automation.providerRetryMaxAttempts,
+          maxElapsedMs: this.config.automation.providerRetryMaxElapsedMs,
+        }
+      : undefined);
+    const budgetSignal = composeRetryBudgetSignal(options.signal, retryBudget);
     let compact: Awaited<ReturnType<CodexLbClient["compact"]>>;
-    while (true) {
-      options.signal.throwIfAborted();
-      options.callbacks?.onStatus?.("Compacting context");
-      try {
-        compact = await this.clientFor(session.provider).compact({
-          model: session.model,
-          instructions: this.instructionsFor(session),
-          input: context.input,
-          promptCacheKey: session.promptCacheKey,
-          fast: session.fast,
-          signal: options.signal,
-        });
-        break;
-      } catch (error) {
-        if (!essential || options.signal.aborted || !isTransientProviderError(error)) throw error;
-        retryAttempt += 1;
-        await this.waitForRetry(options.callbacks, options.signal, retryAttempt);
+    try {
+      while (true) {
+        options.signal.throwIfAborted();
+        if (budgetSignal.signal.aborted) throw retryBudgetError(retryBudget);
+        if (!retryBudgetCanRetry(retryBudget)) {
+          throw retryBudgetError(retryBudget);
+        }
+        const attempt = markRetryAttempt(retryBudget);
+        options.callbacks?.onStatus?.("Compacting context");
+        try {
+          compact = await this.clientFor(session.provider).compact({
+            model: session.model,
+            instructions: this.instructionsFor(session),
+            input: context.input,
+            promptCacheKey: session.promptCacheKey,
+            fast: session.fast,
+            signal: budgetSignal.signal,
+          });
+          budgetSignal.signal.throwIfAborted();
+          if (retryBudgetExpired(retryBudget)) throw retryBudgetError(retryBudget);
+          break;
+        } catch (error) {
+          if (options.signal.aborted) throw options.signal.reason ?? error;
+          if (budgetSignal.signal.aborted) throw retryBudgetError(retryBudget);
+          if (isStoreLeaseLoss(error) || errorCode(error) === "session_operation_lease_lost") throw error;
+          if (!isTransientProviderError(error)) throw error;
+          if (!essential) throw error;
+          if (!retryBudgetCanRetry(retryBudget)) throw retryBudgetError(retryBudget);
+          retryBudget.retries += 1;
+          if (metrics) metrics.providerRetries += 1;
+          await this.waitForRetry(options.callbacks, options.signal, attempt, retryBudget);
+        }
       }
+    } finally {
+      budgetSignal.dispose();
     }
     const usage = compact.usage;
     const inputTokens = usage && typeof usage === "object" && !Array.isArray(usage)
@@ -484,7 +612,7 @@ export class ConversationEngine {
     if (!this.store.saveCheckpointAndResetContinuityFenced(
       sessionId, executionToken, context.latestSequence, compact, inputTokens,
     )) {
-      throw new Error("Session operation lease was lost before saving the compacted context");
+      throw this.operationLeaseError(sessionId, executionToken, "saving compacted context");
     }
     if (metrics) metrics.compactions += 1;
     options.callbacks?.onStatus?.("Context compacted");
@@ -494,8 +622,21 @@ export class ConversationEngine {
     callbacks: EngineCallbacks | undefined,
     signal: AbortSignal,
     attempt: number,
+    budget?: ReturnType<typeof createRetryBudget>,
   ): Promise<void> {
-    await waitForTransientRetry(signal, attempt, callbacks?.onStatus, this.delay);
+    await waitForTransientRetry(
+      signal,
+      attempt,
+      callbacks?.onStatus,
+      this.delay,
+      budget
+        ? {
+            maxAttempts: budget.maxAttempts,
+            maxElapsedMs: budget.maxElapsedMs,
+            startedAt: budget.startedAt,
+          }
+        : undefined,
+    );
   }
 
   private async requestWithRecovery(
@@ -512,7 +653,13 @@ export class ConversationEngine {
     let compacted = false;
     let contextRecoveryUsed = false;
     let staleRecoveryUsed = false;
-    let retryAttempt = 0;
+    const retryBudget = createRetryBudget(options.automated
+      ? {
+          maxAttempts: this.config.automation.providerRetryMaxAttempts,
+          maxElapsedMs: this.config.automation.providerRetryMaxElapsedMs,
+        }
+      : undefined);
+    const budgetSignal = composeRetryBudgetSignal(options.signal, retryBudget);
     let visibleText = false;
 
     const streamAttempt = async (): Promise<Response> => {
@@ -544,8 +691,8 @@ export class ConversationEngine {
           fast: currentSession.fast,
           ...(currentPreviousResponseId ? { previousResponseId: currentPreviousResponseId } : {}),
           signal: currentPreviousResponseId
-            ? AbortSignal.any([options.signal, anchorAbort.signal])
-            : options.signal,
+            ? AbortSignal.any([budgetSignal.signal, anchorAbort.signal])
+            : budgetSignal.signal,
         }, {
           ...options.callbacks,
           onTextDelta: (delta) => {
@@ -566,42 +713,59 @@ export class ConversationEngine {
       }
     };
 
-    while (true) {
-      try {
-        const streamed = await streamAttempt();
-        return { response: streamed, compacted };
-      } catch (error) {
-        if (!visibleText && isContextOverflowError(error) && !contextRecoveryUsed && !options.signal.aborted) {
-          contextRecoveryUsed = true;
-          options.callbacks?.onStatus?.("Recovering context overflow");
-          await this.compactLocked(session.id, options, executionToken, metrics);
-          currentSession = this.requireSession(session.id);
-          currentInput = projectContext(this.store, session.id).input;
-          currentPreviousResponseId = undefined;
-          compacted = true;
-          continue;
+    try {
+      while (true) {
+        options.signal.throwIfAborted();
+        if (budgetSignal.signal.aborted) throw retryBudgetError(retryBudget);
+        if (!retryBudgetCanRetry(retryBudget)) {
+          throw retryBudgetError(retryBudget);
         }
-        if (!visibleText && currentPreviousResponseId
-          && !staleRecoveryUsed
-          && isStaleResponseError(error, true)
-          && !options.signal.aborted) {
-          staleRecoveryUsed = true;
-          options.callbacks?.onStatus?.("Recovering conversation context");
-          const context = projectContext(this.store, session.id);
-          const recoverySession = this.store.resetContinuityFenced(session.id, executionToken);
-          if (!recoverySession) throw new Error("Session operation lease was lost during stale-anchor recovery");
-          currentSession = recoverySession;
-          currentInput = context.input;
-          currentPreviousResponseId = undefined;
-          continue;
+        markRetryAttempt(retryBudget);
+        try {
+          const streamed = await streamAttempt();
+          budgetSignal.signal.throwIfAborted();
+          if (retryBudgetExpired(retryBudget)) throw retryBudgetError(retryBudget);
+          return { response: streamed, compacted };
+        } catch (error) {
+          if (options.signal.aborted) throw options.signal.reason ?? error;
+          if (budgetSignal.signal.aborted) throw retryBudgetError(retryBudget);
+          if (isStoreLeaseLoss(error) || errorCode(error) === "session_operation_lease_lost") throw error;
+          if (!visibleText && isContextOverflowError(error) && !contextRecoveryUsed && !options.signal.aborted) {
+            contextRecoveryUsed = true;
+            options.callbacks?.onStatus?.("Recovering context overflow");
+            await this.compactLocked(session.id, options, executionToken, metrics);
+            currentSession = this.requireSession(session.id);
+            currentInput = projectContext(this.store, session.id).input;
+            currentPreviousResponseId = undefined;
+            compacted = true;
+            continue;
+          }
+          if (!visibleText && currentPreviousResponseId
+            && !staleRecoveryUsed
+            && isStaleResponseError(error, true)
+            && !options.signal.aborted) {
+            staleRecoveryUsed = true;
+            options.callbacks?.onStatus?.("Recovering conversation context");
+            const context = projectContext(this.store, session.id);
+            const recoverySession = this.store.resetContinuityFenced(session.id, executionToken);
+            if (!recoverySession) throw this.operationLeaseError(session.id, executionToken, "stale-anchor recovery");
+            currentSession = recoverySession;
+            currentInput = context.input;
+            currentPreviousResponseId = undefined;
+            continue;
+          }
+          if (!visibleText && !options.signal.aborted && isTransientProviderError(error)) {
+            if (!retryBudgetCanRetry(retryBudget)) throw retryBudgetError(retryBudget);
+            retryBudget.retries += 1;
+            metrics.providerRetries += 1;
+            await this.waitForRetry(options.callbacks, options.signal, retryBudget.attempts, retryBudget);
+            continue;
+          }
+          throw error;
         }
-        if (!visibleText && !options.signal.aborted && isTransientProviderError(error)) {
-          retryAttempt += 1;
-          await this.waitForRetry(options.callbacks, options.signal, retryAttempt);
-          continue;
-        }
-        throw error;
       }
+    } finally {
+      budgetSignal.dispose();
     }
   }
 
@@ -751,8 +915,14 @@ export class ConversationEngine {
     };
 
     try {
-      if (!this.store.assertOperationToken(sessionId, executionToken)) {
-        throw new Error("Session operation lease was lost before tool execution");
+      let tokenCheck;
+      try {
+        tokenCheck = this.store.assertOperationTokenChecked(sessionId, executionToken);
+      } catch {
+        throw this.operationLeaseUnavailableError("tool execution assertion");
+      }
+      if (!tokenCheck.ok) {
+        throw this.operationLeaseErrorFromState("tool execution assertion", tokenCheck.state);
       }
       options.signal.throwIfAborted();
       const result = await this.tools.execute(call.name, args, context);
@@ -763,14 +933,32 @@ export class ConversationEngine {
         }
       }
       if (options.signal.aborted) {
+        const interruption = options.signal.reason instanceof Error
+          ? options.signal.reason
+          : new Error("Tool execution was interrupted; its outcome is unknown");
+        if (interruption instanceof AutomatedTurnTimeoutError) {
+          Object.assign(interruption, { uncertainSideEffects: true });
+        }
         this.persistUnknownToolOutput(sessionId, call, executionToken, options);
-        throw new Error("Tool execution was interrupted; its outcome is unknown");
+        throw interruption;
       }
       return this.persistToolOutput(
         sessionId, call, executionToken, "completed", result.output, null, result, false, options,
       );
     } catch (error) {
+      if (error instanceof SessionOperationLeaseError
+        || errorCode(error) === "session_operation_lease_unavailable") throw error;
+      if (isStoreLeaseLoss(error)) {
+        throw this.operationLeaseError(sessionId, executionToken, "tool state persistence");
+      }
       if (options.signal.aborted) {
+        if (error instanceof AutomatedTurnTimeoutError
+          && this.store.getToolCall(sessionId, call.call_id)?.state === "started") {
+          // The tool may have crossed its side-effect boundary before the
+          // deadline reached durable reconciliation. Preserve that uncertainty
+          // for scheduled runners instead of claiming a clean timeout.
+          Object.assign(error, { uncertainSideEffects: true });
+        }
         if (this.store.getToolCall(sessionId, call.call_id)?.state === "started") {
           this.persistUnknownToolOutput(sessionId, call, executionToken, options);
         }
@@ -815,10 +1003,9 @@ export class ConversationEngine {
     output = redactSensitiveText(output, secrets);
     error = error === null ? null : redactSensitiveText(error, secrets);
     const item = toolOutputItem(call.call_id, output);
-    const payload: StoredToolResultPayload = {
+    const payload = {
       name: call.name,
       callId: call.call_id,
-      item,
       output,
       ...(result?.artifactUri ? { artifactUri: result.artifactUri } : {}),
       ...(result?.truncated ? { truncated: true } : {}),
@@ -844,11 +1031,9 @@ export class ConversationEngine {
     detail = "Tool execution was interrupted; its side effects may have occurred.",
   ): void {
     const output = redactSensitiveText(detail, configuredCredentialValues(this.config));
-    const item = toolOutputItem(call.call_id, output);
-    const payload: StoredToolResultPayload = {
+    const payload = {
       name: call.name,
       callId: call.call_id,
-      item,
       output,
     };
     this.store.markToolCallUnknownWithEvent(sessionId, call.call_id, executionToken, payload);
@@ -906,33 +1091,57 @@ export class ConversationEngine {
     callerSignal.throwIfAborted();
     const owner = reservation?.owner ?? this.operationOwner;
     const token = reservation?.token ?? randomUUID();
-    const leaseMs = 30_000;
+    const leaseMs = OPERATION_LEASE_MS;
     if (reservation) {
-      if (!this.store.assertOperationLease(sessionId, owner, token)) {
-        throw new Error("Reserved session operation lease is unavailable or expired");
+      let check;
+      try {
+        check = this.store.assertOperationLeaseChecked(sessionId, owner, token);
+      } catch {
+        throw this.operationLeaseUnavailableError("reserved operation assertion");
       }
-    } else if (!this.store.acquireOperationLease(sessionId, owner, token, kind, Date.now(), leaseMs)) {
-      throw new Error("Session is busy with another turn or compaction");
+      if (!check.ok) {
+        throw this.operationLeaseErrorFromState("reserved operation assertion", check.state);
+      }
+    } else {
+      let acquired: boolean;
+      try {
+        acquired = this.store.acquireOperationLease(sessionId, owner, token, kind, Date.now(), leaseMs);
+      } catch {
+        throw this.operationLeaseUnavailableError("operation acquisition");
+      }
+      if (!acquired) throw new Error("Session is busy with another turn or compaction");
     }
     const leaseAbort = new AbortController();
     const signal = AbortSignal.any([callerSignal, leaseAbort.signal]);
     let leaseError: Error | null = null;
     const heartbeat = setInterval(() => {
       try {
-        if (!this.store.renewOperationLease(sessionId, owner, token, Date.now(), leaseMs)) {
-          leaseError = new Error("Session operation lease was lost");
+        const check = this.store.renewOperationLeaseChecked(sessionId, owner, token, Date.now(), leaseMs);
+        if (!check.ok && !leaseError) {
+          leaseError = this.operationLeaseErrorFromState("heartbeat renewal", check.state);
           leaseAbort.abort();
         }
-      } catch (error) {
-        leaseError = new Error(`Session operation heartbeat failed: ${errorMessage(error)}`);
-        leaseAbort.abort();
+      } catch {
+        // Do not surface database/provider exception text here: it may contain
+        // connection details or credentials. Stopping is still mandatory.
+        if (!leaseError) {
+          leaseError = this.operationLeaseUnavailableError("heartbeat renewal");
+          leaseAbort.abort();
+        }
       }
-    }, Math.floor(leaseMs / 3));
+    }, OPERATION_HEARTBEAT_MS);
     heartbeat.unref();
     try {
       const result = await operation(signal, token);
-      if (leaseError || !this.store.assertOperationLease(sessionId, owner, token)) {
-        throw leaseError ?? new Error("Session operation lease expired before completion");
+      if (leaseError) throw leaseError;
+      let finalCheck;
+      try {
+        finalCheck = this.store.assertOperationLeaseChecked(sessionId, owner, token);
+      } catch {
+        throw this.operationLeaseUnavailableError("final assertion");
+      }
+      if (!finalCheck.ok) {
+        throw this.operationLeaseErrorFromState("final assertion", finalCheck.state);
       }
       return result;
     } catch (error) {
@@ -940,8 +1149,53 @@ export class ConversationEngine {
       throw error;
     } finally {
       clearInterval(heartbeat);
-      this.store.releaseOperationLease(sessionId, owner, token);
+      try {
+        this.store.releaseOperationLease(sessionId, owner, token);
+      } catch {
+        // Cleanup is best effort. The row remains fenced and expires naturally;
+        // never replace the operation result with raw database diagnostics.
+      }
     }
+  }
+
+  private operationLeaseErrorFromState(
+    phase: SessionOperationLeaseLossPhase,
+    state: OperationLeaseState,
+  ): SessionOperationLeaseError {
+    // This helper is only called for failed checks. Keep the guard defensive
+    // so a future caller cannot format an "active" state as a loss.
+    const kind = state.kind === "active" ? "missing" : state.kind;
+    return new SessionOperationLeaseError({
+      phase,
+      kind,
+      leaseMs: OPERATION_LEASE_MS,
+      heartbeatMs: OPERATION_HEARTBEAT_MS,
+      leaseDurationMs: state.leaseDurationMs,
+      renewalAgeMs: state.renewalAgeMs,
+      expiryOffsetMs: state.expiryOffsetMs,
+    });
+  }
+
+  private operationLeaseUnavailableError(phase: SessionOperationLeaseLossPhase): Error {
+    const error = new Error(formatLeaseUnavailable(phase));
+    Object.assign(error, { code: "session_operation_lease_unavailable" });
+    return error;
+  }
+
+  private operationLeaseError(
+    sessionId: string,
+    executionToken: string,
+    phase: SessionOperationLeaseLossPhase,
+  ): Error {
+    try {
+      const check = this.store.assertOperationTokenChecked(sessionId, executionToken);
+      if (!check.ok) return this.operationLeaseErrorFromState(phase, check.state);
+    } catch {
+      // Fall through to a safe, non-classified diagnostic. The original
+      // fenced write already stopped, so never turn an inspection failure into
+      // permission to continue.
+    }
+    return this.operationLeaseUnavailableError(phase);
   }
 
   private requireSession(id: string): SessionRecord {

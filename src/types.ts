@@ -33,7 +33,51 @@ export interface SchedulerConfig {
   commandOutputBytes: number;
 }
 
+export interface AutomationConfig {
+  providerRetryMaxAttempts: number;
+  providerRetryMaxElapsedMs: number;
+  agentTurnTimeoutMs: number;
+  scheduledTurnTimeoutMs: number;
+}
+
+export interface AgentSessionMaintenanceConfig {
+  maxAgeMs: number;
+  minAgeMs: number;
+  maxSessions: number;
+  maxLogicalBytes: number;
+  maxSessionsPerRun: number;
+  maxLogicalBytesPerRun: number;
+}
+
+export interface DetachedArtifactMaintenanceConfig {
+  maxAgeMs: number;
+  minAgeMs: number;
+  maxArtifacts: number;
+  maxBytes: number;
+  maxArtifactsPerRun: number;
+  maxBytesPerRun: number;
+}
+
+export interface SchedulerHistoryMaintenanceConfig {
+  outputRetentionMs: number;
+  occurrenceRetentionMs: number;
+  acknowledgedInboxRetentionMs: number;
+  deletedJobRetentionMs: number;
+  minOccurrencesPerJob: number;
+  batchSize: number;
+}
+
+export interface MaintenanceConfig {
+  runOnStartup: boolean;
+  reconcileOrphanedTools: boolean;
+  agentSessions: AgentSessionMaintenanceConfig;
+  detachedArtifacts: DetachedArtifactMaintenanceConfig;
+  schedulerHistory: SchedulerHistoryMaintenanceConfig;
+}
+
 export interface GlassConfig {
+  automation: AutomationConfig;
+  maintenance: MaintenanceConfig;
   gateway: GatewayConfig;
   gateways: GatewayConfig[];
   model: string | null;
