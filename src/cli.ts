@@ -15,7 +15,7 @@ import { serializeConfig } from "./config.js";
 import { collectOperationalSnapshot, type OperationalSnapshot } from "./operations.js";
 import type { MaintenanceMode, MaintenanceReport } from "./maintenance.js";
 
-export const VERSION = "0.7.0";
+export const VERSION = "0.8.0";
 
 function terminalText(value: string): string {
   return value.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/gu, "�");

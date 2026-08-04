@@ -23,7 +23,6 @@ import {
   type EditorTheme,
   type Focusable,
   type MarkdownTheme,
-  type OverlayHandle,
   type SelectItem,
   type SelectListTheme,
   type SlashCommand,
@@ -50,6 +49,21 @@ import type {
   SessionEvent,
   SessionRecord,
 } from "../types.js";
+import { ModalArbiter, type ModalPresentation } from "./modal-arbiter.js";
+import {
+  prepareQueuedValue,
+  SubmissionQueue,
+  type PreparedSubmission,
+} from "./submission-queue.js";
+import {
+  detectActiveSelectorCommand,
+  expandActiveSelectorCommand,
+  findModelChoice,
+  SelectorPresentationQueue,
+} from "./setting-picker.js";
+
+export { SubmissionQueue } from "./submission-queue.js";
+export { detectActiveSelectorCommand, expandActiveSelectorCommand, findModelChoice } from "./setting-picker.js";
 
 const MIN_COLUMNS = 32;
 const MIN_ROWS = 12;
@@ -404,17 +418,20 @@ function plainReasoningText(text: string): string {
   return displaySafe(text).replace(/\*\*|__/g, "");
 }
 
-function renderFrame(title: string, body: string[], width: number): string[] {
-  const frameWidth = Math.max(1, width);
+export function renderFrame(title: string, body: string[], width: number): string[] {
+  const frameWidth = Math.max(1, Math.floor(width));
   if (frameWidth < 4) return body.map((line) => fit(line, frameWidth));
   const innerWidth = frameWidth - 2;
-  const border = `+${"-".repeat(innerWidth)}+`;
+  const topBorder = `╭${"─".repeat(innerWidth)}╮`;
+  const bottomBorder = `╰${"─".repeat(innerWidth)}╯`;
+  const divider = `├${"─".repeat(innerWidth)}┤`;
+  const titleLine = ` ${cyan("◇")} ${bold(displaySafe(title))}`;
   return [
-    border,
-    `|${pad(` ${bold(displaySafe(title))}`, innerWidth)}|`,
-    `|${"-".repeat(innerWidth)}|`,
-    ...body.map((line) => `|${pad(line, innerWidth)}|`),
-    border,
+    topBorder,
+    `│${pad(titleLine, innerWidth)}│`,
+    divider,
+    ...body.map((line) => `│${pad(line, innerWidth)}│`),
+    bottomBorder,
   ].map((line) => fit(line, frameWidth));
 }
 
@@ -512,6 +529,201 @@ class TurnEditor extends Editor {
   override handleInput(data: string): void {
     if (this.enabled) super.handleInput(data);
   }
+}
+
+const startupGradientStops = [
+  { at: 0, color: [52, 238, 255] as const },
+  { at: 0.48, color: [129, 93, 255] as const },
+  { at: 1, color: [255, 82, 190] as const },
+];
+
+const startupWideMark = [
+  "█░░ ███ ███ █░█ ███ █▄░█ ███   ███ █░░ ░█░ ███ ███",
+  "█░░ █░█ █░█ ██░ ░█░ ██░█ █░░   █░░ █░░ █░█ █░░ █░░",
+  "█░░ █░█ █░█ ██░ ░█░ █░██ █░█   █░█ █░░ ███ ░░█ ░░█",
+  "███ ███ ███ █░█ ███ █░▀█ ███   ███ ███ █░█ ███ ███",
+];
+
+const startupDenseMark = startupWideMark.map((line) => line
+  .split("   ")
+  .map((word) => word.replaceAll(" ", ""))
+  .join(" "));
+
+const startupCompactMark = [
+  ...startupWideMark.map((line) => line.split("   ")[0]!),
+  "",
+  ...startupWideMark.map((line) => line.split("   ")[1]!),
+];
+
+const startupHint = "describe a task · type / for commands";
+
+function truecolorStyle(redValue: number, greenValue: number, blueValue: number): Style {
+  return (text) => `\x1b[38;2;${redValue};${greenValue};${blueValue}m${text}\x1b[39m`;
+}
+
+function startupGradientLine(line: string): string {
+  const width = Math.max(1, visibleWidth(line));
+  let offset = 0;
+  let output = "";
+  for (const { segment } of graphemeSegmenter.segment(line)) {
+    const segmentWidth = visibleWidth(segment);
+    if (segmentWidth <= 0) {
+      output += segment;
+      continue;
+    }
+    const position = offset / Math.max(1, width - 1);
+    const rightIndex = startupGradientStops.findIndex((stop) => stop.at >= position);
+    const right = startupGradientStops[Math.max(1, rightIndex)] ?? startupGradientStops.at(-1)!;
+    const left = startupGradientStops[Math.max(0, rightIndex - 1)] ?? startupGradientStops[0]!;
+    const span = Math.max(0.0001, right.at - left.at);
+    const amount = Math.max(0, Math.min(1, (position - left.at) / span));
+    const color = left.color.map((channel, index) => Math.round(channel + (right.color[index]! - channel) * amount));
+    output += truecolorStyle(color[0]!, color[1]!, color[2]!)(segment);
+    offset += segmentWidth;
+  }
+  return output;
+}
+
+function centerAnsiLine(line: string, width: number): string {
+  const safeWidth = Math.max(1, Math.floor(width));
+  const fitted = fit(line, safeWidth);
+  return `${" ".repeat(Math.max(0, Math.floor((safeWidth - visibleWidth(fitted)) / 2)))}${fitted}`;
+}
+
+export function startupPanelWidth(width: number): number {
+  const safeWidth = Math.max(1, Math.floor(width));
+  return Math.min(76, Math.max(1, safeWidth - (safeWidth < 76 ? 2 : 0)));
+}
+
+export function isPlainPromptSubmission(text: string): boolean {
+  const trimmed = text.trim();
+  return trimmed.length > 0 && !trimmed.startsWith("/");
+}
+
+export function startupSessionEligible(durableEventCount: number, acceptedPlainPrompt: boolean): boolean {
+  return durableEventCount === 0 && !acceptedPlainPrompt;
+}
+
+/** Tracks the in-memory part of startup-screen eligibility for this TUI run. */
+export class StartupScreenState {
+  private readonly acceptedPlainPrompts = new Set<string>();
+
+  markPromptAccepted(sessionId: string, text: string): boolean {
+    if (!isPlainPromptSubmission(text)) return false;
+    this.acceptedPlainPrompts.add(sessionId);
+    return true;
+  }
+
+  shouldShow(sessionId: string, durableEventCount: number): boolean {
+    return startupSessionEligible(durableEventCount, this.acceptedPlainPrompts.has(sessionId));
+  }
+}
+
+export interface StartupScreenRenderOptions {
+  panelWidth?: number;
+  statusLines?: string[];
+  metadataLine?: string;
+  inputHint?: string;
+  inputEmpty?: boolean;
+}
+
+function startupEditorIsEmpty(editorLines: string[]): boolean {
+  return editorLines.every((line) => stripTerminalFormatting(line)
+    .replaceAll(CURSOR_MARKER, "")
+    .replace(/[─\s]/gu, "")
+    .length === 0);
+}
+
+function centeredPanelLines(text: string, panelWidth: number, screenWidth: number, lineStyle?: Style): string[] {
+  if (visibleWidth(text) <= panelWidth) {
+    return [centerAnsiLine(lineStyle ? lineStyle(text) : text, screenWidth)];
+  }
+  return wrap(stripTerminalFormatting(text), panelWidth)
+    .map((line) => centerAnsiLine(lineStyle ? lineStyle(line) : line, screenWidth))
+    .filter((line) => visibleWidth(line) > 0);
+}
+
+/** Render the non-transcript landing view around the existing editor panel. */
+export function renderStartupScreen(
+  width: number,
+  height: number,
+  editorLines: string[],
+  options: StartupScreenRenderOptions = {},
+): string[] {
+  const safeWidth = Math.max(1, Math.floor(width));
+  const safeHeight = Math.max(1, Math.floor(height));
+  const panelWidth = Math.min(
+    safeWidth,
+    Math.max(1, Math.floor(options.panelWidth ?? startupPanelWidth(safeWidth))),
+  );
+  const art = safeWidth >= 50
+    ? startupWideMark
+    : safeWidth >= 37
+      ? startupDenseMark
+      : startupCompactMark;
+  const artLines = [
+    ...art.map((line) => centerAnsiLine(bold(startupGradientLine(line)), safeWidth)),
+    "",
+  ];
+  const inputEmpty = options.inputEmpty ?? startupEditorIsEmpty(editorLines);
+  const hint = inputEmpty
+    ? centeredPanelLines(options.inputHint ?? startupHint, panelWidth, safeWidth, dim)
+    : [];
+  const metadata = options.metadataLine
+    ? centeredPanelLines(options.metadataLine, panelWidth, safeWidth, dim)
+    : [];
+  const status = (options.statusLines ?? [])
+    .flatMap((line) => centeredPanelLines(line, panelWidth, safeWidth));
+  const editor = editorLines
+    .map((line) => centerAnsiLine(fit(line, panelWidth), safeWidth));
+  let visibleArt = [...artLines];
+  let visibleHint = [...hint];
+  let visibleMetadata = [...metadata];
+  let visibleStatus = [...status];
+  let content = [...visibleArt, ...editor, ...visibleHint, ...visibleMetadata, ...visibleStatus];
+
+  // Keep the editor (and therefore its cursor marker) in the viewport first.
+  // Transient slash-command notices and decoration yield space before details.
+  while (content.length > safeHeight && visibleStatus.length > 0) {
+    visibleStatus.pop();
+    content = [...visibleArt, ...editor, ...visibleHint, ...visibleMetadata, ...visibleStatus];
+  }
+  while (content.length > safeHeight && visibleArt.length > 0) {
+    visibleArt.shift();
+    content = [...visibleArt, ...editor, ...visibleHint, ...visibleMetadata, ...visibleStatus];
+  }
+  while (content.length > safeHeight && visibleHint.length > 0) {
+    visibleHint.pop();
+    content = [...visibleArt, ...editor, ...visibleHint, ...visibleMetadata, ...visibleStatus];
+  }
+  while (content.length > safeHeight && visibleMetadata.length > 1) {
+    visibleMetadata.pop();
+    content = [...visibleArt, ...editor, ...visibleHint, ...visibleMetadata, ...visibleStatus];
+  }
+
+  let visibleEditor = editor;
+  if (editor.length > safeHeight) {
+    const cursorIndex = editor.findIndex((line) => line.includes(CURSOR_MARKER));
+    const start = cursorIndex < 0
+      ? editor.length - safeHeight
+      : Math.max(0, Math.min(cursorIndex, editor.length - safeHeight));
+    visibleEditor = editor.slice(start, start + safeHeight);
+  }
+  content = [...visibleArt, ...visibleEditor, ...visibleHint, ...visibleMetadata, ...visibleStatus];
+  if (content.length > safeHeight) {
+    const cursorIndex = content.findIndex((line) => line.includes(CURSOR_MARKER));
+    const start = cursorIndex < 0
+      ? content.length - safeHeight
+      : Math.max(0, Math.min(cursorIndex, content.length - safeHeight));
+    content = content.slice(start, start + safeHeight);
+  }
+  const topPadding = Math.max(0, Math.floor((safeHeight - content.length) / 2));
+  const bottomPadding = Math.max(0, safeHeight - topPadding - content.length);
+  return [
+    ...Array.from<string>({ length: topPadding }).fill(""),
+    ...content,
+    ...Array.from<string>({ length: bottomPadding }).fill(""),
+  ];
 }
 
 export class UserMessage implements Component {
@@ -794,6 +1006,7 @@ export class FullHeightRoot extends Container {
   private selectableRows = 0;
   private readonly maxEntries: number;
   private readonly onEvict: ((component: Component) => void) | undefined;
+  private startupVisible: boolean;
 
   constructor(
     private readonly terminal: AlternateScreenTerminal,
@@ -801,14 +1014,32 @@ export class FullHeightRoot extends Container {
     private readonly taskPlanPanel: TaskPlanPanel,
     private readonly activityText: () => string,
     private readonly metadataText: (width: number) => string,
-    options: { maxEntries?: number; onEvict?: (component: Component) => void } = {},
+    options: {
+      maxEntries?: number;
+      onEvict?: (component: Component) => void;
+      startupVisible?: boolean;
+    } = {},
   ) {
     super();
     this.maxEntries = typeof options.maxEntries === "number" && Number.isFinite(options.maxEntries)
       ? Math.max(1, Math.floor(options.maxEntries))
       : Number.POSITIVE_INFINITY;
     this.onEvict = options.onEvict;
+    this.startupVisible = options.startupVisible ?? false;
     this.addChild(editor);
+  }
+
+  setStartupVisible(visible: boolean): void {
+    if (this.startupVisible === visible) return;
+    this.startupVisible = visible;
+    this.scrollFromBottom = 0;
+    this.maxScroll = 0;
+    this.clearSelection();
+    this.invalidate();
+  }
+
+  get isStartupVisible(): boolean {
+    return this.startupVisible;
   }
 
   addEntry(component: Component): void {
@@ -969,6 +1200,28 @@ export class FullHeightRoot extends Container {
       return this.renderSelection(lines);
     }
 
+    if (this.startupVisible) {
+      const panelWidth = startupPanelWidth(safeWidth);
+      const editorLines = this.editor.render(panelWidth).map((line) => fit(line, panelWidth));
+      const latestNotice = this.entries.findLast((entry): entry is Notice => entry instanceof Notice);
+      const statusLines = latestNotice
+        ? latestNotice.render(panelWidth).filter((line) => visibleWidth(line) > 0).slice(0, 3)
+        : [];
+      const frame = renderStartupScreen(safeWidth, height, editorLines, {
+        panelWidth,
+        statusLines,
+        metadataLine: this.metadataText(panelWidth),
+        inputEmpty: typeof this.editor.getText === "function"
+          ? this.editor.getText().trim().length === 0
+          : startupEditorIsEmpty(editorLines),
+      });
+      this.viewportRows = 0;
+      this.maxScroll = 0;
+      this.lastTranscriptLines = 0;
+      this.selectableRows = frame.length;
+      return this.renderSelection(frame);
+    }
+
     // Reserve enough space for the editor, activity, and metadata before
     // rendering the sticky checklist. Without this cap, a valid large plan
     // can push the input and session metadata below the terminal viewport.
@@ -1005,44 +1258,56 @@ export class FullHeightRoot extends Container {
     const topPadding = Array.from<string>({
       length: Math.max(0, this.viewportRows - visibleTranscript.length),
     }).fill("");
-    this.selectableRows = topPadding.length + visibleTranscript.length;
     const activity = fit(dim(` ${oneLine(this.activityText(), 10_000)}`), safeWidth);
     const metadata = fit(dim(` ${oneLine(this.metadataText(Math.max(1, safeWidth - 1)), 10_000)}`), safeWidth);
-    return this.renderSelection([
+    const frame = [
       ...topPadding,
       ...visibleTranscript,
       ...taskPlanLines,
       activity,
       ...editorLines,
       metadata,
-    ]);
+    ];
+    this.selectableRows = frame.length;
+    return this.renderSelection(frame);
   }
 }
 
-class SelectorModal implements Component {
-  readonly list: SelectList;
+interface TerminalDimensions {
+  readonly columns: number;
+  readonly rows: number;
+}
+
+export class SelectorModal implements Component {
+  list: SelectList;
   onSelect?: (value: string) => void;
   onDelete?: (value: string) => void;
   onCancel?: () => void;
 
+  private readonly items: SelectItem[];
+  private readonly maxVisible: number;
+  private listMaxVisible: number;
+  private renderedWidth = 1;
+  private renderedHeight = 1;
+  private readonly hitboxes = new Map<number, { row: number; range: [number, number] }>();
+  private pressed: number | null = null;
+
   constructor(
+    private readonly terminal: TerminalDimensions,
     title: string,
     items: SelectItem[],
     maxVisible: number,
     private readonly prompt?: string,
   ) {
     this.title = title;
-    const safeItems = items.map((item) => ({
+    this.items = items.map((item) => ({
       value: item.value,
       label: oneLine(item.label, 500),
       ...(item.description ? { description: oneLine(item.description, 1_000) } : {}),
     }));
-    this.list = new SelectList(safeItems, maxVisible, selectTheme, {
-      minPrimaryColumnWidth: 12,
-      maxPrimaryColumnWidth: 34,
-    });
-    this.list.onSelect = (item) => this.onSelect?.(item.value);
-    this.list.onCancel = () => this.onCancel?.();
+    this.maxVisible = Math.max(1, Math.floor(maxVisible));
+    this.listMaxVisible = this.maxVisible;
+    this.list = this.createList(this.listMaxVisible);
   }
 
   private readonly title: string;
@@ -1060,13 +1325,161 @@ class SelectorModal implements Component {
     this.list.handleInput(data);
   }
 
+  handleMouse(event: TerminalMouseEvent): boolean {
+    if (event.action === "wheel_up" || event.action === "wheel_down") {
+      this.pressed = null;
+      if (!this.inOverlay(event)) return false;
+      this.moveSelection(event.action === "wheel_up" ? -1 : 1);
+      return true;
+    }
+
+    if (event.action === "press" && event.button !== 0) {
+      this.pressed = null;
+      return false;
+    }
+    if (event.action === "drag" && event.button !== 0) {
+      this.pressed = null;
+      return false;
+    }
+    // SGR mouse releases normally use button code 3 regardless of which
+    // button was released. Accept that sentinel and synthetic left releases,
+    // but never let an explicit foreign-button release complete a click.
+    if (event.action === "release" && event.button !== 0 && event.button !== 3) {
+      this.pressed = null;
+      return false;
+    }
+    const target = this.itemAt(event);
+    if (event.action === "press") {
+      this.pressed = target;
+      if (target !== null) this.list.setSelectedIndex(target);
+      return target !== null;
+    }
+    if (event.action === "drag") return this.pressed !== null;
+    if (event.action === "release") {
+      const pressed = this.pressed;
+      this.pressed = null;
+      if (pressed !== null && target === pressed) {
+        const item = this.items[pressed];
+        if (item) this.onSelect?.(item.value);
+      }
+      return pressed !== null || target !== null;
+    }
+    return false;
+  }
+
+  private selectedIndex(): number {
+    const selected = this.list.getSelectedItem();
+    const index = selected ? this.items.indexOf(selected) : -1;
+    return index >= 0 ? index : 0;
+  }
+
+  private moveSelection(delta: -1 | 1): void {
+    if (this.items.length === 0) return;
+    const index = this.selectedIndex();
+    const next = (index + delta + this.items.length) % this.items.length;
+    this.list.setSelectedIndex(next);
+  }
+
+  private createList(maxVisible: number): SelectList {
+    const list = new SelectList(this.items, maxVisible, selectTheme, {
+      minPrimaryColumnWidth: 12,
+      maxPrimaryColumnWidth: 34,
+    });
+    list.onSelect = (item) => this.onSelect?.(item.value);
+    list.onCancel = () => this.onCancel?.();
+    return list;
+  }
+
+  private setListMaxVisible(maxVisible: number): void {
+    const safeMaxVisible = Math.max(1, Math.floor(maxVisible));
+    if (safeMaxVisible === this.listMaxVisible) return;
+    const selected = this.selectedIndex();
+    this.list = this.createList(safeMaxVisible);
+    this.list.setSelectedIndex(selected);
+    this.listMaxVisible = safeMaxVisible;
+  }
+
+  private overlayOrigin(): ScreenPoint {
+    const margin = 1;
+    const availableWidth = Math.max(1, this.terminal.columns - margin * 2);
+    const availableHeight = Math.max(1, this.terminal.rows - margin * 2);
+    return {
+      column: margin + Math.floor((availableWidth - this.renderedWidth) / 2),
+      row: margin + Math.floor((availableHeight - this.renderedHeight) / 2),
+    };
+  }
+
+  private maxOverlayHeight(): number {
+    const availableHeight = Math.max(1, this.terminal.rows - 2);
+    return Math.max(1, Math.min(availableHeight, Math.floor(this.terminal.rows * 0.8)));
+  }
+
+  private inOverlay(event: ScreenPoint): boolean {
+    const origin = this.overlayOrigin();
+    const row = event.row - origin.row;
+    const column = event.column - origin.column;
+    return row >= 0 && row < this.renderedHeight && column >= 0 && column < this.renderedWidth;
+  }
+
+  private itemAt(event: ScreenPoint): number | null {
+    const origin = this.overlayOrigin();
+    const row = event.row - origin.row;
+    const column = event.column - origin.column;
+    for (const [index, hitbox] of this.hitboxes) {
+      if (row === hitbox.row && column >= hitbox.range[0] && column < hitbox.range[1]) return index;
+    }
+    return null;
+  }
+
   render(width: number): string[] {
-    const prompt = this.prompt ? [...wrap(this.prompt, Math.max(1, width - 4)), ""] : [];
-    return renderFrame(this.title, [
+    const frameWidth = Math.max(1, Math.floor(width));
+    const promptLines = this.prompt ? [...wrap(this.prompt, Math.max(1, frameWidth - 4)), ""] : [];
+    const frameOverhead = frameWidth < 4 ? 0 : 4;
+    const promptBudget = Math.max(
+      0,
+      this.maxOverlayHeight() - frameOverhead - 1 - (this.items.length > 1 ? 2 : 1),
+    );
+    const prompt = promptLines.slice(0, promptBudget);
+    const listBudget = Math.max(1, this.maxOverlayHeight() - frameOverhead - prompt.length - 1);
+    const listMaxVisible = Math.min(
+      this.maxVisible,
+      this.items.length > listBudget ? Math.max(1, listBudget - 1) : listBudget,
+    );
+    this.setListMaxVisible(listMaxVisible);
+    const listLines = this.list.render(Math.max(1, frameWidth - 2));
+    const body = [
       ...prompt,
-      ...this.list.render(Math.max(1, width - 2)),
+      ...listLines,
       dim(` Enter select${this.onDelete ? " | Delete remove" : ""} | Esc cancel`),
-    ], width);
+    ];
+    const renderedLines = renderFrame(this.title, body, frameWidth);
+    const lines = renderedLines.slice(0, this.maxOverlayHeight());
+    this.renderedWidth = frameWidth;
+    this.renderedHeight = lines.length;
+    this.hitboxes.clear();
+
+    // Framed renderFrame puts the body after its top, title, and divider rows;
+    // its narrow fallback omits that frame entirely.
+    const bodyStart = frameWidth < 4
+      ? 0
+      : 3;
+    const selected = this.selectedIndex();
+    const start = Math.max(0, Math.min(
+      selected - Math.floor(this.listMaxVisible / 2),
+      this.items.length - this.listMaxVisible,
+    ));
+    const end = Math.min(start + this.listMaxVisible, this.items.length);
+    for (let index = start; index < end; index += 1) {
+      const row = bodyStart + prompt.length + index - start;
+      if (row >= lines.length) continue;
+      this.hitboxes.set(index, {
+        row,
+        range: frameWidth < 4
+          ? [0, this.renderedWidth]
+          : [1, Math.max(1, this.renderedWidth - 1)],
+      });
+    }
+    return lines;
   }
 }
 
@@ -1479,12 +1892,16 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
   const streaming = new Set<StreamingAssistant>();
   const seenInbox = new Set<string>();
   const suppressedInbox = new Map<string, string>();
+  const startupState = new StartupScreenState();
   const pendingTasks = new Set<Promise<void>>();
+  const pendingPreflightCancels = new Set<() => void>();
+  const modalArbiter = new ModalArbiter();
+  const selectorPresentations = new SelectorPresentationQueue();
   let activeModal: ActiveModal | null = null;
   let activeController: AbortController | null = null;
   let engineStatus = "Ready";
   let activeOperation = false;
-  let submissionBusy = false;
+  let activeTurn = false;
   let stopping = false;
   let pollErrorShown = false;
   let pollTimer: NodeJS.Timeout | null = null;
@@ -1513,6 +1930,7 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
   const taskPlanPanel = new TaskPlanPanel();
   const root = new FullHeightRoot(terminal, editor, taskPlanPanel, activityText, metadataText, {
     maxEntries: TRANSCRIPT_ENTRY_LIMIT,
+    startupVisible: startupState.shouldShow(session.id, app.sessions.eventCount(session.id)),
     onEvict(component) {
       if (component instanceof ToolCard && toolCards.get(component.callId) === component) {
         toolCards.delete(component.callId);
@@ -1608,70 +2026,68 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
     requestRender();
   };
 
-  const settleModal = <T>(
-    handle: OverlayHandle,
-    modalToken: ActiveModal,
-    resolve: (value: T) => void,
-    value: T,
-  ): void => {
-    if (activeModal !== modalToken) return;
-    activeModal = null;
-    handle.hide();
-    restoreEditor();
-    resolve(value);
-  };
-
   const selectValue = (
     title: string,
     items: SelectItem[],
     prompt?: string,
     options: { deletable?: boolean } = {},
   ): Promise<string | null> => {
-    if (stopping || items.length === 0) return Promise.resolve(null);
-    return new Promise((resolve) => {
-      let settled = false;
+    return modalArbiter.request<string | null>((finish) => {
+      if (stopping || items.length === 0) {
+        finish(null);
+        return { close: (): void => {} } satisfies ModalPresentation;
+      }
       const modal = new SelectorModal(
+        terminal,
         title,
         items,
         Math.max(3, Math.min(10, Math.floor(terminal.rows * 0.8) - 6)),
         prompt,
       );
       const handle = tui.showOverlay(modal, { width: "80%", maxHeight: "80%", margin: 1 });
-      const finish = (value: string | null): void => {
-        if (settled) return;
-        settled = true;
-        settleModal(handle, token, resolve, value);
+      const token: ActiveModal = {
+        cancel: () => finish(null),
+        mouse: (event) => modal.handleMouse(event),
       };
-      const token: ActiveModal = { cancel: () => finish(null) };
       activeModal = token;
       modal.onSelect = (value) => finish(value);
       if (options.deletable) modal.onDelete = (value) => finish(`${DELETE_SELECTION_PREFIX}${value}`);
       modal.onCancel = () => finish(null);
-    });
+      return {
+        close: (): void => {
+          if (activeModal === token) activeModal = null;
+          handle.hide();
+          restoreEditor();
+        },
+      } satisfies ModalPresentation;
+    }, null);
   };
 
   const interaction: EngineInteraction = {
     approve(request: ApprovalRequest): Promise<ApprovalDecision> {
-      if (stopping) return Promise.resolve("deny");
-      return new Promise((resolve) => {
-        let settled = false;
+      return modalArbiter.request<ApprovalDecision>((finish) => {
+        if (stopping) {
+          finish("deny");
+          return { close: (): void => {} } satisfies ModalPresentation;
+        }
         const modal = new ApprovalModal(terminal, request);
         const handle = tui.showOverlay(modal, { width: "85%", maxHeight: "80%", margin: 1 });
-        const finish = (decision: ApprovalDecision): void => {
-          if (settled) return;
-          settled = true;
-          settleModal(handle, token, resolve, decision);
-        };
         const token: ActiveModal = {
           cancel: () => finish("deny"),
           mouse: (event) => modal.handleMouse(event),
         };
         activeModal = token;
         modal.onDone = finish;
-      });
+        return {
+          close: (): void => {
+            if (activeModal === token) activeModal = null;
+            handle.hide();
+            restoreEditor();
+          },
+        } satisfies ModalPresentation;
+      }, "deny");
     },
     ask(request: QuestionRequest): Promise<string> {
-      if (stopping) return Promise.resolve("");
       if (request.options && request.options.length > 0) {
         return selectValue(
           "Question",
@@ -1679,19 +2095,24 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
           request.question,
         ).then((answer) => answer ?? "");
       }
-      return new Promise((resolve) => {
-        let settled = false;
+      return modalArbiter.request<string>((finish) => {
+        if (stopping) {
+          finish("");
+          return { close: (): void => {} } satisfies ModalPresentation;
+        }
         const modal = new QuestionInputModal(terminal, request.question, request.secret);
         const handle = tui.showOverlay(modal, { width: "80%", maxHeight: "80%", margin: 1 });
-        const finish = (answer: string): void => {
-          if (settled) return;
-          settled = true;
-          settleModal(handle, token, resolve, answer);
-        };
         const token: ActiveModal = { cancel: () => finish("") };
         activeModal = token;
         modal.onDone = finish;
-      });
+        return {
+          close: (): void => {
+            if (activeModal === token) activeModal = null;
+            handle.hide();
+            restoreEditor();
+          },
+        } satisfies ModalPresentation;
+      }, "");
     },
   };
 
@@ -1703,6 +2124,7 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
     root.clearTranscript();
     toolCards.clear();
     const eventCount = app.sessions.eventCount(session.id);
+    root.setStartupVisible(startupState.shouldShow(session.id, eventCount));
     const events = app.sessions.recentEvents(session.id, TRANSCRIPT_EVENT_LIMIT);
     if (eventCount > events.length) {
       root.addEntry(new Notice(
@@ -1820,13 +2242,15 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
     };
   };
 
-  const beginOperation = (status: string): AbortController => {
+  const beginOperation = (status: string, kind: "turn" | "compact"): AbortController => {
     cancelConfirmation.reset();
     activeOperation = true;
+    activeTurn = kind === "turn";
     activeController = new AbortController();
     engineStatus = status;
-    editor.setEnabled(false);
-    tui.setFocus(null);
+    // Keep the editor focused while the engine owns the active turn lease.
+    // New submissions are serialized below and become follow-up work.
+    editor.setEnabled(true);
     requestRender();
     return activeController;
   };
@@ -1835,6 +2259,7 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
     cancelConfirmation.reset();
     activeController = null;
     activeOperation = false;
+    activeTurn = false;
     engineStatus = "Ready";
     // A model may leave an item pending after a failed, cancelled, or
     // otherwise incomplete turn. Do not let that stale state reserve the
@@ -1846,7 +2271,7 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
   };
 
   const runTurn = async (text: string): Promise<void> => {
-    const controller = beginOperation("Thinking");
+    const controller = beginOperation("Thinking", "turn");
     const turnCallbacks = callbacks();
     try {
       const model = await app.modelForTurn(
@@ -1880,7 +2305,7 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
   };
 
   const runCompact = async (): Promise<void> => {
-    const controller = beginOperation("Compacting context");
+    const controller = beginOperation("Compacting context", "compact");
     try {
       await app.engine.compactNow(session.id, { signal: controller.signal, callbacks: callbacks() });
       refreshContextUsage();
@@ -2456,8 +2881,7 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
         }))) ?? "";
       }
       if (!id || stopping) return;
-      const model = models.find((candidate) => `${candidate.provider}:${candidate.id}` === id)
-        ?? models.find((candidate) => candidate.provider === session.provider && candidate.id === id);
+      const model = findModelChoice(models, id, session.provider);
       if (!model) throw new Error(`Model is not available: ${id}`);
       setModel(model);
       return;
@@ -2484,8 +2908,7 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
         }))) ?? "";
       }
       if (!id || stopping) return;
-      const model = models.find((candidate) => `${candidate.provider}:${candidate.id}` === id)
-        ?? models.find((candidate) => candidate.provider === session.agentProvider && candidate.id === id);
+      const model = findModelChoice(models, id, session.agentProvider);
       if (!model) throw new Error(`Agent model is not available: ${id}`);
       setAgentModel(model);
       return;
@@ -2574,14 +2997,111 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
     throw new Error(`Unknown command: /${command}`);
   };
 
-  const handleSubmission = async (text: string): Promise<void> => {
-    if (!text || submissionBusy || activeOperation || stopping) return;
-    submissionBusy = true;
-    editor.setEnabled(false);
-    editor.addToHistory(text);
-    requestRender();
+  const prepareActiveSelectorSubmission = (input: string): PreparedSubmission<string | null> | null => {
+    const command = detectActiveSelectorCommand(input);
+    if (!activeTurn || stopping || !command) return null;
+
+    const presentation = selectorPresentations.reserve();
+    const controller = new AbortController();
+    let cancelled = false;
+    let settled = false;
+    let resolveReady!: (value: string | null) => void;
+    const ready = new Promise<string | null>((resolve) => {
+      resolveReady = resolve;
+    });
+    const cancel = (): void => {
+      if (cancelled || settled) return;
+      cancelled = true;
+      controller.abort();
+      // Release the presentation reservation independently of the catalog
+      // request. SelectorPresentationQueue defers the actual release until
+      // this slot's predecessor is ready, so an abort-ignoring request cannot
+      // strand later selectors while the queued submission settles now.
+      presentation.release();
+      settled = true;
+      pendingPreflightCancels.delete(cancel);
+      resolveReady(null);
+    };
+    pendingPreflightCancels.add(cancel);
+    const settle = (value: string | null): void => {
+      if (settled) return;
+      settled = true;
+      pendingPreflightCancels.delete(cancel);
+      resolveReady(value);
+    };
+
+    void (async (): Promise<void> => {
+      try {
+        let items: SelectItem[];
+        if (command.name === "model" || command.name === "agentmodel") {
+          const models = await app.models(false, controller.signal);
+          items = models.map((model) => ({
+            value: `${model.provider}:${model.id}`,
+            label: `[${model.provider}] ${model.name}`,
+            description: `${model.id} | context ${model.contextWindow.toLocaleString()}${
+              command.name === "model" && model.supportsFast ? " | fast" : ""
+            }`,
+          }));
+        } else {
+          const model = command.name === "reasoning"
+            ? await app.catalogModel(session.model, session.provider, controller.signal)
+            : await app.catalogModel(session.agentModel, session.agentProvider, controller.signal);
+          items = model.reasoningEfforts.map((value) => ({
+            value,
+            label: value,
+            description: value === (command.name === "reasoning"
+              ? session.reasoningEffort
+              : session.agentReasoningEffort) ? "current" : "",
+          }));
+        }
+        await presentation.wait;
+        // The catalog phase is complete. From here on, the modal arbiter and
+        // submission queue own ordering; Escape should only cancel fetches
+        // that are still holding a pending preflight slot.
+        pendingPreflightCancels.delete(cancel);
+        if (cancelled || stopping) {
+          settle(null);
+          return;
+        }
+        const selected = await selectValue(
+          command.name === "model"
+            ? "Models"
+            : command.name === "agentmodel"
+              ? "Agent models"
+              : command.name === "reasoning"
+                ? "Reasoning effort"
+                : "Agent reasoning effort",
+          items,
+        );
+        if (!selected || cancelled || stopping) {
+          settle(null);
+          return;
+        }
+        settle(expandActiveSelectorCommand(command, selected));
+      } catch (error) {
+        if (!cancelled && !stopping) {
+          addNotice("setting", `Could not load the selector: ${errorMessage(error)}`, yellow);
+        }
+        settle(null);
+      } finally {
+        // This is idempotent with cancellation. The queue performs the
+        // predecessor wait asynchronously rather than making cleanup await a
+        // catalog request that may ignore AbortSignal.
+        presentation.release();
+      }
+    })();
+
+    return prepareQueuedValue(ready, cancel);
+  };
+
+  type QueuedSubmission = string | PreparedSubmission<string | null>;
+
+  const handleSubmission = async (submission: QueuedSubmission): Promise<void> => {
+    const text = typeof submission === "string" ? submission : await submission.ready;
+    if (text === null) return;
+    if (!text || stopping) return;
     try {
-      if (text.startsWith("/")) {
+      if (text.trim().startsWith("/")) {
         const controller = new AbortController();
         activeController = controller;
         try {
@@ -2589,31 +3109,29 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
         } finally {
           if (activeController === controller) activeController = null;
         }
-      } else await runTurn(text);
+      } else {
+        // A prompt queued behind /new or a session switch runs against the
+        // session selected by that earlier command, not necessarily the one
+        // active when the prompt was enqueued. Hide that session's startup
+        // view before model discovery, including when discovery later fails.
+        startupState.markPromptAccepted(session.id, text);
+        root.setStartupVisible(false);
+        await runTurn(text);
+      }
     } catch (error) {
       if (!stopping) addNotice("error", errorMessage(error), red);
     } finally {
-      submissionBusy = false;
-      if (!activeOperation && !stopping) {
-        editor.setEnabled(true);
-        restoreEditor();
-      }
+      if (!stopping) restoreEditor();
     }
   };
+
+  const submissions = new SubmissionQueue<QueuedSubmission>(handleSubmission);
 
   const slashCommands: SlashCommand[] = [
     { name: "new", description: "Start a new session" },
     { name: "fork", description: "Fork current session into an independent copy" },
+    { name: "compact", description: "Compact conversation context" },
     { name: "session", description: "Manage current session" },
-    { name: "config", description: "Configure gateway, credentials, and model" },
-    {
-      name: "persist",
-      description: "Enable or disable persistent scheduled turns",
-      argumentHint: "[on|off]",
-      getArgumentCompletions: (prefix) => ["on", "off"]
-        .filter((value) => value.startsWith(prefix))
-        .map((value) => ({ value, label: value })),
-    },
     {
       name: "sessions",
       description: "Switch session",
@@ -2636,6 +3154,14 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
         })),
     },
     {
+      name: "reasoning",
+      description: "Select a supported reasoning effort",
+      argumentHint: "[effort]",
+      getArgumentCompletions: async (prefix) => (await app.catalogModel(session.model, session.provider)).reasoningEfforts
+        .filter((effort) => effort.startsWith(prefix))
+        .map((effort) => ({ value: effort, label: effort })),
+    },
+    {
       name: "agents",
       description: "Enable or disable agent delegation",
       argumentHint: "[on|off]",
@@ -2656,14 +3182,6 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
         })),
     },
     {
-      name: "reasoning",
-      description: "Select a supported reasoning effort",
-      argumentHint: "[effort]",
-      getArgumentCompletions: async (prefix) => (await app.catalogModel(session.model, session.provider)).reasoningEfforts
-        .filter((effort) => effort.startsWith(prefix))
-        .map((effort) => ({ value: effort, label: effort })),
-    },
-    {
       name: "agentreasoning",
       description: "Select reasoning effort for spawned agents",
       argumentHint: "[effort]",
@@ -2675,15 +3193,6 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
         .map((effort) => ({ value: effort, label: effort })),
     },
     {
-      name: "fast",
-      description: "Toggle fast service",
-      argumentHint: "[on|off]",
-      getArgumentCompletions: (prefix) => ["on", "off"]
-        .filter((value) => value.startsWith(prefix))
-        .map((value) => ({ value, label: value })),
-    },
-    { name: "compact", description: "Compact conversation context" },
-    {
       name: "permissions",
       description: "Set approval mode",
       argumentHint: "[review|code|unrestricted]",
@@ -2691,9 +3200,26 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
         .filter((value) => value.startsWith(prefix))
         .map((value) => ({ value, label: value })),
     },
+    {
+      name: "fast",
+      description: "Toggle fast service",
+      argumentHint: "[on|off]",
+      getArgumentCompletions: (prefix) => ["on", "off"]
+        .filter((value) => value.startsWith(prefix))
+        .map((value) => ({ value, label: value })),
+    },
+    {
+      name: "persist",
+      description: "Enable or disable persistent scheduled turns",
+      argumentHint: "[on|off]",
+      getArgumentCompletions: (prefix) => ["on", "off"]
+        .filter((value) => value.startsWith(prefix))
+        .map((value) => ({ value, label: value })),
+    },
     { name: "schedule", description: "Create a scheduled prompt in this session", argumentHint: "[once|cron] ..." },
     { name: "cron", description: "Browse and manage schedules", argumentHint: "[session]" },
     { name: "inbox", description: "Read all unread scheduler items" },
+    { name: "config", description: "Configure gateway, credentials, and model" },
     { name: "exit", description: "Exit Looking Glass" },
   ];
   editor.setAutocompleteProvider(new SafeAutocompleteProvider(slashCommands, app.workspace));
@@ -2704,12 +3230,21 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
       () => pendingTasks.delete(task),
     );
   };
-  editor.onSubmit = (text) => trackTask(handleSubmission(text));
-
-  const cancelActiveInteraction = (): void => {
+  const cancelNextPendingPreflight = (): boolean => {
+    const cancel = pendingPreflightCancels.values().next().value;
+    if (!cancel) return false;
+    cancel();
+    return true;
+  };
+  const cancelActiveInteraction = (shutdown = false): void => {
     activeController?.abort();
-    activeModal?.cancel();
-    activeModal = null;
+    if (shutdown) {
+      for (const cancel of [...pendingPreflightCancels]) cancel();
+      modalArbiter.cancelAll();
+      activeModal = null;
+    } else {
+      activeModal?.cancel();
+    }
   };
 
   function requestStop(): void {
@@ -2717,13 +3252,35 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
     stopping = true;
     exitConfirmation.reset();
     cancelConfirmation.reset();
-    cancelActiveInteraction();
+    cancelActiveInteraction(true);
     if (pollTimer) clearInterval(pollTimer);
     if (activityTimer) clearInterval(activityTimer);
     pollTimer = null;
     activityTimer = null;
     resolveStopped?.();
   }
+
+  editor.onSubmit = (text) => {
+    if (!text.trim() || stopping) return;
+    editor.addToHistory(text);
+    if (/^\/exit(?:\s|$)/iu.test(text.trim())) {
+      requestStop();
+      return;
+    }
+    if (startupState.markPromptAccepted(session.id, text)) root.setStartupVisible(false);
+    const prepared = prepareActiveSelectorSubmission(text);
+    const ticket = submissions.enqueue(prepared ?? text);
+    if (ticket.queued) {
+      const ahead = Math.max(0, ticket.position - 1);
+      addNotice(
+        "queued",
+        `Submission queued behind ${ahead} item${ahead === 1 ? "" : "s"}; it will run in order.`,
+        cyan,
+      );
+    }
+    trackTask(ticket.promise);
+    requestRender();
+  };
 
   const onSignal = (): void => requestStop();
 
@@ -2792,6 +3349,36 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
         );
       }
       return { consume: true };
+    }
+    if (matchesKey(data, Key.escape) && activeModal) {
+      // A visible picker, approval, or question owns Escape. Do not arm the
+      // active-turn cancellation confirmation while an operator decision is
+      // on screen.
+      exitConfirmation.reset();
+      cancelConfirmation.reset();
+      activeModal.cancel();
+      return { consume: true };
+    }
+    if (
+      matchesKey(data, Key.escape)
+      && !activeOperation
+      && !activeModal
+      && pendingPreflightCancels.size > 0
+      && !(editor.focused && editor.isShowingAutocomplete())
+    ) {
+      // A completed turn can leave a queued selector waiting on its catalog.
+      // Let Escape release only the oldest still-loading preflight; visible
+      // modals and the editor's autocomplete retain their own Escape behavior.
+      exitConfirmation.reset();
+      cancelConfirmation.reset();
+      cancelNextPendingPreflight();
+      return { consume: true };
+    }
+    if (activeOperation && matchesKey(data, Key.escape) && editor.focused && editor.isShowingAutocomplete()) {
+      // Let the editor dismiss its command list without arming cancellation.
+      cancelConfirmation.reset();
+      exitConfirmation.reset();
+      return undefined;
     }
     if (activeOperation && matchesKey(data, Key.escape)) {
       exitConfirmation.reset();
@@ -2883,7 +3470,7 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
     process.removeListener("SIGTERM", onSignal);
     if (pollTimer) clearInterval(pollTimer);
     if (activityTimer) clearInterval(activityTimer);
-    cancelActiveInteraction();
+    cancelActiveInteraction(true);
     for (const assistant of streaming) assistant.dispose();
     if (started) {
       try {

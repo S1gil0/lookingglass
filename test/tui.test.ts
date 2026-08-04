@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { stripVTControlCharacters } from "node:util";
+import { CURSOR_MARKER, visibleWidth } from "@earendil-works/pi-tui";
 import {
   ApprovalModal,
+  SelectorModal,
   AssistantMessage,
   ToolCard,
   UserMessage,
@@ -22,15 +24,202 @@ import {
   parseSessionSchedule,
   ReasoningSummary,
   RepeatedPressConfirmation,
+  renderStartupScreen,
+  renderFrame,
   selectedScreenText,
   sessionMetadataLine,
   shouldAutoDisplayInbox,
+  startupPanelWidth,
+  StartupScreenState,
+  startupSessionEligible,
+  isPlainPromptSubmission,
   restoreApiKeyEnvironment,
   TaskPlanPanel,
+  type TerminalMouseEvent,
+  detectActiveSelectorCommand,
+  expandActiveSelectorCommand,
 } from "../src/ui/tui.js";
 import { terminalSafe } from "../src/ui/stdio.js";
+import { prepareQueuedValue, SubmissionQueue, type PreparedSubmission } from "../src/ui/submission-queue.js";
+import { findModelChoice, SelectorPresentationQueue } from "../src/ui/setting-picker.js";
 import type { InboxRecord, SchedulerJob } from "../src/scheduler/types.js";
 import type { TaskPlanSnapshot } from "../src/task-plan.js";
+
+function selectorMouseEvent(
+  action: TerminalMouseEvent["action"],
+  column: number,
+  row: number,
+  button = 0,
+): TerminalMouseEvent {
+  return { action, button, column, row, shift: false, alt: false, ctrl: false };
+}
+
+test("serializes queued submissions in FIFO order without overlap", async () => {
+  const events: string[] = [];
+  let active = 0;
+  let maximumActive = 0;
+  let releaseFirst!: () => void;
+  const firstTurn = new Promise<void>((resolve) => {
+    releaseFirst = resolve;
+  });
+  const queue = new SubmissionQueue<string>(async (value) => {
+    active += 1;
+    maximumActive = Math.max(maximumActive, active);
+    events.push(`start:${value}`);
+    try {
+      if (value === "first") await firstTurn;
+      events.push(`finish:${value}`);
+    } finally {
+      active -= 1;
+    }
+  });
+
+  const first = queue.enqueue("first");
+  const second = queue.enqueue("second");
+  const third = queue.enqueue("third");
+  assert.equal(first.queued, false);
+  assert.equal(second.position, 2);
+  assert.equal(third.position, 3);
+  assert.equal(queue.size, 3);
+
+  releaseFirst();
+  await Promise.all([first.promise, second.promise, third.promise]);
+  await queue.whenIdle();
+
+  assert.equal(maximumActive, 1);
+  assert.deepEqual(events, [
+    "start:first",
+    "finish:first",
+    "start:second",
+    "finish:second",
+    "start:third",
+    "finish:third",
+  ]);
+  assert.equal(queue.size, 0);
+});
+
+test("continues draining submissions after one item fails", async () => {
+  const completed: string[] = [];
+  const queue = new SubmissionQueue<string>(async (value) => {
+    if (value === "bad") throw new Error("bad submission");
+    completed.push(value);
+  });
+  const failed = queue.enqueue("bad");
+  const next = queue.enqueue("next");
+
+  await assert.rejects(failed.promise, /bad submission/);
+  await next.promise;
+  assert.deepEqual(completed, ["next"]);
+});
+
+test("prepared selector values reserve their FIFO position before later prompts", async () => {
+  const events: string[] = [];
+  let releaseFirst!: () => void;
+  const firstTurn = new Promise<void>((resolve) => {
+    releaseFirst = resolve;
+  });
+  let resolvePicker!: (value: string | null) => void;
+  const picker = prepareQueuedValue(new Promise<string | null>((resolve) => {
+    resolvePicker = resolve;
+  }));
+  type Item = string | PreparedSubmission<string | null>;
+  const queue = new SubmissionQueue<Item>(async (item) => {
+    const value = typeof item === "string" ? item : await item.ready;
+    if (value === null) return;
+    events.push(value);
+    if (value === "first") await firstTurn;
+  });
+
+  queue.enqueue("first");
+  const setting = queue.enqueue(picker);
+  const later = queue.enqueue("later");
+  assert.equal(setting.position, 2);
+  assert.equal(later.position, 3);
+  releaseFirst();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(events, ["first"]);
+  resolvePicker("/model provider:chosen");
+  await Promise.all([setting.promise, later.promise]);
+  assert.deepEqual(events, ["first", "/model provider:chosen", "later"]);
+});
+
+test("cancelled prepared selector values let later submissions continue", async () => {
+  const completed: string[] = [];
+  let resolvePicker!: (value: string | null) => void;
+  const picker = prepareQueuedValue(new Promise<string | null>((resolve) => {
+    resolvePicker = resolve;
+  }));
+  const queue = new SubmissionQueue<string | PreparedSubmission<string | null>>(async (item) => {
+    const value = typeof item === "string" ? item : await item.ready;
+    if (value !== null) completed.push(value);
+  });
+  const cancelled = queue.enqueue(picker);
+  const later = queue.enqueue("later");
+  resolvePicker(null);
+  await cancelled.promise;
+  await later.promise;
+  assert.deepEqual(completed, ["later"]);
+});
+
+test("detects only bare active selector commands and expands captured values", () => {
+  assert.deepEqual(detectActiveSelectorCommand(" /MODEL  "), { name: "model" });
+  assert.deepEqual(detectActiveSelectorCommand("/agentreasoning"), { name: "agentreasoning" });
+  assert.equal(detectActiveSelectorCommand("/model provider:id"), null);
+  assert.equal(detectActiveSelectorCommand("/reasoning high now"), null);
+  assert.equal(expandActiveSelectorCommand({ name: "reasoning" }, " high "), "/reasoning high");
+});
+
+test("selector presentation slots preserve submission order across readiness races", async () => {
+  const presentations = new SelectorPresentationQueue();
+  const first = presentations.reserve();
+  const second = presentations.reserve();
+  let secondReady = false;
+  void second.wait.then(() => {
+    secondReady = true;
+  });
+
+  await Promise.resolve();
+  assert.equal(secondReady, false);
+  first.release();
+  await second.wait;
+  assert.equal(secondReady, true);
+  first.release();
+  second.release();
+});
+
+test("early selector releases cascade in reservation order", async () => {
+  const presentations = new SelectorPresentationQueue();
+  const first = presentations.reserve();
+  const later = presentations.reserve();
+  const last = presentations.reserve();
+  const ready: string[] = [];
+  void later.wait.then(() => ready.push("later"));
+  void last.wait.then(() => ready.push("last"));
+
+  // Model catalog failure/cancellation can happen before the predecessor is
+  // ready. Those releases must remain pending rather than skipping the slot.
+  later.release();
+  last.release();
+  await Promise.resolve();
+  assert.deepEqual(ready, []);
+
+  first.release();
+  await last.wait;
+  assert.deepEqual(ready, ["later", "last"]);
+  later.release();
+  last.release();
+});
+
+test("qualified model choices prefer complete keys and support colon ids", () => {
+  const models = [
+    { provider: "current", id: "plain" },
+    { provider: "current", id: "model:free" },
+    { provider: "other", id: "model:free" },
+  ];
+  assert.deepEqual(findModelChoice(models, "other:model:free", "current"), models[2]);
+  assert.deepEqual(findModelChoice(models, "model:free", "current"), models[1]);
+  assert.deepEqual(findModelChoice(models, "plain", "current"), models[0]);
+});
 
 test("requires a repeated interrupt key press within the confirmation window", () => {
   const confirmation = new RepeatedPressConfirmation(10_000);
@@ -85,6 +274,132 @@ test("bare TUI startup creates a new session while explicit ids resume", async (
   assert.equal((await initialTuiSession(app as never, "existing-session")).id, "existing-session");
   assert.equal(resumedId, "existing-session");
   assert.equal(createCalls, 1);
+});
+
+test("startup eligibility follows durable events and accepted plain prompts", () => {
+  assert.equal(startupSessionEligible(0, false), true);
+  assert.equal(startupSessionEligible(1, false), false);
+  assert.equal(startupSessionEligible(0, true), false);
+  assert.equal(isPlainPromptSubmission(" inspect the project "), true);
+  assert.equal(isPlainPromptSubmission("/model"), false);
+  assert.equal(isPlainPromptSubmission("   "), false);
+
+  const state = new StartupScreenState();
+  assert.equal(state.shouldShow("empty", 0), true);
+  assert.equal(state.markPromptAccepted("empty", "/model"), false);
+  assert.equal(state.shouldShow("empty", 0), true);
+  assert.equal(state.markPromptAccepted("empty", "inspect the project"), true);
+  assert.equal(state.shouldShow("empty", 0), false);
+  assert.equal(state.shouldShow("durable", 1), false);
+  assert.equal(state.shouldShow("new-empty", 0), true);
+  // A prompt queued behind /new is accepted once for the old session and
+  // again when it executes against the newly selected empty session.
+  assert.equal(state.markPromptAccepted("new-empty", "continue in the new session"), true);
+  assert.equal(state.shouldShow("new-empty", 0), false);
+});
+
+test("startup screen centers ANSI content and keeps minimum terminals bounded", () => {
+  for (const [width, height] of [[120, 36], [32, 12]] as const) {
+    const panelWidth = startupPanelWidth(width);
+    const frame = renderStartupScreen(width, height, [
+      "─".repeat(panelWidth),
+      `${" ".repeat(Math.max(0, panelWidth - 2))}${CURSOR_MARKER} `,
+      "─".repeat(panelWidth),
+    ], {
+      panelWidth,
+      metadataLine: "qwen/model (medium) | unrestricted | persist:on | Session name",
+      statusLines: ["[model] gateway status remains inside the panel"],
+    });
+    const plain = frame.map(stripVTControlCharacters);
+    assert.equal(frame.length, height);
+    assert.ok(frame.every((line) => visibleWidth(line) <= width));
+    assert.ok(plain.some((line) => line.includes("███")));
+    assert.ok(plain.some((line) => line.includes("describe a task")));
+    assert.ok(plain.some((line) => line.includes("qwen/model (medium)")));
+    assert.ok(frame.some((line) => line.includes(CURSOR_MARKER)));
+    const panelRowIndex = plain.findIndex((line) => line.includes("─".repeat(panelWidth)));
+    assert.ok(panelRowIndex >= 0);
+    const panelRow = plain[panelRowIndex]!;
+    const panelStart = panelRow.indexOf("─");
+    assert.equal(panelStart, Math.floor((width - panelWidth) / 2));
+    assert.ok(visibleWidth(frame.find((line) => line.includes(CURSOR_MARKER)) ?? "") <= width);
+
+    if (width >= 64) {
+      const statusRow = plain.find((line) => line.includes("gateway status"));
+      assert.ok(statusRow);
+      const statusStart = statusRow!.search(/\S/u);
+      assert.ok(statusStart >= panelStart);
+      assert.ok(statusStart + visibleWidth(statusRow!.slice(statusStart)) <= panelStart + panelWidth);
+    }
+  }
+});
+
+test("startup logo renders the neon block wordmark without separate subtext", () => {
+  for (const [width, height] of [[120, 36], [50, 15], [32, 20]] as const) {
+    const frame = renderStartupScreen(width, height, [], { inputEmpty: false });
+    const plain = frame.map(stripVTControlCharacters).join("\n");
+
+    assert.equal(frame.length, height);
+    assert.ok(frame.every((line) => visibleWidth(line) <= width));
+    assert.ok(plain.includes("█░░ ███ ███"));
+    assert.ok(plain.includes("███ ███ █░█ ███ ███"));
+    assert.equal(plain.includes("LOOKING GLASS"), false);
+    assert.equal(plain.includes("❯_"), false);
+  }
+});
+
+test("startup truncation keeps the latest notice label before its tail", () => {
+  const width = 40;
+  const panelWidth = startupPanelWidth(width);
+  const frame = renderStartupScreen(width, 12, [
+    "─".repeat(panelWidth),
+    `${CURSOR_MARKER}${" ".repeat(Math.max(0, panelWidth - 1))}`,
+    "─".repeat(panelWidth),
+  ], {
+    panelWidth,
+    metadataLine: "model (high)",
+    statusLines: ["[model] updated", "continuation", "unexplained tail"],
+  }).map(stripVTControlCharacters);
+
+  assert.ok(frame.some((line) => line.includes("[model] updated")));
+  assert.equal(frame.some((line) => line.includes("unexplained tail")), false);
+});
+
+test("dismissing startup returns the existing full-height transcript layout", () => {
+  const terminal = { rows: 12, columns: 40 } as never;
+  const editor = {
+    invalidate() {},
+    render() { return ["editor input"]; },
+  } as never;
+  const root = new FullHeightRoot(
+    terminal,
+    editor,
+    new TaskPlanPanel(),
+    () => "activity",
+    () => "metadata",
+    { startupVisible: true },
+  );
+  const startup = root.render(40).map(stripVTControlCharacters);
+  assert.ok(startup.some((line) => line.includes("███")));
+  assert.ok(startup.some((line) => line.includes("metadata")));
+  root.setStartupVisible(false);
+  root.addEntry(new AssistantMessage("The normal transcript is active."));
+  const normal = root.render(40).map(stripVTControlCharacters);
+  assert.equal(normal.some((line) => line.includes("███")), false);
+  assert.ok(normal.some((line) => line.includes("The normal transcript is active.")));
+  assert.equal(normal.at(-1), " metadata");
+});
+
+test("startup keeps the existing minimum-terminal diagnostic", () => {
+  const terminal = { rows: 11, columns: 31 } as never;
+  const editor = { invalidate() {}, render() { return ["editor input"]; } } as never;
+  const root = new FullHeightRoot(terminal, editor, new TaskPlanPanel(), () => "activity", () => "metadata", {
+    startupVisible: true,
+  });
+  const frame = root.render(31).map(stripVTControlCharacters);
+  assert.equal(frame.length, 11);
+  assert.match(frame.join("\n"), /Terminal too small \(31x11\); nee/);
+  assert.equal(frame.some((line) => line.includes("LOOKING GLASS")), false);
 });
 
 test("provides sensible gateway onboarding defaults", () => {
@@ -404,6 +719,45 @@ test("keeps encoded arbitrary agent ids distinct while rendering readable labels
   assert.match(rendered, /similar-long/u);
 });
 
+test("renders modal frames with rounded box-drawing borders and a glass accent", () => {
+  const frame = renderFrame("Confirm command", ["Details", "Choose an action"], 28);
+  const plain = frame.map(stripVTControlCharacters);
+
+  assert.equal(frame.length, 6);
+  assert.match(plain[0]!, /^╭─+╮$/u);
+  assert.match(plain[1]!, /^│ ◇ Confirm command\s+│$/u);
+  assert.match(plain[2]!, /^├─+┤$/u);
+  assert.match(plain[3]!, /^│Details\s+│$/u);
+  assert.match(plain[4]!, /^│Choose an action\s+│$/u);
+  assert.match(plain[5]!, /^╰─+╯$/u);
+  assert.ok(frame.every((line) => visibleWidth(line) === 28));
+});
+
+test("truncates ANSI-styled frame content and titles to the requested width", () => {
+  const frame = renderFrame(
+    `A very long modal title ${"x".repeat(20)}`,
+    [`\x1b[32m${"body ".repeat(12)}\x1b[39m`],
+    18,
+  );
+  const plain = frame.map(stripVTControlCharacters);
+
+  assert.ok(frame.every((line) => visibleWidth(line) <= 18));
+  assert.ok(frame.every((line) => visibleWidth(line) === 18));
+  assert.match(plain[1]!, /^│ ◇ A very long /u);
+  assert.match(plain[1]!, /│$/u);
+  assert.match(frame[1]!, /\x1b\[1m/u);
+  assert.match(frame[3]!, /\x1b\[32m/u);
+});
+
+test("falls back to unframed ANSI-aware lines for widths below four cells", () => {
+  for (const width of [1, 2, 3]) {
+    const frame = renderFrame("Title", [`\x1b[36m${"abcdef"}\x1b[39m`, "body"], width);
+    assert.equal(frame.length, 2);
+    assert.ok(frame.every((line) => visibleWidth(line) <= width));
+    assert.doesNotMatch(stripVTControlCharacters(frame.join("\n")), /[╭╮╰╯│]/u);
+  }
+});
+
 test("renders approval actions as clickable buttons", () => {
   const terminal = { rows: 24, columns: 80 } as never;
   const modal = new ApprovalModal(terminal, {
@@ -573,6 +927,135 @@ test("stacks approval buttons safely at minimum terminal width", () => {
   assert.equal(modal.handleMouse({ ...border, action: "press" }), false);
   assert.equal(modal.handleMouse({ ...border, action: "release" }), false);
   assert.equal(result, null);
+});
+
+test("selector clicks highlight on press and select only on a matching release", () => {
+  const terminal = { rows: 24, columns: 80 };
+  const modal = new SelectorModal(terminal, "Pick one", [
+    { value: "first", label: "First" },
+    { value: "second", label: "Second" },
+    { value: "third", label: "Third" },
+  ], 3);
+  const width = 52;
+  const plain = modal.render(width).map(stripVTControlCharacters);
+  const itemRow = plain.findIndex((line) => line.includes("Second"));
+  assert.ok(itemRow >= 0);
+  const overlayColumn = 1 + Math.floor((terminal.columns - 2 - width) / 2);
+  const overlayRow = 1 + Math.floor((terminal.rows - 2 - plain.length) / 2);
+  const point = selectorMouseEvent("press", overlayColumn + 2, overlayRow + itemRow);
+  let selected: string | null = null;
+  modal.onSelect = (value) => {
+    selected = value;
+  };
+
+  assert.equal(modal.handleMouse(point), true);
+  assert.equal(modal.list.getSelectedItem()?.value, "second");
+  assert.equal(selected, null);
+  assert.equal(modal.handleMouse({ ...point, action: "release" }), true);
+  assert.equal(selected, "second");
+
+  const mismatch = new SelectorModal(terminal, "Pick one", [
+    { value: "first", label: "First" },
+    { value: "second", label: "Second" },
+  ], 2);
+  const mismatchLines = mismatch.render(width).map(stripVTControlCharacters);
+  const mismatchOriginRow = 1 + Math.floor((terminal.rows - 2 - mismatchLines.length) / 2);
+  const mismatchFirst = mismatchLines.findIndex((line) => line.includes("First"));
+  const mismatchSecond = mismatchLines.findIndex((line) => line.includes("Second"));
+  let mismatchValue: string | null = null;
+  mismatch.onSelect = (value) => {
+    mismatchValue = value;
+  };
+  mismatch.handleMouse(selectorMouseEvent("press", overlayColumn + 2, mismatchOriginRow + mismatchFirst));
+  mismatch.handleMouse(selectorMouseEvent("release", overlayColumn + 2, mismatchOriginRow + mismatchSecond));
+  assert.equal(mismatchValue, null);
+
+  const foreignRelease = selectorMouseEvent("press", overlayColumn + 2, mismatchOriginRow + mismatchFirst);
+  mismatch.handleMouse(foreignRelease);
+  assert.equal(mismatch.handleMouse({ ...foreignRelease, action: "release", button: 1 }), false);
+  mismatch.handleMouse({ ...foreignRelease, action: "release", button: 3 });
+  assert.equal(mismatchValue, null);
+});
+
+test("selector ignores frame, prompt, hint, scroll indicator, and outside clicks", () => {
+  const terminal = { rows: 24, columns: 80 };
+  const modal = new SelectorModal(terminal, "Pick one", [
+    { value: "one", label: "One" },
+    { value: "two", label: "Two" },
+    { value: "three", label: "Three" },
+    { value: "four", label: "Four" },
+  ], 2, "Choose an option from this prompt");
+  const width = 52;
+  const plain = modal.render(width).map(stripVTControlCharacters);
+  const overlayColumn = 1 + Math.floor((terminal.columns - 2 - width) / 2);
+  const overlayRow = 1 + Math.floor((terminal.rows - 2 - plain.length) / 2);
+  const hintRow = plain.findIndex((line) => line.includes("Enter select"));
+  const scrollRow = plain.findIndex((line) => line.includes("(1/4)"));
+  const promptRow = plain.findIndex((line) => line.includes("Choose an option"));
+  assert.ok(hintRow >= 0);
+  assert.ok(scrollRow >= 0);
+  assert.ok(promptRow >= 0);
+  let selected: string | null = null;
+  modal.onSelect = (value) => {
+    selected = value;
+  };
+  const ignored = [
+    selectorMouseEvent("press", overlayColumn + 2, overlayRow),
+    selectorMouseEvent("press", overlayColumn + 2, overlayRow + promptRow),
+    selectorMouseEvent("press", overlayColumn + 2, overlayRow + scrollRow),
+    selectorMouseEvent("press", overlayColumn + 2, overlayRow + hintRow),
+    selectorMouseEvent("press", overlayColumn - 1, overlayRow + promptRow),
+  ];
+  for (const press of ignored) {
+    modal.handleMouse(press);
+    modal.handleMouse({ ...press, action: "release" });
+  }
+  assert.equal(selected, null);
+});
+
+test("selector wheel movement follows keyboard scrolling and survives prompt offsets and resize", () => {
+  const terminal = { rows: 24, columns: 80 };
+  const modal = new SelectorModal(terminal, "Pick one", Array.from({ length: 6 }, (_, index) => ({
+    value: `value-${index}`,
+    label: `Value ${index}`,
+  })), 3, "A prompt that wraps across multiple rows in the selector");
+  const width = 52;
+  let plain = modal.render(width).map(stripVTControlCharacters);
+  const overlayColumn = 1 + Math.floor((terminal.columns - 2 - width) / 2);
+  let overlayRow = 1 + Math.floor((terminal.rows - 2 - plain.length) / 2);
+  const wheelPoint = selectorMouseEvent("wheel_down", overlayColumn + 2, overlayRow + 3);
+  assert.equal(modal.handleMouse(wheelPoint), true);
+  assert.equal(modal.list.getSelectedItem()?.value, "value-1");
+  modal.handleInput("\x1b[B");
+  assert.equal(modal.list.getSelectedItem()?.value, "value-2");
+  plain = modal.render(width).map(stripVTControlCharacters);
+  overlayRow = 1 + Math.floor((terminal.rows - 2 - plain.length) / 2);
+  const visibleRow = plain.findIndex((line) => line.includes("Value 2"));
+  assert.ok(visibleRow >= 0);
+  let selected: string | null = null;
+  modal.onSelect = (value) => {
+    selected = value;
+  };
+  const outside = selectorMouseEvent("wheel_down", overlayColumn - 1, overlayRow + visibleRow);
+  assert.equal(modal.handleMouse(outside), false);
+  assert.equal(modal.list.getSelectedItem()?.value, "value-2");
+  const option = selectorMouseEvent("press", overlayColumn + 2, overlayRow + visibleRow);
+  modal.handleMouse(option);
+  modal.handleMouse({ ...option, action: "release" });
+  assert.equal(selected, "value-2");
+
+  terminal.columns = 64;
+  terminal.rows = 20;
+  const resizedWidth = 42;
+  plain = modal.render(resizedWidth).map(stripVTControlCharacters);
+  overlayRow = 1 + Math.floor((terminal.rows - 2 - plain.length) / 2);
+  const resizedRow = plain.findIndex((line) => line.includes("Value 2"));
+  assert.ok(resizedRow >= 0);
+  const resizedColumn = 1 + Math.floor((terminal.columns - 2 - resizedWidth) / 2) + 2;
+  const resizedPoint = selectorMouseEvent("press", resizedColumn, overlayRow + resizedRow);
+  modal.handleMouse(resizedPoint);
+  modal.handleMouse({ ...resizedPoint, action: "release" });
+  assert.equal(selected, "value-2");
 });
 
 function taskPlanSnapshot(items: TaskPlanSnapshot["plan"]["items"]): TaskPlanSnapshot {
@@ -877,4 +1360,19 @@ test("caps an oversized task plan so the checklist stays above the editor viewpo
   assert.ok(plain.some((line) => line.includes("editor input")));
   assert.match(plain.join("\n"), /\[\.\.\. \d+ more plan lines\]/);
   assert.ok(plain.every((line) => line.length <= columns));
+});
+
+test("selects text rendered in the command editor area", () => {
+  const terminal = { rows: 12, columns: 40 } as never;
+  const editor = {
+    invalidate() {},
+    render() { return ["editor input"]; },
+  } as never;
+  const root = new FullHeightRoot(terminal, editor, new TaskPlanPanel(), () => "activity", () => "metadata");
+  const frame = root.render(40).map(stripVTControlCharacters);
+  const editorRow = frame.findIndex((line) => line.includes("editor input"));
+  assert.ok(editorRow >= 0);
+  assert.equal(root.startSelection({ row: editorRow, column: 0 }), true);
+  assert.equal(root.updateSelection({ row: editorRow, column: "editor input".length - 1 }), true);
+  assert.equal(root.selectionText(), "editor input");
 });
