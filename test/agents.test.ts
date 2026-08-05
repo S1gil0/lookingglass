@@ -34,9 +34,9 @@ function response(id: string, text: string): Response {
 }
 
 const agentModel: GatewayModel = {
-  id: "gpt-luna",
+  id: "worker-model",
   provider: "codex-lb",
-  name: "GPT Luna",
+  name: "Worker Model",
   description: "",
   contextWindow: 100_000,
   maxOutputTokens: null,
@@ -81,10 +81,10 @@ test("agent coordinator runs isolated tasks concurrently with configured model m
   const parent = sessions.create({
     workspace: root,
     provider: "codex-lb",
-    model: "gpt-sol",
+    model: "coordinator-model",
     reasoningEffort: "medium",
     agentProvider: "codex-lb",
-    agentModel: "gpt-luna",
+    agentModel: "worker-model",
     agentReasoningEffort: "high",
     verbosity: "low",
     fast: false,
@@ -144,23 +144,23 @@ test("agent coordinator runs isolated tasks concurrently with configured model m
 
   assert.equal(peak, 2);
   assert.equal(requests.length, 3);
-  assert.ok(requests.every((request) => request.model === "gpt-luna"));
+  assert.ok(requests.every((request) => request.model === "worker-model"));
   assert.ok(requests.every((request) => request.reasoningEffort === "high"));
   assert.ok(requests.every((request) => !JSON.stringify(request.input).includes("PARENT_TRANSCRIPT_MUST_NOT_LEAK")));
   assert.ok(requests.every((request) => request.instructions.includes("fresh conversation context")));
   assert.ok(requests.every((request) => JSON.stringify(request.input).includes("Context contract")));
   assert.ok(result.output.indexOf("## slow") < result.output.indexOf("## fast"));
   assert.ok(result.output.indexOf("## fast") < result.output.indexOf("## third"));
-  assert.match(result.output, /codex-lb:gpt-luna \| reasoning high/);
+  assert.match(result.output, /codex-lb:worker-model \| reasoning high/);
   assert.match(result.output, /child_session_id:/);
   assert.equal(instructionLoads, 3);
   assert.equal(result.metadata?.agentTasksAttempted, 3);
-  assert.ok(progress.some((message) => /gpt-luna.*reasoning high.*agent "fast" \[starting\]/.test(message)));
+  assert.ok(progress.some((message) => /worker-model.*reasoning high.*agent "fast" \[starting\]/.test(message)));
   assert.equal(sessions.list(root).length, 1);
   const children = db.prepare("SELECT * FROM sessions WHERE parent_session_id = ?").all(parent.id) as { session_kind: string; model: string; reasoning_effort: string }[];
   assert.equal(children.length, 3);
   assert.ok(children.every((child) => child.session_kind === "agent"));
-  assert.ok(children.every((child) => child.model === "gpt-luna" && child.reasoning_effort === "high"));
+  assert.ok(children.every((child) => child.model === "worker-model" && child.reasoning_effort === "high"));
 });
 
 test("agent coordinator redacts credentials from successful aggregate and oversized results", async (t) => {
@@ -183,10 +183,10 @@ test("agent coordinator redacts credentials from successful aggregate and oversi
   const parent = sessions.create({
     workspace: root,
     provider: "codex-lb",
-    model: "gpt-sol",
+    model: "coordinator-model",
     reasoningEffort: "medium",
     agentProvider: "codex-lb",
-    agentModel: "gpt-luna",
+    agentModel: "worker-model",
     agentReasoningEffort: "high",
     verbosity: "low",
     fast: false,
@@ -261,10 +261,10 @@ test("agent coordinator forwards child tool callbacks as agent progress actions"
   const parent = sessions.create({
     workspace: root,
     provider: "codex-lb",
-    model: "gpt-sol",
+    model: "coordinator-model",
     reasoningEffort: "medium",
     agentProvider: "codex-lb",
-    agentModel: "gpt-luna",
+    agentModel: "worker-model",
     agentReasoningEffort: "high",
     verbosity: "low",
     fast: false,
@@ -346,10 +346,10 @@ test("agent coordinator propagates read-only context to code-mode child turns", 
   const parent = sessions.create({
     workspace: root,
     provider: "codex-lb",
-    model: "gpt-sol",
+    model: "coordinator-model",
     reasoningEffort: "medium",
     agentProvider: "codex-lb",
-    agentModel: "gpt-luna",
+    agentModel: "worker-model",
     agentReasoningEffort: "high",
     verbosity: "low",
     fast: false,
@@ -414,10 +414,10 @@ test("agent model lookup failures are safe preflight failures", async (t) => {
   const parent = sessions.create({
     workspace: root,
     provider: "codex-lb",
-    model: "gpt-sol",
+    model: "coordinator-model",
     reasoningEffort: "medium",
     agentProvider: "codex-lb",
-    agentModel: "gpt-luna",
+    agentModel: "worker-model",
     agentReasoningEffort: "high",
     verbosity: "low",
     fast: false,
@@ -513,7 +513,7 @@ test("model catalog bounds failed gateways and cools them down", async () => {
   const started = Date.now();
   const first = await app.models();
   assert.ok(Date.now() - started < 500);
-  assert.deepEqual(first.map((model) => `${model.provider}:${model.id}`), ["codex-lb:gpt-luna"]);
+  assert.deepEqual(first.map((model) => `${model.provider}:${model.id}`), ["codex-lb:worker-model"]);
   assert.equal(codexCalls, 1);
   assert.equal(studioCalls, 1);
 
@@ -529,21 +529,21 @@ test("model catalog bounds failed gateways and cools them down", async () => {
     modelCacheTimes: Map<string, number>;
   };
   catalogInternals.modelCacheTimes.set("codex-lb", Date.now() - 31_000);
-  const stale = await app.catalogModel("gpt-luna", "codex-lb");
-  assert.equal(stale.id, "gpt-luna");
+  const stale = await app.catalogModel("worker-model", "codex-lb");
+  assert.equal(stale.id, "worker-model");
   assert.equal(codexCalls, 2);
-  const cooledStale = await app.catalogModel("gpt-luna", "codex-lb");
-  assert.equal(cooledStale.id, "gpt-luna");
+  const cooledStale = await app.catalogModel("worker-model", "codex-lb");
+  assert.equal(cooledStale.id, "worker-model");
   assert.equal(codexCalls, 2);
   const stopped = new AbortController();
   stopped.abort(new Error("caller stopped"));
-  await assert.rejects(app.catalogModel("gpt-luna", "codex-lb", stopped.signal), /caller stopped/);
+  await assert.rejects(app.catalogModel("worker-model", "codex-lb", stopped.signal), /caller stopped/);
 
-  await assert.rejects(app.catalogModel("gpt-luna", "lm-studio"), /temporarily unavailable/);
+  await assert.rejects(app.catalogModel("worker-model", "lm-studio"), /temporarily unavailable/);
   studioOnline = true;
   const internals = app as unknown as { modelFailures: Map<string, number> };
   internals.modelFailures.set("lm-studio", Date.now() - 31_000);
-  const recovered = await app.catalogModel("gpt-luna", "lm-studio");
+  const recovered = await app.catalogModel("worker-model", "lm-studio");
   assert.equal(recovered.provider, "lm-studio");
   assert.equal(studioCalls, 2);
 });
@@ -565,7 +565,7 @@ test("model catalog timeout bounds an existing shared request", async () => {
   const keepAlive = setTimeout(() => {}, 1_000);
   try {
     await assert.rejects(
-      app.catalogModel("gpt-luna", "codex-lb"),
+      app.catalogModel("worker-model", "codex-lb"),
       /Gateway model catalog timed out after 20ms: codex-lb/,
     );
   } finally {

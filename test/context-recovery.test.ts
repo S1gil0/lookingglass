@@ -977,11 +977,11 @@ test("explicit provider migration rotates continuity and cache identity", (t) =>
   assert.ok(sessions.latestCheckpoint(session.id));
   const migrated = sessions.updateSettings(session.id, {
     provider: "lm-studio",
-    model: "qwen/qwen3.6-35b-a3b",
+    model: "coordinator-model",
     reasoningEffort: "none",
   });
   assert.equal(migrated.provider, "lm-studio");
-  assert.equal(migrated.model, "qwen/qwen3.6-35b-a3b");
+  assert.equal(migrated.model, "coordinator-model");
   assert.equal(migrated.lastResponseId, null);
   assert.notEqual(migrated.promptCacheKey, session.promptCacheKey);
   assert.equal(sessions.latestCheckpoint(session.id), null);
@@ -996,11 +996,11 @@ test("agent settings are durable without rotating primary continuity and hidden 
   const before = sessions.get(session.id)!;
   const updated = sessions.updateSettings(session.id, {
     agentProvider: "lm-studio",
-    agentModel: "qwen/agent",
+    agentModel: "worker-model",
     agentReasoningEffort: "high",
   });
   assert.equal(updated.agentProvider, "lm-studio");
-  assert.equal(updated.agentModel, "qwen/agent");
+  assert.equal(updated.agentModel, "worker-model");
   assert.equal(updated.agentReasoningEffort, "high");
   assert.equal(updated.promptCacheKey, before.promptCacheKey);
   assert.equal(updated.lastResponseId, "primary-response");

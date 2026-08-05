@@ -307,7 +307,7 @@ test("startup screen centers ANSI content and keeps minimum terminals bounded", 
       "─".repeat(panelWidth),
     ], {
       panelWidth,
-      metadataLine: "qwen/model (medium) | unrestricted | persist:on | Session name",
+      metadataLine: "coordinator-model (medium) | unrestricted | persist:on | Session name",
       statusLines: ["[model] gateway status remains inside the panel"],
     });
     const plain = frame.map(stripVTControlCharacters);
@@ -315,7 +315,7 @@ test("startup screen centers ANSI content and keeps minimum terminals bounded", 
     assert.ok(frame.every((line) => visibleWidth(line) <= width));
     assert.ok(plain.some((line) => line.includes("███")));
     assert.ok(plain.some((line) => line.includes("describe a task")));
-    assert.ok(plain.some((line) => line.includes("qwen/model (medium)")));
+    assert.ok(plain.some((line) => line.includes("coordinator-model (medium)")));
     assert.ok(frame.some((line) => line.includes(CURSOR_MARKER)));
     const panelRowIndex = plain.findIndex((line) => line.includes("─".repeat(panelWidth)));
     assert.ok(panelRowIndex >= 0);
@@ -495,8 +495,8 @@ test("renders activity separately from ordered session metadata", () => {
     provider: "lm-studio",
     agentProvider: "codex-lb",
     title: "Session name",
-    model: "qwen/model",
-    agentModel: "gpt-luna",
+    model: "coordinator-model",
+    agentModel: "worker-model",
     reasoningEffort: "medium",
     agentReasoningEffort: "high",
     agentsEnabled: true,
@@ -512,15 +512,15 @@ test("renders activity separately from ordered session metadata", () => {
     createdAt: 1,
     updatedAt: 1,
   }, "unrestricted", "ctx:42%/1.2k");
-  assert.equal(metadata, "qwen/model (medium) | agent: gpt-luna (high) | ctx:42%/1.2k | unrestricted | persist:on | Session name");
+  assert.equal(metadata, "coordinator-model (medium) | agent: worker-model (high) | ctx:42%/1.2k | unrestricted | persist:on | Session name");
   const narrow = sessionMetadataLine({
     id: "session",
     workspace: "/tmp",
     provider: "lm-studio",
     agentProvider: "codex-lb",
     title: "A long session name",
-    model: "qwen/qwen3.6-35b-a3b",
-    agentModel: "gpt-luna",
+    model: "coordinator-model",
+    agentModel: "worker-model",
     reasoningEffort: "medium",
     agentReasoningEffort: "high",
     agentsEnabled: false,
@@ -536,7 +536,7 @@ test("renders activity separately from ordered session metadata", () => {
     createdAt: 1,
     updatedAt: 1,
   }, "unrestricted", "ctx:42%/1.2k", 79);
-  assert.match(narrow, /^qwen\/.* \| agent: off \| ctx:42%\/1.2k \| unrestricted \| A/);
+  assert.match(narrow, /^coordinator-mode\.\.\. \| agent: off \| ctx:42%\/1.2k \| unrestricted \| A/);
   assert.doesNotMatch(narrow, /(?:^|\| )p(?:ersist)?:/);
   assert.ok(narrow.length <= 79);
   const startup = sessionMetadataLine({
@@ -545,8 +545,8 @@ test("renders activity separately from ordered session metadata", () => {
     provider: "lm-studio",
     agentProvider: "codex-lb",
     title: "New session",
-    model: "qwen/qwen3.6-35b-a3b",
-    agentModel: "gpt-luna",
+    model: "coordinator-model",
+    agentModel: "worker-model",
     reasoningEffort: "medium",
     agentReasoningEffort: "high",
     agentsEnabled: false,
@@ -562,7 +562,7 @@ test("renders activity separately from ordered session metadata", () => {
     createdAt: 1,
     updatedAt: 1,
   }, "unrestricted", "ctx:?", 62, true);
-  assert.equal(startup, "qwen/qwen3.6-35b-a3b (medium) | agent: off | unrestricted");
+  assert.equal(startup, "coordinator-model (medium) | agent: off | unrestricted");
   assert.doesNotMatch(startup, /ctx:|New session/);
   assert.equal(formatTokenCount(512), "512");
   assert.equal(formatTokenCount(1_000), "1k");
@@ -669,8 +669,8 @@ test("uses distinct transcript tones without repeating the assistant title", () 
   const user = new UserMessage("Inspect the service").render(width);
   const assistant = new AssistantMessage("The service is healthy.").render(width);
   const tool = new ToolCard("call-1", "bash", "Check service status");
-  tool.progress("codex-lb:gpt-luna | reasoning high | agent api [Thinking]");
-  assert.match(stripVTControlCharacters(tool.render(width).join("\n")), /gpt-luna.*reasoning high/);
+  tool.progress("codex-lb:worker-model | reasoning high | agent api [Thinking]");
+  assert.match(stripVTControlCharacters(tool.render(width).join("\n")), /worker-model.*reasoning high/);
   tool.finish("active", false);
   const toolLines = tool.render(width);
 
@@ -688,7 +688,7 @@ test("uses distinct transcript tones without repeating the assistant title", () 
 test("keeps agent progress oldest-first, grouped, bounded, and visible after finish", () => {
   const tool = new ToolCard("agents", "run_agents", "Run agents");
   const progress = (agent: string, action: string): void => {
-    tool.progress(`codex-lb:gpt-luna | reasoning high | agent ${agent} [${action}]`);
+    tool.progress(`codex-lb:worker-model | reasoning high | agent ${agent} [${action}]`);
   };
   progress("alpha", "older");
   progress("alpha", "newer");
@@ -701,7 +701,7 @@ test("keeps agent progress oldest-first, grouped, bounded, and visible after fin
 
   const bounded = new ToolCard("bounded", "run_agents", "Run agents");
   for (let index = 0; index < 12; index += 1) {
-    bounded.progress(`codex-lb:gpt-luna | reasoning high | agent alpha [action-${index}]`);
+    bounded.progress(`codex-lb:worker-model | reasoning high | agent alpha [action-${index}]`);
   }
   const boundedText = stripVTControlCharacters(bounded.render(96).join("\n"));
   assert.equal((boundedText.match(/action-\d+/gu) ?? []).length, 5);
@@ -717,7 +717,7 @@ test("keeps agent progress oldest-first, grouped, bounded, and visible after fin
 test("keeps encoded arbitrary agent ids distinct while rendering readable labels", () => {
   const tool = new ToolCard("encoded-agents", "run_agents", "Run agents");
   const progress = (agent: string, action: string): void => {
-    tool.progress(`codex-lb:gpt-luna | reasoning high | agent ${JSON.stringify(agent)} [${action}]`);
+    tool.progress(`codex-lb:worker-model | reasoning high | agent ${JSON.stringify(agent)} [${action}]`);
   };
   const whitespaceId = "worker  id";
   const ordinaryId = "worker id";

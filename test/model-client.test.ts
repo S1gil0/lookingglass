@@ -16,7 +16,7 @@ import {
 } from "../src/model/codex-lb.js";
 
 const request: ResponseRequest = {
-  model: "qwen/qwen3.6-35b-a3b",
+  model: "coordinator-model",
   instructions: "test",
   input: [{ role: "user", content: [{ type: "input_text", text: "hello" }] }] as ResponseInputItem[],
   tools: [],
@@ -247,8 +247,8 @@ test("LM Studio tool schemas omit long maxLength bounds without changing source 
 test("maps LM Studio native model metadata", () => {
   const model = lmStudioModelInfo({
     type: "llm",
-    key: "qwen/qwen3.6-35b-a3b",
-    display_name: "Qwen3.6 35B A3B",
+    key: "coordinator-model",
+    display_name: "Coordinator Model",
     max_context_length: 262_144,
     loaded_instances: [{ config: { context_length: 131_072 } }],
     capabilities: {
@@ -257,8 +257,8 @@ test("maps LM Studio native model metadata", () => {
       reasoning: { allowed_options: ["off", "on"], default: "on" },
     },
   });
-  assert.equal(model.id, "qwen/qwen3.6-35b-a3b");
-  assert.equal(model.name, "Qwen3.6 35B A3B");
+  assert.equal(model.id, "coordinator-model");
+  assert.equal(model.name, "Coordinator Model");
   assert.equal(model.contextWindow, 131_072);
   assert.equal(model.supportsReasoning, true);
   assert.deepEqual(model.reasoningEfforts, ["none", "medium"]);

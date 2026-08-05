@@ -2,7 +2,25 @@
   <img src="./img/lg.png" alt="Looking Glass — Persistent AI Automation">
 </p>
 
-Looking Glass is an open-source local AI coding CLI for persistent, automatable sessions. It combines interactive terminal chat and one-shot prompts with workspace tools, configurable OpenAI-compatible gateways, durable SQLite state, and a scheduler for future model turns.
+Looking Glass is an open-source local AI coding CLI that lets one model orchestrate while concurrent worker agents use another—with an independent provider, model, and reasoning level for each role. A hosted model can coordinate the session while faster, cheaper, or local models handle parallel work, or the arrangement can be reversed.
+
+It combines this multi-model orchestration with interactive terminal chat, complete development tools, persistent sessions, durable SQLite state, and a scheduler that can run future model turns after the terminal closes.
+
+## Mix Models and Providers for Orchestration
+
+The primary model owns the conversation, plans the work, and decides when to delegate. Worker agents run isolated discovery, implementation, or review tasks concurrently using their own shared agent configuration. The two roles can use the same gateway or completely different providers—for example, an OpenRouter model as coordinator and an LM Studio model for local worker agents.
+
+Provider, model, and reasoning effort are selected independently for the primary and agent roles and stored with the session. Scheduled turns resume with the same choices. Configure them from the interactive model pickers or directly with slash commands:
+
+```text
+/model openrouter:<main-model-id>
+/reasoning high
+/agentmodel lm-studio:<worker-model-id>
+/agentreasoning medium
+/agents on
+```
+
+This makes it practical to reserve a stronger model for architecture and coordination while distributing parallel tasks to lower-latency or lower-cost models without leaving the session.
 
 ## Persistent Sessions and Scheduled Turns
 
@@ -21,8 +39,6 @@ Scheduled prompts are not separate stateless jobs or fresh chats. Future turns c
 - Continue debugging after external processes produce new logs or artifacts.
 - Keep a session working through scheduled turns while the interactive terminal is closed.
 - Combine exact scheduled shell commands with context-aware AI follow-ups.
-
-The main model and worker-agent model are configured independently, including separate reasoning levels. A stronger model can coordinate the task while faster or cheaper models handle parallel discovery, implementation, or review work.
 
 ## What It Provides
 
