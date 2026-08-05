@@ -276,6 +276,7 @@ export function sessionMetadataLine(
   approval: ApprovalMode,
   contextUsage: string,
   width = Number.POSITIVE_INFINITY,
+  startup = false,
 ): string {
   const narrow = Number.isFinite(width) && width < 100;
   const modelInfo = `${session.model} (${session.reasoningEffort})`;
@@ -283,10 +284,17 @@ export function sessionMetadataLine(
     session.agentsEnabled
       ? `agent: ${session.agentModel} (${session.agentReasoningEffort})`
       : "agent: off",
-    contextUsage,
+    ...(!startup ? [contextUsage] : []),
     approval,
     ...(session.persistent ? [`${narrow ? "p" : "persist"}:on`] : []),
   ];
+  if (startup) {
+    const separators = 3 * middle.length;
+    const modelWidth = Number.isFinite(width)
+      ? Math.max(4, Math.floor(width) - middle.reduce((sum, value) => sum + value.length, 0) - separators)
+      : modelInfo.length;
+    return [oneLine(modelInfo, modelWidth), ...middle].join(" | ");
+  }
   const separators = 3 * (middle.length + 1);
   const available = Number.isFinite(width)
     ? Math.max(8, Math.floor(width) - middle.reduce((sum, value) => sum + value.length, 0) - separators)
@@ -1013,7 +1021,7 @@ export class FullHeightRoot extends Container {
     readonly editor: TurnEditor,
     private readonly taskPlanPanel: TaskPlanPanel,
     private readonly activityText: () => string,
-    private readonly metadataText: (width: number) => string,
+    private readonly metadataText: (width: number, startup?: boolean) => string,
     options: {
       maxEntries?: number;
       onEvict?: (component: Component) => void;
@@ -1210,7 +1218,7 @@ export class FullHeightRoot extends Container {
       const frame = renderStartupScreen(safeWidth, height, editorLines, {
         panelWidth,
         statusLines,
-        metadataLine: this.metadataText(panelWidth),
+        metadataLine: this.metadataText(panelWidth, true),
         inputEmpty: typeof this.editor.getText === "function"
           ? this.editor.getText().trim().length === 0
           : startupEditorIsEmpty(editorLines),
@@ -1920,11 +1928,12 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
   });
 
   const activityText = (): string => activityLine(activeOperation, engineStatus, activityFrame, root.scrollOffset);
-  const metadataText = (width: number): string => sessionMetadataLine(
+  const metadataText = (width: number, startup = false): string => sessionMetadataLine(
     session,
     session.approvalMode,
     contextUsageLabel(contextInputTokens, contextWindow),
     width,
+    startup,
   );
   const editor = new TurnEditor(tui, editorTheme, { paddingX: 1, autocompleteMaxVisible: 7 });
   const taskPlanPanel = new TaskPlanPanel();

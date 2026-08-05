@@ -1,10 +1,6 @@
-# Looking Glass
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="./looking-glass-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="./looking-glass-light.svg">
-  <img alt="Looking Glass — Persistent AI Automation" src="./looking-glass-light.svg">
-</picture>
+<p align="center">
+  <img src="./img/lg.png" alt="Looking Glass — Persistent AI Automation">
+</p>
 
 Looking Glass is an open-source local AI coding CLI for persistent, automatable sessions. It combines interactive terminal chat and one-shot prompts with workspace tools, configurable OpenAI-compatible gateways, durable SQLite state, and a scheduler for future model turns.
 

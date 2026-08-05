@@ -376,18 +376,18 @@ test("dismissing startup returns the existing full-height transcript layout", ()
     editor,
     new TaskPlanPanel(),
     () => "activity",
-    () => "metadata",
+    (_width, startup) => startup ? "startup metadata" : "normal metadata",
     { startupVisible: true },
   );
   const startup = root.render(40).map(stripVTControlCharacters);
   assert.ok(startup.some((line) => line.includes("███")));
-  assert.ok(startup.some((line) => line.includes("metadata")));
+  assert.ok(startup.some((line) => line.includes("startup metadata")));
   root.setStartupVisible(false);
   root.addEntry(new AssistantMessage("The normal transcript is active."));
   const normal = root.render(40).map(stripVTControlCharacters);
   assert.equal(normal.some((line) => line.includes("███")), false);
   assert.ok(normal.some((line) => line.includes("The normal transcript is active.")));
-  assert.equal(normal.at(-1), " metadata");
+  assert.equal(normal.at(-1), " normal metadata");
 });
 
 test("startup keeps the existing minimum-terminal diagnostic", () => {
@@ -539,6 +539,31 @@ test("renders activity separately from ordered session metadata", () => {
   assert.match(narrow, /^qwen\/.* \| agent: off \| ctx:42%\/1.2k \| unrestricted \| A/);
   assert.doesNotMatch(narrow, /(?:^|\| )p(?:ersist)?:/);
   assert.ok(narrow.length <= 79);
+  const startup = sessionMetadataLine({
+    id: "session",
+    workspace: "/tmp",
+    provider: "lm-studio",
+    agentProvider: "codex-lb",
+    title: "New session",
+    model: "qwen/qwen3.6-35b-a3b",
+    agentModel: "gpt-luna",
+    reasoningEffort: "medium",
+    agentReasoningEffort: "high",
+    agentsEnabled: false,
+    verbosity: "low",
+    fast: false,
+    approvalMode: "unrestricted",
+    showReasoning: true,
+    persistent: false,
+    promptCacheKey: "cache",
+    lastResponseId: null,
+    kind: "interactive",
+    parentSessionId: null,
+    createdAt: 1,
+    updatedAt: 1,
+  }, "unrestricted", "ctx:?", 62, true);
+  assert.equal(startup, "qwen/qwen3.6-35b-a3b (medium) | agent: off | unrestricted");
+  assert.doesNotMatch(startup, /ctx:|New session/);
   assert.equal(formatTokenCount(512), "512");
   assert.equal(formatTokenCount(1_000), "1k");
   assert.equal(formatTokenCount(1_200), "1.2k");
