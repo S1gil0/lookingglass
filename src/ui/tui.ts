@@ -100,8 +100,13 @@ export class RepeatedPressConfirmation {
 export function defaultGatewayBaseURL(provider: GatewayProvider): string {
   if (provider === "lm-studio") return "http://127.0.0.1:1234/v1";
   if (provider === "openrouter") return "https://openrouter.ai/api/v1";
+  if (provider === "opencode-go") return "https://opencode.ai/zen/go/v1";
   if (provider === "custom") return "http://127.0.0.1:8080/v1";
   return "http://127.0.0.1:2455/v1";
+}
+
+export function gatewayApiKeyEnvironmentIsConfigurable(provider: GatewayProvider): boolean {
+  return provider === "custom";
 }
 
 export function restoreApiKeyEnvironment(apiKeyEnv: string, value: string | undefined): void {
@@ -1671,7 +1676,7 @@ export class ApprovalModal implements Component {
   }
 }
 
-class QuestionInputModal implements Component, Focusable {
+export class QuestionInputModal implements Component, Focusable {
   private readonly input = new Input();
   onDone?: (answer: string) => void;
 
@@ -1679,7 +1684,9 @@ class QuestionInputModal implements Component, Focusable {
     private readonly terminal: AlternateScreenTerminal,
     private readonly question: string,
     private readonly secret = false,
+    initialValue = "",
   ) {
+    this.input.setValue(initialValue);
     this.input.onSubmit = (answer) => this.onDone?.(answer);
     this.input.onEscape = () => this.onDone?.("");
   }
@@ -2109,7 +2116,7 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
           finish("");
           return { close: (): void => {} } satisfies ModalPresentation;
         }
-        const modal = new QuestionInputModal(terminal, request.question, request.secret);
+        const modal = new QuestionInputModal(terminal, request.question, request.secret, request.initialValue);
         const handle = tui.showOverlay(modal, { width: "80%", maxHeight: "80%", margin: 1 });
         const token: ActiveModal = { cancel: () => finish("") };
         activeModal = token;
@@ -2381,6 +2388,7 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
       { value: "codex-lb", label: "codex-lb", description: "Local Looking Glass gateway" },
       { value: "lm-studio", label: "lm-studio", description: "Local LM Studio server" },
       { value: "openrouter", label: "openrouter", description: "OpenRouter hosted models" },
+      { value: "opencode-go", label: "OpenCode Go", description: "OpenCode Go hosted models" },
       { value: "custom", label: "custom", description: "An OpenAI-compatible endpoint" },
     ], "Choose the gateway used by this session.");
     if (!providerValue || stopping) return;
@@ -2396,14 +2404,22 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
       protocol = selectedProtocol as typeof protocol;
     }
     const currentGateway = app.config.gateway.provider === provider ? app.config.gateway : null;
+    const initialBaseURL = currentGateway?.baseURL ?? defaultGatewayBaseURL(provider);
     const baseURL = (await interaction.ask({
-      question: `Gateway base URL (default: ${currentGateway?.baseURL ?? defaultGatewayBaseURL(provider)})`,
-    })).trim() || currentGateway?.baseURL || defaultGatewayBaseURL(provider);
-    const apiKeyEnv = (await interaction.ask({
-      question: `API-key environment variable (default: ${currentGateway?.apiKeyEnv ?? defaultApiKeyEnv(provider)})`,
-    })).trim() || currentGateway?.apiKeyEnv || defaultApiKeyEnv(provider);
+      question: "Gateway base URL",
+      initialValue: initialBaseURL,
+    })).trim() || initialBaseURL;
+    let apiKeyEnv = currentGateway?.apiKeyEnv ?? defaultApiKeyEnv(provider);
+    if (gatewayApiKeyEnvironmentIsConfigurable(provider)) {
+      apiKeyEnv = (await interaction.ask({
+        question: "API-key environment variable name (advanced)",
+        initialValue: apiKeyEnv,
+      })).trim() || apiKeyEnv;
+    }
     const enteredApiKey = (await interaction.ask({
-      question: "API key (optional; blank keeps the current key; stored in the environment file, never in config JSON)",
+      question: provider === "opencode-go"
+        ? "API key (required; blank keeps the current key; stored in the environment file, never in config JSON)"
+        : "API key (optional; blank keeps the current key; stored in the environment file, never in config JSON)",
       secret: true,
     })).trim();
     if (stopping) return;
@@ -2417,12 +2433,15 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
       throw new Error("Gateway base URL must be a valid HTTP or HTTPS URL");
     }
     if ((parsedBaseURL.protocol !== "http:" && parsedBaseURL.protocol !== "https:")
-      || parsedBaseURL.username || parsedBaseURL.password) {
-      throw new Error("Gateway base URL must be HTTP or HTTPS and must not contain credentials");
+      || parsedBaseURL.username || parsedBaseURL.password || parsedBaseURL.search || parsedBaseURL.hash) {
+      throw new Error("Gateway base URL must be HTTP or HTTPS and must not contain credentials, a query, or a fragment");
     }
 
     const previousApiKey = process.env[apiKeyEnv];
     const apiKey = enteredApiKey || previousApiKey || "";
+    if (provider === "opencode-go" && !apiKey.trim()) {
+      throw new Error(`OpenCode Go requires an API key in ${apiKeyEnv}`);
+    }
     let models: GatewayModel[] = [];
     let catalogError: unknown = null;
     let client: CodexLbClient | undefined;

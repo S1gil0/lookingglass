@@ -5,7 +5,7 @@ import type {
 } from "openai/resources/responses/responses";
 import { randomUUID } from "node:crypto";
 import type { CodexLbClient } from "../model/codex-lb.js";
-import { isStaleResponseError } from "../model/codex-lb.js";
+import { isStaleResponseError, requiresPortableCodexReplay } from "../model/codex-lb.js";
 import type { ArtifactStore } from "../storage/artifact-store.js";
 import type { OperationLeaseState, SessionStore } from "../storage/session-store.js";
 import type { GatewayProvider, GlassConfig, ModelInfo, SessionRecord } from "../types.js";
@@ -730,9 +730,29 @@ export class ConversationEngine {
           if (options.signal.aborted) throw options.signal.reason ?? error;
           if (budgetSignal.signal.aborted) throw retryBudgetError(retryBudget);
           if (isStoreLeaseLoss(error) || errorCode(error) === "session_operation_lease_lost") throw error;
-          if (!visibleText && isContextOverflowError(error) && !contextRecoveryUsed && !options.signal.aborted) {
+          const estimatedTokens = this.estimatedRequestTokens(currentSession, currentInput);
+          const oversizedUnanchoredReplay = currentPreviousResponseId === undefined
+            && estimatedTokens >= this.usableContextTokens(options.modelInfo);
+          const oversizedEmptyReplay = errorCode(error) === "empty_response"
+            && this.clientFor(currentSession.provider).supportsResponseContinuity?.() === false
+            && oversizedUnanchoredReplay;
+          const oversizedRejectedReplay = errorCode(error) === "upstream_rejected_input"
+            && currentSession.provider === "codex-lb"
+            && currentPreviousResponseId === undefined
+            && estimatedTokens >= Math.max(1, options.modelInfo.contextWindow);
+          const portableRejectedReplay = errorCode(error) === "upstream_rejected_input"
+            && currentSession.provider === "codex-lb"
+            && currentPreviousResponseId === undefined
+            && requiresPortableCodexReplay(currentInput);
+          if (!visibleText && (isContextOverflowError(error) || oversizedEmptyReplay
+            || oversizedRejectedReplay || portableRejectedReplay)
+            && !contextRecoveryUsed && !options.signal.aborted) {
             contextRecoveryUsed = true;
-            options.callbacks?.onStatus?.("Recovering context overflow");
+            options.callbacks?.onStatus?.(portableRejectedReplay
+              ? "Recovering migrated conversation context"
+              : oversizedEmptyReplay || oversizedRejectedReplay
+                ? "Recovering oversized local context"
+                : "Recovering context overflow");
             await this.compactLocked(session.id, options, executionToken, metrics);
             currentSession = this.requireSession(session.id);
             currentInput = projectContext(this.store, session.id).input;
@@ -1062,23 +1082,30 @@ export class ConversationEngine {
   private async shouldCompact(sessionId: string, response: Response, model: ModelInfo): Promise<boolean> {
     const checkpointSequence = this.store.latestCheckpoint(sessionId)?.throughSequence ?? 0;
     const semanticGrowth = this.store.semanticEventCount(sessionId, checkpointSequence);
-    const reserve = Math.max(20_000, model.maxOutputTokens ?? 0);
-    const usableTokens = Math.max(1, model.contextWindow - reserve);
+    const usableTokens = this.usableContextTokens(model);
     const threshold = usableTokens * 0.8;
     const providerTokens = response.usage?.input_tokens ?? 0;
-    const context = projectContext(this.store, sessionId).input;
-    const estimatedTokens = Math.ceil((
-      this.instructionsFor(this.requireSession(sessionId)).length
-      + JSON.stringify(this.toolDefinitions(this.requireSession(sessionId))).length
-      + JSON.stringify(context).length
-    ) / 4) + 2_000;
+    const session = this.requireSession(sessionId);
+    const estimatedTokens = this.estimatedRequestTokens(session, projectContext(this.store, sessionId).input);
     if (providerTokens > 0) {
-      const providerTruncatedReplay = this.clientFor(this.requireSession(sessionId).provider)
+      const providerTruncatedReplay = this.clientFor(session.provider)
         .supportsResponseContinuity?.() === false
         && estimatedTokens >= usableTokens;
       return semanticGrowth >= 2 && (providerTokens >= threshold || providerTruncatedReplay);
     }
     return estimatedTokens >= usableTokens;
+  }
+
+  private usableContextTokens(model: ModelInfo): number {
+    return Math.max(1, model.contextWindow - Math.max(20_000, model.maxOutputTokens ?? 0));
+  }
+
+  private estimatedRequestTokens(session: SessionRecord, input: ResponseInputItem[]): number {
+    return Math.ceil((
+      this.instructionsFor(session).length
+      + JSON.stringify(this.toolDefinitions(session)).length
+      + JSON.stringify(input).length
+    ) / 4) + 2_000;
   }
 
   private async withOperationLease<T>(

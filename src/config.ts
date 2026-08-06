@@ -105,12 +105,13 @@ type GatewayConfigInput = Partial<GlassConfig["gateway"]> & Pick<GlassConfig["ga
 export function defaultApiKeyEnv(provider: GlassConfig["gateway"]["provider"]): string {
   if (provider === "lm-studio") return "LM_STUDIO_API_KEY";
   if (provider === "openrouter") return "OPENROUTER_API_KEY";
+  if (provider === "opencode-go") return "OPENCODE_API_KEY";
   if (provider === "custom") return "CUSTOM_API_KEY";
   return "CODEX_LB_API_KEY";
 }
 
 export function defaultProtocol(provider: GlassConfig["gateway"]["provider"]): GatewayProtocol {
-  return provider === "openrouter" ? "chat" : "responses";
+  return provider === "openrouter" || provider === "opencode-go" ? "chat" : "responses";
 }
 
 function assertGatewayBaseURL(baseURL: string): void {
@@ -268,8 +269,8 @@ function validate(config: GlassConfig): void {
   const gateways = [config.gateway, ...config.gateways];
   const providers = new Set<string>();
   for (const gateway of gateways) {
-    if (!["codex-lb", "lm-studio", "openrouter", "custom"].includes(gateway.provider)) {
-      throw new Error("gateway provider must be codex-lb, lm-studio, openrouter, or custom");
+    if (!["codex-lb", "lm-studio", "openrouter", "opencode-go", "custom"].includes(gateway.provider)) {
+      throw new Error("gateway provider must be codex-lb, lm-studio, openrouter, opencode-go, or custom");
     }
     if (!["responses", "chat"].includes(gateway.protocol)) throw new Error("gateway protocol must be responses or chat");
     if (gateway.provider !== "custom" && gateway.protocol !== defaultProtocol(gateway.provider)) {
@@ -579,6 +580,26 @@ export function serializeConfig(config: GlassConfig): GlassConfig {
   };
 }
 
+function sanitizedPersistedGateway(value: unknown): GlassConfig["gateway"] | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const object = value as Record<string, unknown>;
+  if (typeof object.provider !== "string" || typeof object.baseURL !== "string") return undefined;
+  const provider = object.provider as GlassConfig["gateway"]["provider"];
+  const gateway: GlassConfig["gateway"] = {
+    provider,
+    protocol: (object.protocol === undefined ? defaultProtocol(provider) : object.protocol) as GatewayProtocol,
+    baseURL: object.baseURL.replace(/\/$/, ""),
+    apiKeyEnv: (object.apiKeyEnv === undefined ? defaultApiKeyEnv(provider) : object.apiKeyEnv) as string,
+    timeoutMs: (object.timeoutMs === undefined ? DEFAULT_CONFIG.gateway.timeoutMs : object.timeoutMs) as number,
+  };
+  try {
+    validate({ ...DEFAULT_CONFIG, gateway, gateways: [] });
+    return gateway;
+  } catch {
+    return undefined;
+  }
+}
+
 function atomicWrite(path: string, contents: string, mode = 0o600): void {
   mkdirSync(configDir(), shouldEnforcePosixPermissions() ? { recursive: true, mode: 0o700 } : { recursive: true });
   const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
@@ -617,6 +638,18 @@ function atomicWrite(path: string, contents: string, mode = 0o600): void {
 export function writeGlobalConfig(input: PersistedGatewayConfig): string {
   const path = globalConfigPath();
   let existing: Record<string, unknown> = {};
+  let inheritedGateway: unknown;
+  let inheritedGateways: unknown[] = [];
+  const inheritedPath = join(configDir(), "config.jsonc");
+  if (existsSync(inheritedPath)) {
+    try {
+      const inherited = parseConfigFile(inheritedPath);
+      inheritedGateway = inherited.gateway;
+      inheritedGateways = inherited.gateways ?? [];
+    } catch {
+      // Ignore a damaged lower-priority layer while repairing config.json.
+    }
+  }
   if (existsSync(path)) {
     try {
       existing = parseConfigFile(path) as Record<string, unknown>;
@@ -629,22 +662,29 @@ export function writeGlobalConfig(input: PersistedGatewayConfig): string {
   const previousGateway = existing.gateway && typeof existing.gateway === "object" && !Array.isArray(existing.gateway)
     ? existing.gateway as Record<string, unknown>
     : {};
+  const previousGateways = Array.isArray(existing.gateways) ? existing.gateways : [];
+  const configuredGateways = [previousGateway, ...previousGateways, inheritedGateway, ...inheritedGateways]
+    .map(sanitizedPersistedGateway)
+    .filter((gateway): gateway is GlassConfig["gateway"] => gateway !== undefined);
   const provider = input.provider;
   assertGatewayBaseURL(input.baseURL);
   if (input.apiKeyEnv !== undefined) assertApiKeyEnv(input.apiKeyEnv);
-  const previousApiKeyEnv = previousGateway.provider === provider && typeof previousGateway.apiKeyEnv === "string"
-    && /^[A-Za-z_][A-Za-z0-9_]*$/.test(previousGateway.apiKeyEnv)
-    ? previousGateway.apiKeyEnv
-    : undefined;
-  const gateway = {
+  const matchingGateway = configuredGateways.find((candidate) => candidate.provider === provider);
+  const gateway: GlassConfig["gateway"] = {
     provider,
-    protocol: input.protocol ?? (previousGateway.provider === provider && typeof previousGateway.protocol === "string"
-      ? previousGateway.protocol
-      : defaultProtocol(provider)),
+    protocol: input.protocol ?? matchingGateway?.protocol ?? defaultProtocol(provider),
     baseURL: input.baseURL.replace(/\/$/, ""),
-    apiKeyEnv: input.apiKeyEnv ?? previousApiKeyEnv ?? defaultApiKeyEnv(provider),
-    ...(typeof previousGateway.timeoutMs === "number" ? { timeoutMs: previousGateway.timeoutMs } : {}),
+    apiKeyEnv: input.apiKeyEnv ?? matchingGateway?.apiKeyEnv ?? defaultApiKeyEnv(provider),
+    timeoutMs: matchingGateway?.timeoutMs ?? DEFAULT_CONFIG.gateway.timeoutMs,
   };
+  validate({ ...DEFAULT_CONFIG, gateway, gateways: [] });
+  const gateways: GlassConfig["gateways"] = [];
+  const seenProviders = new Set<GlassConfig["gateway"]["provider"]>([provider]);
+  for (const retained of configuredGateways) {
+    if (seenProviders.has(retained.provider)) continue;
+    seenProviders.add(retained.provider);
+    gateways.push(retained);
+  }
   const previousAutomation = sanitizedAutomation(existing.automation, false) ?? {};
   const incomingAutomation = input.automation === undefined
     ? undefined
@@ -663,6 +703,7 @@ export function writeGlobalConfig(input: PersistedGatewayConfig): string {
   const updated: Record<string, unknown> = {
     ...existing,
     gateway,
+    gateways,
     maintenance,
     ...(automation && Object.keys(automation).length > 0 ? { automation } : {}),
   };

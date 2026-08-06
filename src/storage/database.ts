@@ -395,6 +395,59 @@ CREATE INDEX sessions_workspace_provider_updated ON sessions(workspace, provider
 CREATE INDEX sessions_parent_kind ON sessions(parent_session_id, session_kind, created_at);
 `;
 
+// SQLite cannot alter a CHECK expression in place. Rebuild sessions while
+// retaining every current column, row, index, and foreign-key target intact.
+const SESSION_PROVIDER_OPENCODE_SCHEMA = `
+DROP INDEX IF EXISTS sessions_workspace_updated;
+DROP INDEX IF EXISTS sessions_workspace_provider_updated;
+DROP INDEX IF EXISTS sessions_parent_kind;
+ALTER TABLE sessions RENAME TO sessions_before_opencode;
+CREATE TABLE sessions (
+  id TEXT PRIMARY KEY,
+  workspace TEXT NOT NULL,
+  title TEXT NOT NULL,
+  model TEXT NOT NULL,
+  reasoning_effort TEXT NOT NULL,
+  verbosity TEXT NOT NULL,
+  fast INTEGER NOT NULL CHECK (fast IN (0, 1)),
+  prompt_cache_key TEXT NOT NULL UNIQUE,
+  last_response_id TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  show_reasoning INTEGER NOT NULL DEFAULT 0 CHECK (show_reasoning IN (0, 1)),
+  persistent INTEGER NOT NULL DEFAULT 0 CHECK (persistent IN (0, 1)),
+  provider TEXT NOT NULL DEFAULT 'codex-lb'
+    CHECK (provider IN ('codex-lb', 'lm-studio', 'openrouter', 'custom', 'opencode-go')),
+  approval_mode TEXT NOT NULL DEFAULT 'review'
+    CHECK (approval_mode IN ('review', 'code', 'unrestricted')),
+  agent_provider TEXT
+    CHECK (agent_provider IS NULL OR agent_provider IN ('codex-lb', 'lm-studio', 'openrouter', 'custom', 'opencode-go')),
+  agent_model TEXT CHECK (agent_model IS NULL OR length(agent_model) > 0),
+  agent_reasoning_effort TEXT,
+  session_kind TEXT NOT NULL DEFAULT 'interactive'
+    CHECK (session_kind IN ('interactive', 'agent')),
+  parent_session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,
+  agents_enabled INTEGER NOT NULL DEFAULT 1 CHECK (agents_enabled IN (0, 1)),
+  fork_count INTEGER NOT NULL DEFAULT 0 CHECK (fork_count >= 0)
+) STRICT;
+INSERT INTO sessions(
+  id, workspace, title, model, reasoning_effort, verbosity, fast,
+  prompt_cache_key, last_response_id, created_at, updated_at, show_reasoning,
+  persistent, provider, approval_mode, agent_provider, agent_model,
+  agent_reasoning_effort, session_kind, parent_session_id, agents_enabled, fork_count
+)
+SELECT
+  id, workspace, title, model, reasoning_effort, verbosity, fast,
+  prompt_cache_key, last_response_id, created_at, updated_at, show_reasoning,
+  persistent, provider, approval_mode, agent_provider, agent_model,
+  agent_reasoning_effort, session_kind, parent_session_id, agents_enabled, fork_count
+FROM sessions_before_opencode;
+DROP TABLE sessions_before_opencode;
+CREATE INDEX sessions_workspace_updated ON sessions(workspace, updated_at DESC);
+CREATE INDEX sessions_workspace_provider_updated ON sessions(workspace, provider, updated_at DESC);
+CREATE INDEX sessions_parent_kind ON sessions(parent_session_id, session_kind, created_at);
+`;
+
 const MAINTENANCE_SCHEMA = `
 ALTER TABLE scheduler_jobs ADD COLUMN deleted_at INTEGER;
 CREATE INDEX scheduler_jobs_deleted_at
@@ -564,11 +617,17 @@ export function openDatabase(path: string, platform: NodeJS.Platform = process.p
       `).run();
       db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (17, ?)").run(now);
     }
+    const sessionProviderOpenCodeMigration = db.prepare("SELECT 1 FROM schema_migrations WHERE version = 18").get();
+    if (!sessionProviderOpenCodeMigration) {
+      db.exec(SESSION_PROVIDER_OPENCODE_SCHEMA);
+      db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (18, ?)").run(Date.now());
+    }
   });
   const sessionsRebuildMigrationPending = !db.prepare(
     "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations' AND sql LIKE '%version%'",
   ).get() || !db.prepare("SELECT 1 FROM schema_migrations WHERE version = 14").get()
-    || !db.prepare("SELECT 1 FROM schema_migrations WHERE version = 16").get();
+    || !db.prepare("SELECT 1 FROM schema_migrations WHERE version = 16").get()
+    || !db.prepare("SELECT 1 FROM schema_migrations WHERE version = 18").get();
   if (sessionsRebuildMigrationPending) db.exec("PRAGMA foreign_keys = OFF; PRAGMA legacy_alter_table = ON;");
   try {
     migrate.immediate();

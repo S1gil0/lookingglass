@@ -299,6 +299,24 @@ function validateNow(now: number): void {
   finiteInteger("now", now);
 }
 
+function isPortableCheckpoint(compact: unknown): boolean {
+  if (compact === null || typeof compact !== "object" || Array.isArray(compact)) return false;
+  const output = (compact as Record<string, unknown>).output;
+  if (!Array.isArray(output) || output.length === 0) return false;
+  return output.every((item) => {
+    if (item === null || typeof item !== "object" || Array.isArray(item)) return false;
+    const message = item as Record<string, unknown>;
+    if (message.type !== "message" || message.role !== "user") return false;
+    const content = message.content;
+    if (!Array.isArray(content) || content.length === 0) return false;
+    return content.every((part) => {
+      if (part === null || typeof part !== "object" || Array.isArray(part)) return false;
+      const inputText = part as Record<string, unknown>;
+      return inputText.type === "input_text" && typeof inputText.text === "string";
+    });
+  });
+}
+
 const SESSION_STATS_OPTION_KEYS = new Set<keyof SessionStatsSnapshotOptions>([
   "now",
   "staleToolCallAgeMs",
@@ -690,7 +708,28 @@ export class SessionStore {
         id,
       );
       if (changes.provider !== undefined && changes.provider !== current.provider) {
-        this.db.prepare("DELETE FROM context_checkpoints WHERE session_id = ?").run(id);
+        const checkpoints = this.db.prepare(`
+          SELECT id, compact_json FROM context_checkpoints
+          WHERE session_id = ?
+          ORDER BY through_sequence DESC
+        `).all(id) as Array<{ id: number; compact_json: string }>;
+        let portableCheckpointId: number | null = null;
+        for (const checkpoint of checkpoints) {
+          try {
+            if (isPortableCheckpoint(JSON.parse(checkpoint.compact_json) as unknown)) {
+              portableCheckpointId = checkpoint.id;
+              break;
+            }
+          } catch {
+            // Skip malformed checkpoints and continue to an older portable one.
+          }
+        }
+        if (portableCheckpointId !== null) {
+          this.db.prepare("DELETE FROM context_checkpoints WHERE session_id = ? AND id <> ?")
+            .run(id, portableCheckpointId);
+        } else {
+          this.db.prepare("DELETE FROM context_checkpoints WHERE session_id = ?").run(id);
+        }
       }
       return this.require(id);
     });

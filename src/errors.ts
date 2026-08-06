@@ -539,7 +539,9 @@ export function providerError(error: unknown, context: ProviderErrorContext): No
         message = `${prefix} failed: network connection failed`;
         break;
       case "protocol":
-        message = `${prefix} failed: malformed provider response`;
+        message = detail.code === "empty_response"
+          ? `${prefix} failed: provider returned an empty completion stream (no choices or output; possible context overflow or upstream model failure)`
+          : `${prefix} failed: malformed provider response`;
         break;
       default:
         message = `${prefix} failed${summary ? `: ${summary}` : ""}`;

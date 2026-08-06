@@ -31,7 +31,8 @@ export function stdioInteraction(assumeYes: boolean): EngineInteraction {
     async ask(request: QuestionRequest): Promise<string> {
       process.stderr.write(`\n${terminalSafe(request.question)}\n`);
       if (request.options) process.stderr.write(`${request.options.map((value, index) => `${index + 1}. ${terminalSafe(value)}`).join("\n")}\n`);
-      return promptLine("> ");
+      const answer = await promptLine(request.initialValue ? `> [${terminalSafe(request.initialValue)}] ` : "> ");
+      return answer || request.initialValue || "";
     },
   };
 }

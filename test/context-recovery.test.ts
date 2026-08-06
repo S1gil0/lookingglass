@@ -517,6 +517,223 @@ test("provider context overflow compacts and retries exactly once", async (t) =>
   assert.equal(result.metrics?.compactions, 1);
 });
 
+test("oversized stateless empty streams compact and retry exactly once", async (t) => {
+  const { root, sessions, session, artifacts } = fixture(t);
+  sessions.updateSettings(session.id, { provider: "openrouter" });
+  const requests: ResponseRequest[] = [];
+  let compactions = 0;
+  const client = {
+    supportsResponseContinuity: () => false,
+    async stream(request: ResponseRequest) {
+      requests.push(request);
+      if (requests.length === 1) {
+        throw Object.assign(new Error("empty completion stream"), { code: "empty_response" });
+      }
+      return response("empty-recovered", "EMPTY_RECOVERED");
+    },
+    async compact() {
+      compactions += 1;
+      return {
+        id: "compact_empty",
+        output: [{ type: "compaction_summary", encrypted_content: "empty-stream checkpoint" }],
+        usage: { input_tokens: 1_000 },
+      };
+    },
+  } as unknown as CodexLbClient;
+  const engine = new ConversationEngine(
+    structuredClone(DEFAULT_CONFIG), root, sessions, artifacts, client, new ToolRegistry(), "instructions",
+  );
+  const result = await engine.turn(session.id, "x".repeat(20_000), {
+    signal: new AbortController().signal,
+    interaction: { approve: async () => "once", ask: async () => "" },
+    modelInfo: { ...modelInfo, contextWindow: 25_000 },
+  });
+  assert.equal(result.text, "EMPTY_RECOVERED");
+  assert.equal(requests.length, 2);
+  assert.equal(compactions, 1);
+  assert.equal(result.compacted, true);
+  assert.equal(result.metrics?.compactions, 1);
+  assert.match(JSON.stringify(requests[1]?.input), /empty-stream checkpoint/);
+});
+
+test("small stateless empty streams remain provider failures without compaction", async (t) => {
+  const { root, sessions, session, artifacts } = fixture(t);
+  sessions.updateSettings(session.id, { provider: "openrouter" });
+  let requests = 0;
+  let compactions = 0;
+  const client = {
+    supportsResponseContinuity: () => false,
+    async stream() {
+      requests += 1;
+      throw Object.assign(new Error("empty completion stream"), { code: "empty_response" });
+    },
+    async compact() { compactions += 1; return {}; },
+  } as unknown as CodexLbClient;
+  const engine = new ConversationEngine(
+    structuredClone(DEFAULT_CONFIG), root, sessions, artifacts, client, new ToolRegistry(), "instructions",
+  );
+  await assert.rejects(() => engine.turn(session.id, "small request", {
+    signal: new AbortController().signal,
+    interaction: { approve: async () => "once", ask: async () => "" },
+    modelInfo,
+  }), (error: unknown) => {
+    assert.equal((error as { code?: string }).code, "empty_response");
+    return true;
+  });
+  assert.equal(requests, 1);
+  assert.equal(compactions, 0);
+});
+
+test("oversized unanchored codex rejections compact and retry exactly once", async (t) => {
+  const { root, sessions, session, artifacts } = fixture(t);
+  const requests: ResponseRequest[] = [];
+  let compactions = 0;
+  const client = {
+    supportsResponseContinuity: () => true,
+    async stream(request: ResponseRequest) {
+      requests.push(request);
+      if (requests.length === 1) {
+        throw Object.assign(new Error("Upstream rejected the request before response.created"), {
+          code: "upstream_rejected_input",
+        });
+      }
+      return response("rejected-recovered", "REJECTED_RECOVERED");
+    },
+    async compact() {
+      compactions += 1;
+      return {
+        id: "compact_rejected",
+        output: [{ type: "compaction_summary", encrypted_content: "rejected-input checkpoint" }],
+        usage: { input_tokens: 1_000 },
+      };
+    },
+  } as unknown as CodexLbClient;
+  const engine = new ConversationEngine(
+    structuredClone(DEFAULT_CONFIG), root, sessions, artifacts, client, new ToolRegistry(), "instructions",
+  );
+  const result = await engine.turn(session.id, "x".repeat(120_000), {
+    signal: new AbortController().signal,
+    interaction: { approve: async () => "once", ask: async () => "" },
+    modelInfo: { ...modelInfo, contextWindow: 25_000 },
+  });
+  assert.equal(result.text, "REJECTED_RECOVERED");
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0]?.previousResponseId, undefined);
+  assert.equal(requests[1]?.previousResponseId, undefined);
+  assert.equal(compactions, 1);
+  assert.equal(result.compacted, true);
+  assert.equal(result.metrics?.compactions, 1);
+  assert.match(JSON.stringify(requests[1]?.input), /rejected-input checkpoint/);
+});
+
+test("rejected portable codex replays compact to native context and retry once", async (t) => {
+  const { root, sessions, session, artifacts } = fixture(t);
+  sessions.saveCheckpoint(session.id, 0, {
+    output: [{
+      id: "msg_compact_foreign",
+      type: "message",
+      role: "user",
+      status: "completed",
+      content: [{ type: "input_text", text: "portable checkpoint" }],
+    }],
+  }, 10);
+  const requests: ResponseRequest[] = [];
+  let compactions = 0;
+  const client = {
+    supportsResponseContinuity: () => true,
+    async stream(request: ResponseRequest) {
+      requests.push(request);
+      if (requests.length === 1) {
+        throw Object.assign(new Error("Upstream rejected the request before response.created"), {
+          code: "upstream_rejected_input",
+        });
+      }
+      return response("portable-recovered", "PORTABLE_RECOVERED");
+    },
+    async compact() {
+      compactions += 1;
+      return {
+        id: "compact_portable",
+        output: [{ type: "compaction_summary", encrypted_content: "native checkpoint" }],
+        usage: { input_tokens: 100 },
+      };
+    },
+  } as unknown as CodexLbClient;
+  const engine = new ConversationEngine(
+    structuredClone(DEFAULT_CONFIG), root, sessions, artifacts, client, new ToolRegistry(), "instructions",
+  );
+  const result = await engine.turn(session.id, "continue", {
+    signal: new AbortController().signal,
+    interaction: { approve: async () => "once", ask: async () => "" },
+    modelInfo,
+  });
+  assert.equal(result.text, "PORTABLE_RECOVERED");
+  assert.equal(requests.length, 2);
+  assert.equal(compactions, 1);
+  assert.equal(result.compacted, true);
+  assert.match(JSON.stringify(requests[1]?.input), /native checkpoint/);
+});
+
+test("normal-sized codex input rejections remain provider failures", async (t) => {
+  const { root, sessions, session, artifacts } = fixture(t);
+  let requests = 0;
+  let compactions = 0;
+  const client = {
+    supportsResponseContinuity: () => true,
+    async stream() {
+      requests += 1;
+      throw Object.assign(new Error("Upstream rejected the request before response.created"), {
+        code: "upstream_rejected_input",
+      });
+    },
+    async compact() { compactions += 1; return {}; },
+  } as unknown as CodexLbClient;
+  const engine = new ConversationEngine(
+    structuredClone(DEFAULT_CONFIG), root, sessions, artifacts, client, new ToolRegistry(), "instructions",
+  );
+  await assert.rejects(() => engine.turn(session.id, "small request", {
+    signal: new AbortController().signal,
+    interaction: { approve: async () => "once", ask: async () => "" },
+    modelInfo,
+  }), (error: unknown) => {
+    assert.equal((error as { code?: string }).code, "upstream_rejected_input");
+    return true;
+  });
+  assert.equal(requests, 1);
+  assert.equal(compactions, 0);
+});
+
+test("anchored codex input rejections do not discard continuity or compact", async (t) => {
+  const { root, sessions, session, artifacts } = fixture(t);
+  sessions.setLastResponseId(session.id, "response-anchor");
+  const requests: ResponseRequest[] = [];
+  let compactions = 0;
+  const client = {
+    supportsResponseContinuity: () => true,
+    async stream(request: ResponseRequest) {
+      requests.push(request);
+      throw Object.assign(new Error("Upstream rejected the request before response.created"), {
+        code: "upstream_rejected_input",
+      });
+    },
+    async compact() { compactions += 1; return {}; },
+  } as unknown as CodexLbClient;
+  const engine = new ConversationEngine(
+    structuredClone(DEFAULT_CONFIG), root, sessions, artifacts, client, new ToolRegistry(), "instructions",
+  );
+  await assert.rejects(() => engine.turn(session.id, "x".repeat(120_000), {
+    signal: new AbortController().signal,
+    interaction: { approve: async () => "once", ask: async () => "" },
+    modelInfo: { ...modelInfo, contextWindow: 25_000 },
+  }), (error: unknown) => {
+    assert.equal((error as { code?: string }).code, "upstream_rejected_input");
+    return true;
+  });
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0]?.previousResponseId, "response-anchor");
+  assert.equal(compactions, 0);
+});
+
 test("transient model failures retry one logical round with bounded backoff and ephemeral statuses", async (t) => {
   const { root, sessions, session, artifacts } = fixture(t);
   const requests: ResponseRequest[] = [];
@@ -987,6 +1204,51 @@ test("explicit provider migration rotates continuity and cache identity", (t) =>
   assert.equal(sessions.latestCheckpoint(session.id), null);
   assert.match(JSON.stringify(projectContext(sessions, session.id).input), /retained history/);
   assert.equal(sessions.listCommandApprovals(session.id).length, 1);
+});
+
+test("provider migration retains only the latest portable text checkpoint", (t) => {
+  const { db, sessions, session } = fixture(t);
+  sessions.updateSettings(session.id, { provider: "opencode-go" });
+  sessions.saveCheckpoint(session.id, 1, {
+    output: [{ type: "compaction_summary", encrypted_content: "older provider-specific checkpoint" }],
+  }, 10);
+  const portable = {
+    output: [{
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "portable context" }],
+    }],
+  };
+  sessions.saveCheckpoint(session.id, 2, portable, 20);
+
+  sessions.updateSettings(session.id, { provider: "codex-lb" });
+
+  assert.deepEqual(sessions.latestCheckpoint(session.id)?.compact, portable);
+  assert.equal((db.prepare(
+    "SELECT COUNT(*) AS total FROM context_checkpoints WHERE session_id = ?",
+  ).get(session.id) as { total: number }).total, 1);
+});
+
+test("provider migration falls back to the newest portable checkpoint", (t) => {
+  const { db, sessions, session } = fixture(t);
+  const portable = {
+    output: [{
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "portable fallback" }],
+    }],
+  };
+  sessions.saveCheckpoint(session.id, 1, portable, 10);
+  sessions.saveCheckpoint(session.id, 2, {
+    output: [{ type: "compaction_summary", encrypted_content: "newer provider-specific checkpoint" }],
+  }, 20);
+
+  sessions.updateSettings(session.id, { provider: "lm-studio" });
+
+  assert.deepEqual(sessions.latestCheckpoint(session.id)?.compact, portable);
+  assert.equal((db.prepare(
+    "SELECT COUNT(*) AS total FROM context_checkpoints WHERE session_id = ?",
+  ).get(session.id) as { total: number }).total, 1);
 });
 
 test("agent settings are durable without rotating primary continuity and hidden sessions stay hidden", (t) => {

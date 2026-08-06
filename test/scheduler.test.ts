@@ -112,7 +112,7 @@ test("installs current migrations and validates scheduler definitions", (t) => {
   const { db, root, store } = fixture(t);
   const now = Date.parse("2026-01-01T00:00:30Z");
   const versions = db.prepare("SELECT version FROM schema_migrations ORDER BY version").all() as { version: number }[];
-  assert.deepEqual(versions.map((row) => row.version), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]);
+  assert.deepEqual(versions.map((row) => row.version), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]);
   const sessionId = createSession(db, root, true);
   const approval = db.prepare("SELECT approval_mode FROM sessions WHERE id = ?").get(sessionId) as { approval_mode: string };
   assert.equal(approval.approval_mode, "review");
@@ -197,7 +197,7 @@ test("migration 13 promotes existing Bash approvals to leading executables", (t)
   assert.ok(signatures.some((row) => row.signature === JSON.stringify(["bash-executable", 2, "git"])));
 });
 
-test("migrations 14-16 preserve sessions and referencing conversation and scheduler data", (t) => {
+test("migrations 14-18 preserve sessions and referencing conversation and scheduler data", (t) => {
   const root = mkdtempSync(join(tmpdir(), "looking-glass-openrouter-migration-"));
   const path = join(root, "glass.db");
   let db = openDatabase(path);
@@ -246,7 +246,7 @@ test("migrations 14-16 preserve sessions and referencing conversation and schedu
   `).run(jobId, now);
 
   // Rebuild the sessions table into the v13 shape, retaining all records that
-  // depend on it, then let openDatabase run migrations 14, 15, and 16 as real
+  // depend on it, then let openDatabase run migrations 14 through 18 as real
   // upgrades.
   db.pragma("foreign_keys = OFF");
   db.pragma("legacy_alter_table = ON");
@@ -297,27 +297,27 @@ test("migrations 14-16 preserve sessions and referencing conversation and schedu
     CREATE INDEX sessions_workspace_updated ON sessions(workspace, updated_at DESC);
     CREATE INDEX sessions_workspace_provider_updated ON sessions(workspace, provider, updated_at DESC);
     CREATE INDEX sessions_parent_kind ON sessions(parent_session_id, session_kind, created_at);
-    DELETE FROM schema_migrations WHERE version IN (14, 15, 16);
+    DELETE FROM schema_migrations WHERE version IN (14, 15, 16, 18);
   `);
   db.pragma("legacy_alter_table = OFF");
   db.pragma("foreign_keys = ON");
   db.close();
 
-  // Let v14/v15/v16 run, then exercise v16 once more with a non-default fork
-  // count so the rebuild proves it does not discard the newly-added column.
+  // Let v14-v18 run, then exercise v18 once more with a non-default fork count
+  // so the rebuild proves it does not discard the current sessions shape.
   db = openDatabase(path);
   db.prepare("UPDATE sessions SET fork_count = 7 WHERE id = ?").run(childId);
-  db.prepare("DELETE FROM schema_migrations WHERE version = 16").run();
+  db.prepare("DELETE FROM schema_migrations WHERE version = 18").run();
   db.close();
 
   db = openDatabase(path);
   const child = db.prepare("SELECT parent_session_id, fork_count FROM sessions WHERE id = ?").get(childId) as { parent_session_id: string; fork_count: number };
   assert.equal(child.parent_session_id, parentId);
   assert.equal(child.fork_count, 7);
-  db.prepare("UPDATE sessions SET provider = 'custom', agent_provider = 'custom' WHERE id = ?").run(childId);
+  db.prepare("UPDATE sessions SET provider = 'opencode-go', agent_provider = 'opencode-go' WHERE id = ?").run(childId);
   assert.deepEqual(db.prepare("SELECT provider, agent_provider FROM sessions WHERE id = ?").get(childId), {
-    provider: "custom",
-    agent_provider: "custom",
+    provider: "opencode-go",
+    agent_provider: "opencode-go",
   });
   assert.deepEqual(db.prepare("SELECT message FROM scheduler_inbox WHERE id = 1").get(), {
     message: "preserve scheduler record",
@@ -336,6 +336,7 @@ test("migrations 14-16 preserve sessions and referencing conversation and schedu
   assert.deepEqual(db.prepare("SELECT version FROM schema_migrations WHERE version = 14").get(), { version: 14 });
   assert.deepEqual(db.prepare("SELECT version FROM schema_migrations WHERE version = 15").get(), { version: 15 });
   assert.deepEqual(db.prepare("SELECT version FROM schema_migrations WHERE version = 16").get(), { version: 16 });
+  assert.deepEqual(db.prepare("SELECT version FROM schema_migrations WHERE version = 18").get(), { version: 18 });
 });
 
 test("migration 16 normalizes legacy textual session flags", (t) => {

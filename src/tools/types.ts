@@ -18,6 +18,7 @@ export interface QuestionRequest {
   question: string;
   options?: string[];
   secret?: boolean;
+  initialValue?: string;
 }
 
 export interface ToolContext {

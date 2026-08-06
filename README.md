@@ -47,7 +47,7 @@ Scheduled prompts are not separate stateless jobs or fresh chats. Future turns c
 - **Persistent approval modes** for interactive and automated turns, including remembered approvals.
 - **Scheduled AI prompts, reminders, and deterministic shell commands.**
 - **Concurrent worker agents** with independently selected models and reasoning settings.
-- **Configured gateway providers** including codex-lb, LM Studio, OpenRouter, and a custom OpenAI-compatible profile.
+- **Configured gateway providers** including codex-lb, LM Studio, OpenCode Go, OpenRouter, and a custom OpenAI-compatible profile.
 - **SQLite-backed sessions, scheduler state, and artifacts** with context recovery and compaction.
 - **A user-level scheduler** that runs independently of the interactive terminal (systemd on Linux and Task Scheduler on Windows).
 
@@ -124,10 +124,10 @@ You can run directly from TypeScript during development with `npm run dev`, but 
 
 ## Configure a Gateway
 
-Looking Glass supports the built-in codex-lb and LM Studio Responses profiles, OpenRouter's Chat Completions profile, and a custom OpenAI-compatible gateway profile. The optional API key is read from the environment variable named by `gateway.apiKeyEnv`:
+Looking Glass supports the built-in codex-lb and LM Studio Responses profiles, model-specific OpenCode Go routing, OpenRouter Chat Completions, and a custom OpenAI-compatible gateway profile. When a gateway requires an API key, it is read from the environment variable named by `gateway.apiKeyEnv`:
 
 ```bash
-export LM_STUDIO_API_KEY=replace-with-your-token
+export LM_STUDIO_API_KEY='your-token'
 ```
 
 In Windows PowerShell, use `$env:LM_STUDIO_API_KEY = 'your-token'` instead.
@@ -237,7 +237,7 @@ For an authenticated gateway, set the environment variable named by
 token when that variable is unset:
 
 ```bash
-export LM_STUDIO_API_KEY=replace-with-your-token
+export LM_STUDIO_API_KEY='your-token'
 ```
 
 ```jsonc
@@ -309,6 +309,34 @@ defaults `apiKeyEnv` to `OPENROUTER_API_KEY`:
 }
 ```
 
+#### OpenCode Go
+
+OpenCode Go uses `https://opencode.ai/zen/go/v1` by default, reads
+`OPENCODE_API_KEY`, and discovers its model catalog from `/models`. Looking
+Glass automatically routes each known model through its documented protocol:
+OpenAI Responses, OpenAI-compatible Chat Completions, or Anthropic Messages.
+It exposes only the model-specific effort levels documented by OpenCode,
+including `none`, `low`, `medium`, `high`, `xhigh`, and `max` where supported.
+Some models instead expose bounded `high` and `max` thinking budgets, while
+MiniMax M3 uses `high` as the switch for adaptive thinking. Unknown future
+model IDs use conservative Chat Completions defaults without an inferred
+reasoning control. OpenCode Go is separate from OpenCode Zen.
+
+```bash
+export OPENCODE_API_KEY='your-token'
+```
+
+```jsonc
+{
+  "gateway": {
+    "provider": "opencode-go",
+    "baseURL": "https://opencode.ai/zen/go/v1",
+    "apiKeyEnv": "OPENCODE_API_KEY"
+  },
+  "model": "deepseek-v4-flash"
+}
+```
+
 Additional gateways can be listed in `gateways`; each provider must be unique.
 Models ending in `:free` or with zero catalog pricing are marked `[free]` by
 `glass models` and selected by `glass models --free`.
@@ -358,6 +386,8 @@ glass
 ```
 
 Bare `glass` starts a fresh session. It appears in session history only after its first message; exiting or switching away before then discards the empty draft. The top metadata line shows the active model, reasoning effort, context usage, agent state, approval mode, persistence state, and session title. The transcript and tool history are saved as you work.
+
+An empty interactive session opens on a centered Looking Glass startup screen. The screen remains available while slash commands such as `/model` run and changes to the normal transcript layout when the first non-empty plain prompt is accepted. Resuming or switching to a session with durable events skips the startup screen; `/new` and other empty sessions show it again.
 
 ### Run One Prompt
 
@@ -490,7 +520,7 @@ Enter slash commands inside `glass`:
 | `/inbox` | Show unread scheduler records and mark them read |
 | `/exit` | Exit the TUI |
 
-The transcript supports mouse-wheel scrolling, `PageUp`, and `PageDown`. Dragging across text selects and copies it through OSC52 with a native clipboard fallback. To keep very large sessions responsive, the TUI renders the latest 1,000 transcript events while retaining the complete durable history and model context. Press `Esc` twice within 10 seconds to stop an active operation without leaving the TUI. Press `Ctrl+C` twice within 10 seconds to exit; if an operation is active, exiting stops it. Exiting does not hand an active turn to background processing, even when persistence is enabled.
+The TUI supports mouse-wheel scrolling, `PageUp`, and `PageDown`. Dragging across rendered TUI text selects and copies it through OSC52 with a native clipboard fallback. To keep very large sessions responsive, the TUI renders the latest 1,000 transcript events while retaining the complete durable history and model context. The editor remains available during active work: submissions are acknowledged and run FIFO, with plain prompts continuing as follow-up turns, bare setting selectors available immediately, and their choices applying after the current turn before later queued work. Press `Esc` twice within 10 seconds to stop an active operation without leaving the TUI. Press `Ctrl+C` twice within 10 seconds to exit; if an operation is active, exiting stops it. Exiting does not hand an active turn to background processing, even when persistence is enabled.
 
 For interactive turns, before any visible model output, transient connectivity,
 rate-limit, and temporary provider/model availability failures keep the current

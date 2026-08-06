@@ -98,6 +98,24 @@ test("keeps useful plain and string payload details", () => {
   assert.match(providerError({ message: "structured provider failure" }, context).message, /structured provider failure/);
 });
 
+test("gives empty completion streams a safe actionable protocol diagnostic", () => {
+  const secret = "empty-stream-secret";
+  const error = providerError({
+    code: "empty_response",
+    message: `untrusted upstream detail ${secret}`,
+  }, {
+    ...context,
+    protocol: true,
+    configuredSecrets: [secret],
+  });
+  assert.match(error.message, /empty completion stream/);
+  assert.match(error.message, /possible context overflow or upstream model failure/);
+  assert.doesNotMatch(error.message, new RegExp(secret));
+  assert.equal(error.code, "empty_response");
+  assert.equal(error.kind, "protocol");
+  assert.equal(error.retryable, false);
+});
+
 test("normalizes bounded incomplete response details without exposing the raw payload", () => {
   const secret = "incomplete-secret";
   const error = providerError({

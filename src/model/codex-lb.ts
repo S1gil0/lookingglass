@@ -7,6 +7,13 @@ import type {
 } from "openai/resources/responses/responses";
 import { Agent } from "undici";
 import type { GatewayProtocol, GatewayProvider, GlassConfig, ModelInfo, ReasoningEffort, Verbosity } from "../types.js";
+import {
+  anthropicMessageText,
+  anthropicMessageUsage,
+  buildAnthropicMessagesParams,
+  parseAnthropicMessagesStream,
+} from "./anthropic-messages.js";
+import { openCodeGoModelInfo, openCodeGoProfile, openCodeGoReasoningParams } from "./opencode-go.js";
 
 interface ErrorDetail {
   code?: string;
@@ -82,6 +89,13 @@ export interface OpenRouterModel {
   } | null;
   pricing?: { prompt?: string | number | null; completion?: string | number | null } | null;
   supported_parameters?: string[] | null;
+  reasoning?: {
+    mandatory?: boolean | null;
+    default_enabled?: boolean | null;
+    supports_max_tokens?: boolean | null;
+    supported_efforts?: string[] | null;
+    default_effort?: string | null;
+  } | null;
   top_provider?: { context_length?: number | null; max_completion_tokens?: number | null } | null;
 }
 
@@ -159,15 +173,36 @@ function lmStudioTools(tools: FunctionTool[]): FunctionTool[] {
 
 export function buildResponseParams(provider: GatewayProvider, request: ResponseRequest, protocol: GatewayProtocol = "responses"): ResponseParams {
   if (provider === "openrouter") return buildOpenRouterParams(request) as unknown as ResponseParams;
-  if (provider === "custom" && protocol === "chat") {
-    return buildCustomChatParams(request) as unknown as ResponseParams;
+  if (provider === "opencode-go" && openCodeGoProfile(request.model).protocol === "responses") {
+    return {
+      model: request.model,
+      instructions: request.instructions,
+      input: request.input.filter((item) => item.type !== "compaction"
+        && (request.supportsReasoning || item.type !== "reasoning")),
+      tools: request.tools,
+      ...(request.supportsParallelToolCalls ? { parallel_tool_calls: true } : {}),
+      ...(request.supportsReasoning ? openCodeGoReasoningParams(request.model, request.reasoningEffort) : {}),
+      ...(request.supportsReasoning ? { include: ["reasoning.encrypted_content"] } : {}),
+      store: false,
+      text: { verbosity: request.verbosity },
+    };
+  }
+  if (provider === "opencode-go" || (provider === "custom" && protocol === "chat")) {
+    return {
+      ...buildCustomChatParams(request, provider === "opencode-go" && request.supportsReasoning),
+      ...(provider === "opencode-go" && request.supportsReasoning
+        ? openCodeGoReasoningParams(request.model, request.reasoningEffort)
+        : {}),
+    } as unknown as ResponseParams;
   }
   const common = {
     model: request.model,
     instructions: request.instructions,
     input: provider === "lm-studio" || provider === "custom"
       ? request.input.filter((item) => item.type !== "reasoning")
-      : request.input,
+      : provider === "codex-lb" && !request.previousResponseId
+        ? portableCodexReplayInput(request.input)
+        : request.input,
     tools: provider === "lm-studio" ? lmStudioTools(request.tools) : request.tools,
     ...(request.supportsParallelToolCalls ? { parallel_tool_calls: true } : {}),
     ...(request.supportsReasoning ? {
@@ -276,7 +311,7 @@ export function isStaleResponseError(value: unknown, requestWasAnchored: boolean
 }
 
 function asEffort(value: string | null | undefined): ReasoningEffort | null {
-  return ["none", "low", "medium", "high", "xhigh", "max", "ultra"].includes(value ?? "")
+  return ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"].includes(value ?? "")
     ? value as ReasoningEffort
     : null;
 }
@@ -293,9 +328,18 @@ function asVerbosity(value: string | null | undefined): Verbosity {
 
 export function modelInfo(raw: RawModel): ModelInfo {
   const metadata = raw.metadata ?? {};
-  const efforts = (metadata.supported_reasoning_levels ?? [])
+  const advertisedEfforts = (metadata.supported_reasoning_levels ?? [])
     .map((entry) => asEffort(entry.effort))
     .filter((effort): effort is ReasoningEffort => effort !== null);
+  const efforts = [...new Set(advertisedEfforts)];
+  const supportsReasoning = raw.capabilities?.supports_reasoning ?? raw.supports_reasoning ?? efforts.length > 0;
+  const reasoningEfforts: ReasoningEffort[] = supportsReasoning
+    ? efforts.length > 0 ? efforts : ["low", "medium", "high"]
+    : ["none"];
+  const advertisedDefault = asEffort(metadata.default_reasoning_level);
+  const defaultReasoningEffort = advertisedDefault && reasoningEfforts.includes(advertisedDefault)
+    ? advertisedDefault
+    : reasoningEfforts.includes("medium") ? "medium" : reasoningEfforts[0] ?? "none";
   const contextWindow = metadata.input_context_window ?? metadata.context_window ?? raw.capabilities?.context_length
     ?? raw.context_length ?? 128_000;
   const supportsFast = metadata.additional_speed_tiers?.includes("fast") === true
@@ -306,10 +350,10 @@ export function modelInfo(raw: RawModel): ModelInfo {
     description: metadata.description ?? "",
     contextWindow,
     maxOutputTokens: metadata.max_output_tokens ?? raw.capabilities?.max_output_tokens ?? raw.max_output_tokens ?? null,
-    reasoningEfforts: efforts.length > 0 ? efforts : ["low", "medium", "high"],
-    defaultReasoningEffort: asEffort(metadata.default_reasoning_level) ?? "medium",
+    reasoningEfforts,
+    defaultReasoningEffort,
     defaultVerbosity: asVerbosity(metadata.default_verbosity),
-    supportsReasoning: raw.capabilities?.supports_reasoning ?? raw.supports_reasoning ?? efforts.length > 0,
+    supportsReasoning,
     supportsImages: raw.capabilities?.supports_images ?? raw.supports_images ?? false,
     supportsParallelToolCalls: metadata.supports_parallel_tool_calls ?? true,
     supportsFast,
@@ -383,7 +427,21 @@ export function openRouterModelInfo(raw: OpenRouterModel): ModelInfo {
   const pricing = raw.pricing ?? {};
   const isFree = raw.id.toLowerCase().endsWith(":free")
     || (numericPrice(pricing.prompt) === 0 && numericPrice(pricing.completion) === 0);
-  const supportsReasoning = supported.has("reasoning");
+  const advertisesReasoning = supported.has("reasoning") || supported.has("reasoning_effort");
+  const advertisedEfforts = raw.reasoning?.supported_efforts;
+  const mappedEfforts = advertisedEfforts === null
+    ? (["none", "minimal", "low", "medium", "high", "xhigh", "max"] satisfies ReasoningEffort[])
+    : Array.isArray(advertisedEfforts)
+      ? advertisedEfforts.map((effort) => asEffort(effort)).filter((effort): effort is ReasoningEffort => effort !== null)
+      : advertisesReasoning ? (["low", "medium", "high"] satisfies ReasoningEffort[]) : [];
+  const efforts = raw.reasoning?.mandatory ? mappedEfforts.filter((effort) => effort !== "none") : mappedEfforts;
+  const supportsReasoning = advertisesReasoning && efforts.length > 0;
+  const advertisedDefault = asEffort(raw.reasoning?.default_effort);
+  const defaultReasoningEffort = advertisedDefault && efforts.includes(advertisedDefault)
+    ? advertisedDefault
+    : efforts.includes("medium") ? "medium"
+      : efforts.includes("high") ? "high"
+        : efforts[0] ?? "none";
   const supportsImages = (architecture.input_modalities ?? []).some((value) => /image/i.test(value));
   const supportsTools = supported.has("tools") || supported.has("tool_choice")
     || supported.has("parallel_tool_calls") || supported.has("function_calling");
@@ -394,8 +452,8 @@ export function openRouterModelInfo(raw: OpenRouterModel): ModelInfo {
     contextWindow: raw.context_length ?? raw.top_provider?.context_length ?? 128_000,
     maxOutputTokens: raw.max_completion_tokens ?? raw.top_provider?.max_completion_tokens
       ?? raw.max_output_tokens ?? null,
-    reasoningEfforts: supportsReasoning ? ["low", "medium", "high"] : ["none"],
-    defaultReasoningEffort: supportsReasoning ? "medium" : "none",
+    reasoningEfforts: supportsReasoning ? efforts : ["none"],
+    defaultReasoningEffort: supportsReasoning ? defaultReasoningEffort : "none",
     defaultVerbosity: "low",
     supportsReasoning,
     supportsImages,
@@ -456,7 +514,7 @@ function compactTranscript(input: ResponseInputItem[]): string {
   for (const item of input) {
     if (item.type === "reasoning") continue;
     if (item.type === "function_call") {
-      lines.push(`ASSISTANT TOOL CALL ${item.name}: ${item.arguments}`);
+      lines.push(`ASSISTANT TOOL CALL ${item.name} [${item.call_id}]: ${item.arguments}`);
       continue;
     }
     if (item.type === "function_call_output") {
@@ -464,16 +522,102 @@ function compactTranscript(input: ResponseInputItem[]): string {
       continue;
     }
     const message = item as unknown as { role?: string; content?: unknown };
-    if (!message.role || !Array.isArray(message.content)) continue;
+    if (!message.role) continue;
+    if (typeof message.content === "string") {
+      if (message.content) lines.push(`${message.role.toUpperCase()}: ${message.content}`);
+      continue;
+    }
+    if (!Array.isArray(message.content)) continue;
     const text = message.content.map((content: unknown) => {
       if (!content || typeof content !== "object") return "";
-      const part = content as { type?: string; text?: string };
-      if ((part.type === "input_text" || part.type === "output_text") && part.text) return part.text;
+      const part = content as { type?: string; text?: string; refusal?: string };
+      if ((part.type === "input_text" || part.type === "output_text" || part.type === "text") && part.text) return part.text;
+      if (part.type === "refusal" && part.refusal) return `REFUSAL: ${part.refusal}`;
+      if (part.type === "input_image") return "[IMAGE ATTACHMENT PRESERVED BELOW]";
+      if (part.type === "input_file") return "[FILE ATTACHMENT PRESERVED BELOW]";
       return "";
     }).filter(Boolean).join("\n");
     if (text) lines.push(`${message.role.toUpperCase()}: ${text}`);
   }
   return lines.join("\n\n");
+}
+
+export function requiresPortableCodexReplay(input: ResponseInputItem[]): boolean {
+  if (input.some((item) => item.type === "compaction")) return false;
+  return input.some((item) => {
+    const record = item as unknown as Record<string, unknown>;
+    if (item.type === "reasoning") {
+      return typeof record.encrypted_content !== "string" || record.encrypted_content.length === 0;
+    }
+    if (item.type === "function_call" && typeof record.id === "string") {
+      return !record.id.startsWith("fc_");
+    }
+    const message = item as unknown as { role?: string; id?: unknown; status?: unknown };
+    return message.role === "user" && (typeof message.id === "string" || typeof message.status === "string");
+  });
+}
+
+function portableReplayAttachments(input: ResponseInputItem[]): unknown[] {
+  return input.flatMap((item) => {
+    const content = (item as unknown as { content?: unknown }).content;
+    if (!Array.isArray(content)) return [];
+    return content.flatMap((part) => {
+      if (!part || typeof part !== "object" || Array.isArray(part)) return [];
+      const type = (part as { type?: unknown }).type;
+      return type === "input_image" || type === "input_file" ? [structuredClone(part)] : [];
+    });
+  });
+}
+
+function portableCodexReplayInput(input: ResponseInputItem[]): ResponseInputItem[] {
+  if (!requiresPortableCodexReplay(input)) return input;
+  const transcript = compactTranscript(input);
+  const attachments = portableReplayAttachments(input);
+  return [{
+    role: "user",
+    content: [{
+      type: "input_text",
+      text: transcript
+        ? `Portable conversation replay generated by Looking Glass:\n\n${transcript}`
+        : "Portable conversation replay generated by Looking Glass. Refer to the preserved attachments below.",
+    }, ...attachments],
+  } as unknown as ResponseInputItem];
+}
+
+const MAX_COMPACTION_CHUNKS = 32;
+const MAX_COMPACTION_OUTPUT_TOKENS = 8_192;
+
+function chunkTranscript(transcript: string, maxChars: number): string[] {
+  const limit = Math.max(16_384, Math.floor(maxChars));
+  if (transcript.length <= limit) return [transcript];
+  const chunks: string[] = [];
+  let offset = 0;
+  while (offset < transcript.length) {
+    if (chunks.length >= MAX_COMPACTION_CHUNKS) {
+      throw Object.assign(new Error("conversation is too large for bounded checkpoint generation"), {
+        code: "compaction_input_too_large",
+      });
+    }
+    let end = Math.min(transcript.length, offset + limit);
+    if (end < transcript.length) {
+      const boundary = transcript.lastIndexOf("\n\n", end);
+      if (boundary > offset + Math.floor(limit / 2)) end = boundary;
+      if (/^[\uDC00-\uDFFF]$/.test(transcript[end] ?? "")) end -= 1;
+    }
+    const chunk = transcript.slice(offset, end).trim();
+    if (chunk) chunks.push(chunk);
+    offset = end;
+    while (transcript.startsWith("\n", offset)) offset += 1;
+  }
+  return chunks;
+}
+
+function combinedUsage(values: Array<Record<string, number> | undefined>): Record<string, number> | undefined {
+  const present = values.filter((value): value is Record<string, number> => value !== undefined);
+  if (present.length === 0) return undefined;
+  const inputTokens = present.reduce((sum, value) => sum + (value.input_tokens ?? 0), 0);
+  const outputTokens = present.reduce((sum, value) => sum + (value.output_tokens ?? 0), 0);
+  return { input_tokens: inputTokens, output_tokens: outputTokens, total_tokens: inputTokens + outputTokens };
 }
 
 function lmStudioModelsURL(baseURL: string): string {
@@ -503,12 +647,28 @@ function chatContent(value: unknown): unknown {
   return parts.length === 1 && typeof parts[0] === "string" ? parts[0] : parts;
 }
 
-export function openRouterMessages(instructions: string, input: ResponseInputItem[]): OpenRouterChatMessage[] {
+function reasoningSummaryText(item: Record<string, unknown>): string {
+  if (!Array.isArray(item.summary)) return "";
+  return item.summary.map((part) => part && typeof part === "object"
+    && typeof (part as Record<string, unknown>).text === "string"
+    ? (part as Record<string, string>).text : "").join("");
+}
+
+export function openRouterMessages(
+  instructions: string,
+  input: ResponseInputItem[],
+  includeReasoningContent = false,
+): OpenRouterChatMessage[] {
   const messages: OpenRouterChatMessage[] = [];
+  let pendingReasoning = "";
   if (instructions.trim()) messages.push({ role: "system", content: instructions });
   for (const raw of input) {
     const item = raw as unknown as Record<string, unknown>;
-    if (item.type === "reasoning" || item.type === "compaction") continue;
+    if (item.type === "reasoning") {
+      if (includeReasoningContent) pendingReasoning += reasoningSummaryText(item);
+      continue;
+    }
+    if (item.type === "compaction") continue;
     if (item.type === "function_call") {
       const previous = messages.at(-1);
       const call = {
@@ -522,10 +682,18 @@ export function openRouterMessages(instructions: string, input: ResponseInputIte
       if (previous?.role === "assistant") {
         if (Array.isArray(previous.tool_calls)) previous.tool_calls.push(call);
         else previous.tool_calls = [call];
-      } else messages.push({ role: "assistant", content: null, tool_calls: [call] });
+        if (pendingReasoning) previous.reasoning_content = pendingReasoning;
+      } else messages.push({
+        role: "assistant",
+        content: null,
+        tool_calls: [call],
+        ...(pendingReasoning ? { reasoning_content: pendingReasoning } : {}),
+      });
+      pendingReasoning = "";
       continue;
     }
     if (item.type === "function_call_output") {
+      pendingReasoning = "";
       messages.push({
         role: "tool",
         tool_call_id: typeof item.call_id === "string" ? item.call_id : String(item.id ?? "call_unknown"),
@@ -535,7 +703,12 @@ export function openRouterMessages(instructions: string, input: ResponseInputIte
     }
     const role = item.role === "developer" ? "system"
       : item.role === "assistant" ? "assistant" : item.role === "system" ? "system" : "user";
-    messages.push({ role, content: chatContent(item.content) });
+    messages.push({
+      role,
+      content: chatContent(item.content),
+      ...(role === "assistant" && pendingReasoning ? { reasoning_content: pendingReasoning } : {}),
+    });
+    pendingReasoning = "";
   }
   return messages;
 }
@@ -556,12 +729,14 @@ export function buildOpenRouterParams(request: ResponseRequest): Record<string, 
     ...(tools.length > 0
       ? { tools, ...(request.supportsParallelToolCalls ? { parallel_tool_calls: true } : {}) }
       : {}),
-    ...(request.supportsReasoning && request.reasoningEffort !== "none"
-      ? { reasoning: { effort: request.reasoningEffort } } : {}),
+    ...(request.supportsReasoning ? { reasoning: { effort: request.reasoningEffort } } : {}),
   };
 }
 
-export function buildCustomChatParams(request: ResponseRequest): Record<string, unknown> {
+export function buildCustomChatParams(
+  request: ResponseRequest,
+  includeReasoningContent = false,
+): Record<string, unknown> {
   const tools = request.tools.map((tool) => ({
     type: "function",
     function: {
@@ -573,7 +748,7 @@ export function buildCustomChatParams(request: ResponseRequest): Record<string, 
   }));
   return {
     model: request.model,
-    messages: openRouterMessages(request.instructions, request.input),
+    messages: openRouterMessages(request.instructions, request.input, includeReasoningContent),
     ...(tools.length > 0
       ? { tools, ...(request.supportsParallelToolCalls ? { parallel_tool_calls: true } : {}) }
       : {}),
@@ -737,17 +912,27 @@ async function* openRouterEvents(response: globalThis.Response, context: Provide
 }
 
 export class CodexLbClient {
-  private readonly apiKey: string;
+  private apiKey: string;
   private readonly lmStudioAgent: Agent | undefined;
 
   constructor(private readonly config: GlassConfig) {
-    this.apiKey = process.env[config.gateway.apiKeyEnv] || "local-looking-glass";
+    const configuredApiKey = process.env[config.gateway.apiKeyEnv] ?? "";
+    this.apiKey = configuredApiKey || "local-looking-glass";
     if (config.gateway.provider === "lm-studio") {
       // Local model prefill and token generation can leave the connection quiet
       // for longer than Undici's 300-second headers/body defaults. The request
       // AbortSignal remains the overall finite deadline for this client.
       this.lmStudioAgent = new Agent({ headersTimeout: 0, bodyTimeout: 0 });
     }
+  }
+
+  private requireOpenCodeApiKey(): void {
+    if (this.config.gateway.provider !== "opencode-go") return;
+    const configuredApiKey = process.env[this.config.gateway.apiKeyEnv] ?? "";
+    if (configuredApiKey.trim() === "") {
+      throw new Error(`Missing OpenCode Go API key in ${this.config.gateway.apiKeyEnv}`);
+    }
+    this.apiKey = configuredApiKey;
   }
 
   private fetchOptions(init: RequestInit): RequestInit {
@@ -767,6 +952,7 @@ export class CodexLbClient {
   }
 
   async models(signal?: AbortSignal): Promise<ModelInfo[]> {
+    this.requireOpenCodeApiKey();
     const provider = this.config.gateway.provider;
     const timeout = AbortSignal.timeout(this.config.gateway.timeoutMs);
     const requestSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
@@ -811,6 +997,11 @@ export class CodexLbClient {
       throw providerError({ code: "malformed_response", message: "model catalog data was not an array" }, { ...context, protocol: true });
     }
     const models = (payload.data ?? []).filter((model) => model && typeof model === "object" && typeof model.id === "string");
+    if (provider === "opencode-go") {
+      return models
+        .map((model) => openCodeGoModelInfo(model))
+        .sort((left, right) => left.priority - right.priority || left.name.localeCompare(right.name));
+    }
     if (provider === "custom") {
       return models
         .map((model) => customModelInfo(model as unknown as RawModel))
@@ -827,10 +1018,33 @@ export class CodexLbClient {
       .sort((left, right) => left.priority - right.priority || left.name.localeCompare(right.name));
   }
 
+  private async anthropicMessagesStream(request: ResponseRequest, callbacks: StreamCallbacks): Promise<Response> {
+    const timeout = AbortSignal.timeout(this.config.gateway.timeoutMs);
+    const signal = request.signal ? AbortSignal.any([request.signal, timeout]) : timeout;
+    const context = requestContext("opencode-go", "stream", this.apiKey, request.signal, timeout);
+    let http: globalThis.Response;
+    try {
+      http = await fetch(`${this.config.gateway.baseURL.replace(/\/$/, "")}/messages`, {
+        method: "POST",
+        headers: {
+          "x-api-key": this.apiKey,
+          "anthropic-version": "2023-06-01",
+          "content-type": "application/json",
+          accept: "text/event-stream",
+        },
+        body: JSON.stringify(buildAnthropicMessagesParams(request)),
+        signal,
+      });
+    } catch (error) {
+      throw providerError(error, context);
+    }
+    return parseAnthropicMessagesStream(http, callbacks, context);
+  }
+
   private async openRouterStream(
     request: ResponseRequest,
     callbacks: StreamCallbacks,
-    provider: "openrouter" | "custom" = "openrouter",
+    provider: "openrouter" | "custom" | "opencode-go" = "openrouter",
   ): Promise<Response> {
     const timeout = AbortSignal.timeout(this.config.gateway.timeoutMs);
     const signal = request.signal ? AbortSignal.any([request.signal, timeout]) : timeout;
@@ -844,8 +1058,14 @@ export class CodexLbClient {
           "content-type": "application/json",
           accept: "text/event-stream",
         },
-        body: JSON.stringify(provider === "custom"
-          ? { ...buildCustomChatParams(request), stream: true }
+        body: JSON.stringify(provider === "custom" || provider === "opencode-go"
+          ? {
+              ...buildCustomChatParams(request, provider === "opencode-go" && request.supportsReasoning),
+              ...(provider === "opencode-go" && request.supportsReasoning
+                ? openCodeGoReasoningParams(request.model, request.reasoningEffort)
+                : {}),
+              stream: true,
+            }
           : { ...buildOpenRouterParams(request), stream: true, stream_options: { include_usage: true } }),
         signal,
       });
@@ -939,7 +1159,10 @@ export class CodexLbClient {
     const incompleteReason = finishReason === "length" ? "max_output_tokens"
       : finishReason === "content_filter" ? "content_filter" : undefined;
     if (output.length === 0 && !incompleteReason) {
-      throw providerError({ code: "malformed_response", message: "response contained no output" }, { ...context, protocol: true });
+      throw providerError({
+        code: "empty_response",
+        message: "provider returned an empty completion stream",
+      }, { ...context, protocol: true });
     }
     for (const [index, item] of output.entries()) callbacks.onEvent?.({ type: "response.output_item.done", output_index: index, item } as unknown as ResponseStreamEvent);
     for (const [index, call] of [...toolCalls.entries()].sort(([left], [right]) => left - right)) {
@@ -968,7 +1191,13 @@ export class CodexLbClient {
   }
 
   async stream(request: ResponseRequest, callbacks: StreamCallbacks = {}): Promise<Response> {
+    this.requireOpenCodeApiKey();
     if (this.config.gateway.provider === "openrouter") return this.openRouterStream(request, callbacks);
+    if (this.config.gateway.provider === "opencode-go") {
+      const protocol = openCodeGoProfile(request.model).protocol;
+      if (protocol === "chat") return this.openRouterStream(request, callbacks, "opencode-go");
+      if (protocol === "messages") return this.anthropicMessagesStream(request, callbacks);
+    }
     if (this.config.gateway.provider === "custom" && this.config.gateway.protocol === "chat") {
       return this.openRouterStream(request, callbacks, "custom");
     }
@@ -1059,8 +1288,83 @@ export class CodexLbClient {
     return this.config.gateway.provider === "lm-studio" ? redactLmStudioReasoning(canonical) : canonical;
   }
 
+  private async anthropicMessagesCompact(request: CompactRequest): Promise<Record<string, unknown>> {
+    const transcript = compactTranscript(request.input);
+    const timeout = AbortSignal.timeout(this.config.gateway.timeoutMs);
+    const context = requestContext("opencode-go", "compact", this.apiKey, request.signal, timeout);
+    if (!transcript) throw providerError({ code: "malformed_response", message: "compaction received no semantic transcript" }, {
+      ...context,
+      protocol: true,
+    });
+    const profile: ResponseRequest = {
+      model: request.model,
+      instructions: [
+        request.instructions,
+        "Create a dense, durable checkpoint of the supplied conversation.",
+        "Preserve user requirements, decisions, relevant facts, file paths, code changes, tool outcomes, unresolved work, and safety constraints.",
+        "Do not continue the task, call tools, or add commentary. Return only the checkpoint text.",
+      ].filter((part) => part.trim()).join(" "),
+      input: [{
+        role: "user",
+        content: [{ type: "input_text", text: `Conversation transcript:\n\n${transcript}` }],
+      }],
+      tools: [],
+      promptCacheKey: request.promptCacheKey,
+      reasoningEffort: "none",
+      supportsReasoning: false,
+      supportsParallelToolCalls: false,
+      verbosity: "low",
+      fast: false,
+      ...(request.signal ? { signal: request.signal } : {}),
+    };
+    const signal = request.signal ? AbortSignal.any([request.signal, timeout]) : timeout;
+    let http: globalThis.Response;
+    try {
+      const body = { ...buildAnthropicMessagesParams(profile, { maxTokens: 8_192, includeReasoning: false }), stream: false };
+      http = await fetch(`${this.config.gateway.baseURL.replace(/\/$/, "")}/messages`, {
+        method: "POST",
+        headers: {
+          "x-api-key": this.apiKey,
+          "anthropic-version": "2023-06-01",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(body),
+        signal,
+      });
+    } catch (error) {
+      throw providerError(error, context);
+    }
+    const payload = await readJsonResponse(http, context);
+    const summary = anthropicMessageText(payload).trim();
+    if (!summary) throw providerError({ code: "malformed_response", message: "compaction returned no checkpoint text" }, {
+      ...context,
+      protocol: true,
+    });
+    const object = payload as Record<string, unknown>;
+    const id = typeof object.id === "string" ? object.id : `msg_${Date.now().toString(36)}`;
+    const usage = anthropicMessageUsage(payload);
+    return {
+      id: `compact_${id}`,
+      object: "response.compaction",
+      output: [{
+        id: `msg_compact_${id}`,
+        type: "message",
+        role: "user",
+        status: "completed",
+        content: [{ type: "input_text", text: `Conversation checkpoint generated by Looking Glass:\n${summary}` }],
+      }],
+      ...(usage ? { usage } : {}),
+    };
+  }
+
   async compact(request: CompactRequest): Promise<Record<string, unknown>> {
+    this.requireOpenCodeApiKey();
+    const openCodeProtocol = this.config.gateway.provider === "opencode-go"
+      ? openCodeGoProfile(request.model).protocol
+      : undefined;
+    if (openCodeProtocol === "messages") return this.anthropicMessagesCompact(request);
     if (this.config.gateway.provider === "openrouter"
+      || openCodeProtocol === "chat"
       || (this.config.gateway.provider === "custom" && this.config.gateway.protocol === "chat")) {
       const chatProvider = this.config.gateway.provider;
       const semanticInput = request.input.filter((item) => item.type !== "reasoning" && item.type !== "compaction");
@@ -1073,45 +1377,76 @@ export class CodexLbClient {
         "Preserve user requirements, decisions, relevant facts, file paths, code changes, tool outcomes, unresolved work, and safety constraints.",
         "Do not continue the task, call tools, or add commentary. Return only the checkpoint text.",
       ].filter((part) => part.trim()).join(" ");
-      const messages = openRouterMessages(checkpointInstructions, request.input);
-      messages.push({
-        role: "user",
-        content: "Create the durable conversation checkpoint now. Return only the checkpoint text.",
-      });
-      const timeout = AbortSignal.timeout(this.config.gateway.timeoutMs);
-      const signal = request.signal ? AbortSignal.any([request.signal, timeout]) : timeout;
-      const context = requestContext(chatProvider, "compact", this.apiKey, request.signal, timeout);
-      let http: globalThis.Response;
-      try {
-        http = await fetch(`${this.config.gateway.baseURL.replace(/\/$/, "")}/chat/completions`, {
-          method: "POST",
-          headers: { authorization: `Bearer ${this.apiKey}`, "content-type": "application/json" },
-          body: JSON.stringify({
-            model: request.model,
-            messages,
-            ...(chatProvider === "openrouter" ? { transforms: ["middle-out"] } : {}),
-            max_tokens: 8_192,
-            stream: false,
-          }),
-          signal,
-        });
-      } catch (error) {
-        throw providerError(error, context);
+      const transcript = compactTranscript(request.input);
+      const openCodeProfile = openCodeProtocol === "chat" ? openCodeGoProfile(request.model) : undefined;
+      const chunkChars = openCodeProfile
+        ? Math.max(16_384, Math.floor(Math.max(8_192, openCodeProfile.contextWindow - 32_000) * 2))
+        : Number.POSITIVE_INFINITY;
+      const transcriptChunks = chunkTranscript(transcript, chunkChars);
+      const maxTokens = transcriptChunks.length === 1
+        ? MAX_COMPACTION_OUTPUT_TOKENS
+        : Math.max(1, Math.floor(MAX_COMPACTION_OUTPUT_TOKENS / transcriptChunks.length));
+      const messageSets: OpenRouterChatMessage[][] = transcriptChunks.length === 1
+        ? [(() => {
+            const messages = openRouterMessages(checkpointInstructions, request.input);
+            messages.push({
+              role: "user",
+              content: "Create the durable conversation checkpoint now. Return only the checkpoint text.",
+            });
+            return messages;
+          })()]
+        : transcriptChunks.map((chunk, index) => [{
+            role: "system",
+            content: `${checkpointInstructions} This is transcript part ${index + 1} of ${transcriptChunks.length}; produce a self-contained checkpoint for this part.`,
+          }, {
+            role: "user",
+            content: `Conversation transcript part ${index + 1} of ${transcriptChunks.length}:\n\n${chunk}`,
+          }]);
+      const summaries: string[] = [];
+      const usages: Array<Record<string, number> | undefined> = [];
+      const ids: string[] = [];
+      for (const messages of messageSets) {
+        const timeout = AbortSignal.timeout(this.config.gateway.timeoutMs);
+        const signal = request.signal ? AbortSignal.any([request.signal, timeout]) : timeout;
+        const context = requestContext(chatProvider, "compact", this.apiKey, request.signal, timeout);
+        let http: globalThis.Response;
+        try {
+          http = await fetch(`${this.config.gateway.baseURL.replace(/\/$/, "")}/chat/completions`, {
+            method: "POST",
+            headers: { authorization: `Bearer ${this.apiKey}`, "content-type": "application/json" },
+            body: JSON.stringify({
+              model: request.model,
+              messages,
+              ...(chatProvider === "openrouter" ? { transforms: ["middle-out"] } : {}),
+              max_tokens: maxTokens,
+              stream: false,
+            }),
+            signal,
+          });
+        } catch (error) {
+          throw providerError(error, context);
+        }
+        const payload = objectPayload(await readJsonResponse(http, context), context, "compaction returned an invalid payload");
+        const choices = Array.isArray(payload.choices) ? payload.choices : [];
+        const first = choices[0] && typeof choices[0] === "object" ? choices[0] as Record<string, unknown> : {};
+        const message = first.message && typeof first.message === "object" ? first.message as Record<string, unknown> : {};
+        const summaryValue = typeof message.content === "string" ? message.content : chatContent(message.content);
+        const summary = typeof summaryValue === "string"
+          ? summaryValue.trim()
+          : Array.isArray(summaryValue)
+            ? summaryValue.map((part) => part && typeof part === "object" && typeof (part as Record<string, unknown>).text === "string"
+              ? (part as Record<string, string>).text : "").join("\n").trim()
+            : "";
+        if (!summary) throw providerError({ code: "malformed_response", message: "compaction returned no checkpoint text" }, { ...context, protocol: true });
+        summaries.push(summary);
+        usages.push(normalizedUsage(payload.usage));
+        if (typeof payload.id === "string") ids.push(payload.id);
       }
-      const payload = objectPayload(await readJsonResponse(http, context), context, "compaction returned an invalid payload");
-      const choices = Array.isArray(payload.choices) ? payload.choices : [];
-      const first = choices[0] && typeof choices[0] === "object" ? choices[0] as Record<string, unknown> : {};
-      const message = first.message && typeof first.message === "object" ? first.message as Record<string, unknown> : {};
-      const summaryValue = typeof message.content === "string" ? message.content : chatContent(message.content);
-      const summary = typeof summaryValue === "string"
-        ? summaryValue.trim()
-        : Array.isArray(summaryValue)
-          ? summaryValue.map((part) => part && typeof part === "object" && typeof (part as Record<string, unknown>).text === "string"
-            ? (part as Record<string, string>).text : "").join("\n").trim()
-          : "";
-      if (!summary) throw providerError({ code: "malformed_response", message: "compaction returned no checkpoint text" }, { ...context, protocol: true });
-      const id = typeof payload.id === "string" ? payload.id : `compact_${Date.now().toString(36)}`;
-      const usage = normalizedUsage(payload.usage);
+      const summary = summaries.length === 1
+        ? summaries[0] ?? ""
+        : summaries.map((part, index) => `Checkpoint part ${index + 1} of ${summaries.length}:\n${part}`).join("\n\n");
+      const id = ids[0] ?? `compact_${Date.now().toString(36)}`;
+      const usage = combinedUsage(usages);
       return {
         id: `compact_${id}`,
         object: "response.compaction",
@@ -1123,6 +1458,7 @@ export class CodexLbClient {
       };
     }
     if (this.config.gateway.provider === "lm-studio"
+      || openCodeProtocol === "responses"
       || (this.config.gateway.provider === "custom" && this.config.gateway.protocol === "responses")) {
       const responseProvider = this.config.gateway.provider;
       const transcript = compactTranscript(request.input);
@@ -1204,7 +1540,7 @@ export class CodexLbClient {
     const body = {
       model: request.model,
       instructions: request.instructions,
-      input: request.input,
+      input: portableCodexReplayInput(request.input),
       prompt_cache_key: request.promptCacheKey,
       ...(request.fast ? { service_tier: "priority" } : {}),
     };

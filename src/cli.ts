@@ -15,7 +15,7 @@ import { serializeConfig } from "./config.js";
 import { collectOperationalSnapshot, type OperationalSnapshot } from "./operations.js";
 import type { MaintenanceMode, MaintenanceReport } from "./maintenance.js";
 
-export const VERSION = "0.8.1";
+export const VERSION = "0.9.0";
 
 function terminalText(value: string): string {
   return value.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/gu, "�");
@@ -48,6 +48,7 @@ Environment:
   CODEX_LB_API_KEY              Optional local gateway API key
   LM_STUDIO_API_KEY             Recommended LM Studio API token variable
   OPENROUTER_API_KEY            OpenRouter API key
+  OPENCODE_API_KEY              OpenCode Go API key
   CUSTOM_API_KEY                Custom OpenAI-compatible gateway API key
   LOOKING_GLASS_CONFIG          Explicit JSON/JSONC config path
   LOOKING_GLASS_DB              Explicit SQLite state path

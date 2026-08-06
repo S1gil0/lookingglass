@@ -15,6 +15,7 @@ import {
   formatTurnSummary,
   formatCommandApproval,
   FullHeightRoot,
+  gatewayApiKeyEnvironmentIsConfigurable,
   inboxLine,
   initialTuiSession,
   markInboxItemsRead,
@@ -22,6 +23,7 @@ import {
   mouseWheelDelta,
   parseTerminalMouse,
   parseSessionSchedule,
+  QuestionInputModal,
   ReasoningSummary,
   RepeatedPressConfirmation,
   renderStartupScreen,
@@ -406,7 +408,23 @@ test("provides sensible gateway onboarding defaults", () => {
   assert.equal(defaultGatewayBaseURL("codex-lb"), "http://127.0.0.1:2455/v1");
   assert.equal(defaultGatewayBaseURL("lm-studio"), "http://127.0.0.1:1234/v1");
   assert.equal(defaultGatewayBaseURL("openrouter"), "https://openrouter.ai/api/v1");
+  assert.equal(defaultGatewayBaseURL("opencode-go"), "https://opencode.ai/zen/go/v1");
   assert.equal(defaultGatewayBaseURL("custom"), "http://127.0.0.1:8080/v1");
+  assert.equal(gatewayApiKeyEnvironmentIsConfigurable("opencode-go"), false);
+  assert.equal(gatewayApiKeyEnvironmentIsConfigurable("custom"), true);
+});
+
+test("question inputs render their initial value as editable text", () => {
+  const terminal = { rows: 30 } as never;
+  const modal = new QuestionInputModal(
+    terminal,
+    "Gateway base URL",
+    false,
+    "https://opencode.ai/zen/go/v1",
+  );
+  const rendered = modal.render(80).map(stripVTControlCharacters).join("\n");
+  assert.match(rendered, /Gateway base URL/);
+  assert.match(rendered, /https:\/\/opencode\.ai\/zen\/go\/v1/);
 });
 
 test("restores or clears the TUI API key environment snapshot", () => {

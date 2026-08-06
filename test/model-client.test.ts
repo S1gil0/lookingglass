@@ -9,6 +9,7 @@ import {
   CodexLbClient,
   customModelInfo,
   lmStudioModelInfo,
+  modelInfo,
   openRouterModelInfo,
   openRouterMessages,
   responseText,
@@ -34,7 +35,7 @@ test("LM Studio response profile uses stateless replay and omits codex-only fiel
     ...request,
     input: [
       ...request.input,
-      { type: "reasoning", id: "reasoning", summary: [], content: [] } as unknown as ResponseInputItem,
+      { type: "reasoning", id: "rs_native", summary: [], content: [], encrypted_content: "opaque" } as unknown as ResponseInputItem,
     ],
   };
   const params = buildResponseParams("lm-studio", withReasoning);
@@ -55,6 +56,145 @@ test("LM Studio response profile uses stateless replay and omits codex-only fiel
   assert.equal(codex.prompt_cache_key, "cache-key");
   assert.equal(codex.service_tier, "priority");
   assert.equal((codex.input as ResponseInputItem[]).some((item) => item.type === "reasoning"), true);
+});
+
+test("codex-lb converts foreign unanchored replay into a portable transcript", () => {
+  const { previousResponseId: _previousResponseId, ...unanchored } = request;
+  const params = buildResponseParams("codex-lb", {
+    ...unanchored,
+    input: [
+      {
+        id: "msg_compact_foreign",
+        type: "message",
+        role: "user",
+        status: "completed",
+        content: [{ type: "input_text", text: "checkpoint context" }],
+      },
+      {
+        id: "reasoning_foreign",
+        type: "reasoning",
+        status: "completed",
+        summary: [{ type: "summary_text", text: "private plan" }],
+        content: [],
+      },
+      {
+        id: "msg_foreign",
+        type: "message",
+        role: "assistant",
+        status: "completed",
+        content: [{ type: "output_text", text: "assistant result" }],
+      },
+      {
+        id: "msg_refusal_foreign",
+        type: "message",
+        role: "assistant",
+        status: "completed",
+        content: [{ type: "refusal", refusal: "declined detail" }],
+      },
+      {
+        id: "call_00_foreign",
+        type: "function_call",
+        call_id: "call_foreign",
+        name: "lookup",
+        arguments: "{}",
+        status: "completed",
+      },
+      { type: "function_call_output", call_id: "call_foreign", output: "tool result" },
+      { role: "user", content: "string-form context" },
+      {
+        role: "user",
+        content: [
+          { type: "input_image", image_url: "data:image/png;base64,AA==", detail: "auto" },
+          { type: "input_file", file_data: "data:text/plain;base64,QQ==", filename: "context.txt" },
+        ],
+      },
+    ] as unknown as ResponseInputItem[],
+  });
+  assert.equal(params.input.length, 1);
+  const replay = params.input[0] as unknown as Record<string, unknown>;
+  assert.equal(replay.role, "user");
+  assert.equal("id" in replay, false);
+  assert.equal("status" in replay, false);
+  assert.match(JSON.stringify(replay), /Portable conversation replay/);
+  assert.match(JSON.stringify(replay), /checkpoint context/);
+  assert.match(JSON.stringify(replay), /assistant result/);
+  assert.match(JSON.stringify(replay), /ASSISTANT TOOL CALL lookup/);
+  assert.match(JSON.stringify(replay), /call_foreign/);
+  assert.match(JSON.stringify(replay), /TOOL RESULT call_foreign/);
+  assert.match(JSON.stringify(replay), /REFUSAL: declined detail/);
+  assert.match(JSON.stringify(replay), /string-form context/);
+  assert.doesNotMatch(JSON.stringify(replay), /private plan/);
+  const replayContent = replay.content as Array<Record<string, unknown>>;
+  assert.deepEqual(replayContent.map((part) => part.type), ["input_text", "input_image", "input_file"]);
+});
+
+test("codex-lb preserves native unanchored replay items", () => {
+  const { previousResponseId: _previousResponseId, ...unanchored } = request;
+  const nativeInput = [
+    ...request.input,
+    {
+      id: "msg_compact_native",
+      type: "message",
+      role: "user",
+      status: "completed",
+      content: [{ type: "input_text", text: "native compact context" }],
+    },
+    { type: "compaction", encrypted_content: "native compact payload" },
+    { id: "rs_native", type: "reasoning", summary: [], encrypted_content: "opaque" },
+    {
+      id: "msg_native",
+      type: "message",
+      role: "assistant",
+      status: "completed",
+      content: [{ type: "output_text", text: "native result" }],
+    },
+    { id: "fc_native", type: "function_call", call_id: "call_native", name: "lookup", arguments: "{}" },
+    { type: "function_call_output", call_id: "call_native", output: "result" },
+  ] as unknown as ResponseInputItem[];
+  const params = buildResponseParams("codex-lb", { ...unanchored, input: nativeInput });
+  assert.deepEqual(params.input, nativeInput);
+});
+
+test("codex-lb compaction canonicalizes foreign replay before transport", async (t) => {
+  let body: Record<string, unknown> | undefined;
+  const server = createServer((req, response) => {
+    let raw = "";
+    req.on("data", (chunk) => { raw += chunk; });
+    req.on("end", () => {
+      body = JSON.parse(raw) as Record<string, unknown>;
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({
+        id: "compact_native",
+        object: "response.compaction",
+        output: [{ id: "cmp_native", type: "compaction_summary", encrypted_content: "opaque" }],
+      }));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.gateway.provider = "codex-lb";
+  config.gateway.baseURL = `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1`;
+  config.gateway.apiKeyEnv = "LOOKING_GLASS_CODEX_PORTABLE_TEST_KEY";
+  process.env.LOOKING_GLASS_CODEX_PORTABLE_TEST_KEY = "portable-test-key";
+  t.after(() => { delete process.env.LOOKING_GLASS_CODEX_PORTABLE_TEST_KEY; });
+
+  await new CodexLbClient(config).compact({
+    model: "coordinator-model",
+    instructions: "Keep context",
+    input: [{
+      id: "msg_compact_foreign",
+      type: "message",
+      role: "user",
+      status: "completed",
+      content: [{ type: "input_text", text: "portable checkpoint" }],
+    }] as unknown as ResponseInputItem[],
+    promptCacheKey: "portable",
+    fast: false,
+  });
+  assert.equal((body?.input as ResponseInputItem[]).length, 1);
+  assert.match(JSON.stringify(body?.input), /Portable conversation replay/);
+  assert.equal(JSON.stringify(body?.input).includes("msg_compact_foreign"), false);
 });
 
 test("custom Responses profile is stateless and omits gateway-specific fields", () => {
@@ -83,6 +223,131 @@ test("custom model metadata is conservative when the catalog omits capabilities"
   assert.equal(model.supportsImages, false);
   assert.equal(model.supportsParallelToolCalls, false);
   assert.equal(model.supportsFast, false);
+});
+
+test("codex-compatible metadata retains minimal and extended effort levels", () => {
+  const model = modelInfo({
+    id: "reasoning-model",
+    metadata: {
+      supported_reasoning_levels: ["none", "minimal", "low", "xhigh", "max", "ultra"]
+        .map((effort) => ({ effort })),
+      default_reasoning_level: "minimal",
+    },
+  });
+  assert.deepEqual(model.reasoningEfforts, ["none", "minimal", "low", "xhigh", "max", "ultra"]);
+  assert.equal(model.defaultReasoningEffort, "minimal");
+
+  const disabled = modelInfo({
+    id: "non-reasoning-model",
+    capabilities: { supports_reasoning: false },
+    metadata: {
+      supported_reasoning_levels: [{ effort: "high" }],
+      default_reasoning_level: "high",
+    },
+  });
+  assert.equal(disabled.supportsReasoning, false);
+  assert.deepEqual(disabled.reasoningEfforts, ["none"]);
+  assert.equal(disabled.defaultReasoningEffort, "none");
+
+  const mismatchedDefault = modelInfo({
+    id: "mismatched-default",
+    metadata: {
+      supported_reasoning_levels: [{ effort: "low" }, { effort: "high" }],
+      default_reasoning_level: "xhigh",
+    },
+  });
+  assert.deepEqual(mismatchedDefault.reasoningEfforts, ["low", "high"]);
+  assert.equal(mismatchedDefault.defaultReasoningEffort, "low");
+});
+
+test("OpenCode Go enriches its sparse catalog with model-specific capabilities", async (t) => {
+  const server = createServer((request, response) => {
+    assert.equal(request.method, "GET");
+    assert.equal(request.url, "/v1/models");
+    assert.equal(request.headers.authorization, "Bearer catalog-test-key");
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ data: [{ id: "deepseek-v4-flash" }] }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.gateway.provider = "opencode-go";
+  config.gateway.protocol = "chat";
+  config.gateway.baseURL = `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1`;
+  config.gateway.apiKeyEnv = "LOOKING_GLASS_OPENCODE_CATALOG_TEST_KEY";
+  process.env.LOOKING_GLASS_OPENCODE_CATALOG_TEST_KEY = "catalog-test-key";
+  t.after(() => { delete process.env.LOOKING_GLASS_OPENCODE_CATALOG_TEST_KEY; });
+  const models = await new CodexLbClient(config).models();
+  assert.deepEqual(models.map((model) => model.id), ["deepseek-v4-flash"]);
+  assert.equal(models[0]?.name, "deepseek-v4-flash");
+  assert.equal(models[0]?.contextWindow, 1_000_000);
+  assert.equal(models[0]?.maxOutputTokens, 384_000);
+  assert.equal(models[0]?.supportsReasoning, true);
+  assert.equal(models[0]?.defaultReasoningEffort, "high");
+  assert.deepEqual(models[0]?.reasoningEfforts, ["low", "high", "max"]);
+});
+
+test("OpenCode Go requires its configured API key when used", async (t) => {
+  let requests = 0;
+  const server = createServer((_request, response) => {
+    requests += 1;
+    response.writeHead(500);
+    response.end();
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.gateway.provider = "opencode-go";
+  config.gateway.protocol = "chat";
+  config.gateway.baseURL = `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1`;
+  config.gateway.apiKeyEnv = "LOOKING_GLASS_MISSING_OPENCODE_TEST_KEY";
+  delete process.env.LOOKING_GLASS_MISSING_OPENCODE_TEST_KEY;
+  const client = new CodexLbClient(config);
+  await assert.rejects(() => client.models(), /Missing OpenCode Go API key/);
+  await assert.rejects(() => client.stream(request), /Missing OpenCode Go API key/);
+  await assert.rejects(() => client.compact({
+    model: request.model,
+    instructions: request.instructions,
+    input: request.input,
+    promptCacheKey: request.promptCacheKey,
+    fast: request.fast,
+  }), /Missing OpenCode Go API key/);
+  assert.equal(requests, 0);
+});
+
+test("OpenCode Go reports metadata-only Chat streams as empty provider responses", async (t) => {
+  const server = createServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.end([
+      `data: ${JSON.stringify({ model: "glm-5.2" })}\n\n`,
+      "data: [DONE]\n\n",
+    ].join(""));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.gateway.provider = "opencode-go";
+  config.gateway.protocol = "chat";
+  config.gateway.baseURL = `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1`;
+  config.gateway.apiKeyEnv = "LOOKING_GLASS_OPENCODE_EMPTY_TEST_KEY";
+  process.env.LOOKING_GLASS_OPENCODE_EMPTY_TEST_KEY = "empty-test-key";
+  t.after(() => { delete process.env.LOOKING_GLASS_OPENCODE_EMPTY_TEST_KEY; });
+
+  await assert.rejects(
+    () => new CodexLbClient(config).stream({
+      ...request,
+      model: "glm-5.2",
+      reasoningEffort: "max",
+      supportsParallelToolCalls: false,
+    }),
+    (error: unknown) => {
+      assert.equal((error as { code?: string }).code, "empty_response");
+      assert.equal((error as { kind?: string }).kind, "protocol");
+      assert.equal((error as { retryable?: boolean }).retryable, false);
+      assert.match((error as Error).message, /empty completion stream/);
+      return true;
+    },
+  );
 });
 
 test("custom Responses profile uses the Responses endpoint", async (t) => {
@@ -194,6 +459,319 @@ test("custom chat profile uses the Chat Completions path and parses basic SSE", 
   assert.equal(result.output_text, "CUSTOM_OK");
   assert.equal("reasoning" in (body ?? {}), false);
   assert.equal("stream_options" in (body ?? {}), false);
+});
+
+test("OpenCode Go Chat replays reasoning only when the selected model supports it", () => {
+  const priorInput = [
+    { type: "reasoning", id: "reasoning_prior", summary: [{ type: "summary_text", text: "prior plan" }], content: [] },
+    { type: "function_call", call_id: "call_prior", name: "lookup", arguments: "{}" },
+  ] as unknown as ResponseInputItem[];
+  const supported = buildResponseParams("opencode-go", {
+    ...request,
+    model: "deepseek-v4-flash",
+    input: priorInput,
+    reasoningEffort: "high",
+  }) as unknown as Record<string, unknown>;
+  assert.equal(supported.reasoning_effort, "high");
+  const supportedMessages = supported.messages as Array<Record<string, unknown>>;
+  assert.equal(supportedMessages.find((message) => message.role === "assistant")?.reasoning_content, "prior plan");
+
+  const unsupported = buildResponseParams("opencode-go", {
+    ...request,
+    model: "deepseek-v4-flash",
+    input: priorInput,
+    reasoningEffort: "high",
+    supportsReasoning: false,
+  }) as unknown as Record<string, unknown>;
+  assert.equal("reasoning_effort" in unsupported, false);
+  const unsupportedMessages = unsupported.messages as Array<Record<string, unknown>>;
+  assert.equal("reasoning_content" in (unsupportedMessages.find((message) => message.role === "assistant") ?? {}), false);
+});
+
+test("OpenCode Go Responses omits controls and prior reasoning when reasoning is unsupported", () => {
+  const params = buildResponseParams("opencode-go", {
+    ...request,
+    model: "gpt-5.6-luna",
+    supportsReasoning: false,
+    input: [
+      ...request.input,
+      { type: "reasoning", id: "prior", summary: [], content: [], encrypted_content: "opaque" } as unknown as ResponseInputItem,
+    ],
+  }) as unknown as Record<string, unknown>;
+  assert.equal("reasoning" in params, false);
+  assert.equal("include" in params, false);
+  assert.equal((params.input as ResponseInputItem[]).some((item) => item.type === "reasoning"), false);
+});
+
+test("OpenCode Go Chat models transmit supported reasoning effort and compact without it", async (t) => {
+  const bodies: Record<string, unknown>[] = [];
+  const server = createServer((req, response) => {
+    let raw = "";
+    req.on("data", (chunk) => { raw += chunk; });
+    req.on("end", () => {
+      const body = JSON.parse(raw) as Record<string, unknown>;
+      bodies.push(body);
+      assert.equal(req.url, "/v1/chat/completions");
+      if (body.stream === true) {
+        response.writeHead(200, { "content-type": "text/event-stream" });
+        response.end([
+          `data: ${JSON.stringify({ id: "opencode_chat", model: "deepseek-v4-flash", choices: [{ delta: {
+            content: "before",
+            reasoning_content: "thinking",
+            tool_calls: [{ index: 0, id: "call_1", function: { name: "lookup", arguments: "{}" } }],
+          } }] })}\n\n`,
+          "data: [DONE]\n\n",
+        ].join(""));
+        return;
+      }
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({
+        id: "opencode_compact",
+        choices: [{ message: { content: "checkpoint" } }],
+        usage: { prompt_tokens: 7, completion_tokens: 3, total_tokens: 10 },
+      }));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.gateway.provider = "opencode-go";
+  config.gateway.protocol = "chat";
+  config.gateway.baseURL = `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1`;
+  config.gateway.apiKeyEnv = "LOOKING_GLASS_OPENCODE_STREAM_TEST_KEY";
+  process.env.LOOKING_GLASS_OPENCODE_STREAM_TEST_KEY = "stream-test-key";
+  t.after(() => { delete process.env.LOOKING_GLASS_OPENCODE_STREAM_TEST_KEY; });
+  const client = new CodexLbClient(config);
+  const { previousResponseId: _previousResponseId, ...unanchoredRequest } = request;
+  const streamed = await client.stream({
+    ...unanchoredRequest,
+    model: "deepseek-v4-flash",
+    reasoningEffort: "high",
+  });
+  assert.equal(streamed.output_text, "before");
+  assert.equal(streamed.output.some((item) => item.type === "reasoning"), true);
+  assert.equal(streamed.output.some((item) => item.type === "function_call"), true);
+  const streamBody = bodies[0] ?? {};
+  assert.equal(streamBody.model, "deepseek-v4-flash");
+  assert.equal(streamBody.stream, true);
+  assert.equal(streamBody.reasoning_effort, "high");
+  assert.equal("reasoning" in streamBody, false);
+  assert.equal("stream_options" in streamBody, false);
+  assert.equal("transforms" in streamBody, false);
+
+  const compacted = await client.compact({
+    model: "deepseek-v4-flash",
+    instructions: "Keep context",
+    input: [
+      ...request.input,
+      { type: "function_call", call_id: "call_1", name: "lookup", arguments: "{}" },
+      { type: "function_call_output", call_id: "call_1", output: "result" },
+    ] as ResponseInputItem[],
+    promptCacheKey: "k",
+    fast: false,
+  });
+  const compactBody = bodies[1] ?? {};
+  assert.equal(compactBody.stream, false);
+  assert.equal(compactBody.max_tokens, 8_192);
+  assert.equal("reasoning" in compactBody, false);
+  assert.equal("stream_options" in compactBody, false);
+  assert.equal("transforms" in compactBody, false);
+  assert.equal((compactBody.messages as Array<Record<string, unknown>>).some((message) => message.role === "tool"), true);
+  assert.deepEqual(compacted.usage, { input_tokens: 7, output_tokens: 3, total_tokens: 10 });
+});
+
+test("OpenCode Go generates oversized Chat checkpoints in bounded transcript chunks", async (t) => {
+  const bodies: Array<Record<string, unknown>> = [];
+  const server = createServer((req, response) => {
+    let raw = "";
+    req.on("data", (chunk) => { raw += chunk; });
+    req.on("end", () => {
+      bodies.push(JSON.parse(raw) as Record<string, unknown>);
+      const part = bodies.length;
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({
+        id: `compact_part_${part}`,
+        choices: [{ message: { content: `summary ${part}` } }],
+        usage: { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 },
+      }));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.gateway.provider = "opencode-go";
+  config.gateway.protocol = "chat";
+  config.gateway.baseURL = `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1`;
+  config.gateway.apiKeyEnv = "LOOKING_GLASS_OPENCODE_CHUNK_TEST_KEY";
+  process.env.LOOKING_GLASS_OPENCODE_CHUNK_TEST_KEY = "chunk-test-key";
+  t.after(() => { delete process.env.LOOKING_GLASS_OPENCODE_CHUNK_TEST_KEY; });
+
+  const compacted = await new CodexLbClient(config).compact({
+    model: "future-model",
+    instructions: "Keep durable context",
+    input: [{ role: "user", content: [{ type: "input_text", text: "x".repeat(16_384 * 31 + 1) }] }] as ResponseInputItem[],
+    promptCacheKey: "chunk-test",
+    fast: false,
+  });
+  assert.equal(bodies.length, 32);
+  let aggregateMaxTokens = 0;
+  for (const [index, body] of bodies.entries()) {
+    assert.equal(body.stream, false);
+    assert.equal(body.max_tokens, 256);
+    assert.ok(typeof body.max_tokens === "number" && body.max_tokens >= 1 && body.max_tokens <= 8_192);
+    aggregateMaxTokens += body.max_tokens as number;
+    const messages = body.messages as Array<Record<string, unknown>>;
+    assert.deepEqual(messages.map((message) => message.role), ["system", "user"]);
+    assert.match(String(messages[0]?.content), new RegExp(`part ${index + 1} of 32`));
+    assert.ok(String(messages[1]?.content).length < 17_000);
+  }
+  assert.equal(aggregateMaxTokens, 8_192);
+  assert.match(JSON.stringify(compacted.output), /Checkpoint part 1 of 32/);
+  assert.match(JSON.stringify(compacted.output), /summary 32/);
+  assert.deepEqual(compacted.usage, { input_tokens: 320, output_tokens: 64, total_tokens: 384 });
+});
+
+test("OpenCode Go routes GPT 5.6 Luna through Responses with extended effort levels", async (t) => {
+  const bodies: Record<string, unknown>[] = [];
+  const paths: string[] = [];
+  const server = createServer((req, response) => {
+    let raw = "";
+    req.on("data", (chunk) => { raw += chunk; });
+    req.on("end", () => {
+      const body = JSON.parse(raw) as Record<string, unknown>;
+      bodies.push(body);
+      paths.push(req.url ?? "");
+      assert.equal(req.headers.authorization, "Bearer luna-test-key");
+      if (body.stream === true) {
+        response.writeHead(200, { "content-type": "text/event-stream" });
+        response.end([
+          `data: ${JSON.stringify({ type: "response.created", response: { id: "resp_luna", status: "in_progress", model: "gpt-5.6-luna", output: [] } })}\n\n`,
+          `data: ${JSON.stringify({ type: "response.output_item.done", output_index: 0, item: { id: "msg_luna", type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: "LUNA_OK", annotations: [], logprobs: [] }] } })}\n\n`,
+          `data: ${JSON.stringify({ type: "response.completed", response: { id: "resp_luna", status: "completed", model: "gpt-5.6-luna", output: [] } })}\n\n`,
+          "data: [DONE]\n\n",
+        ].join(""));
+        return;
+      }
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({
+        id: "resp_luna_compact",
+        status: "completed",
+        output: [{ id: "msg_luna_compact", type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: "luna checkpoint" }] }],
+        usage: { input_tokens: 9, output_tokens: 2, total_tokens: 11 },
+      }));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.gateway.provider = "opencode-go";
+  config.gateway.protocol = "chat";
+  config.gateway.baseURL = `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1`;
+  config.gateway.apiKeyEnv = "LOOKING_GLASS_OPENCODE_LUNA_TEST_KEY";
+  process.env.LOOKING_GLASS_OPENCODE_LUNA_TEST_KEY = "luna-test-key";
+  t.after(() => { delete process.env.LOOKING_GLASS_OPENCODE_LUNA_TEST_KEY; });
+  const client = new CodexLbClient(config);
+  const streamed = await client.stream({
+    ...request,
+    model: "gpt-5.6-luna",
+    reasoningEffort: "xhigh",
+    supportsParallelToolCalls: false,
+    input: [
+      ...request.input,
+      {
+        type: "reasoning",
+        id: "old_reasoning",
+        summary: [{ type: "summary_text", text: "prior thought" }],
+        content: [],
+        encrypted_content: "opaque-reasoning",
+      } as unknown as ResponseInputItem,
+    ],
+  });
+  assert.equal(streamed.output_text, "LUNA_OK");
+  assert.equal(paths[0], "/v1/responses");
+  assert.deepEqual(bodies[0]?.reasoning, { effort: "xhigh", summary: "auto" });
+  assert.equal((bodies[0]?.input as ResponseInputItem[]).some((item) => item.type === "reasoning"), true);
+  assert.deepEqual(bodies[0]?.include, ["reasoning.encrypted_content"]);
+  assert.equal("previous_response_id" in (bodies[0] ?? {}), false);
+
+  const compacted = await client.compact({
+    model: "gpt-5.6-luna",
+    instructions: "Keep context",
+    input: request.input,
+    promptCacheKey: "k",
+    fast: false,
+  });
+  assert.equal(paths[1], "/v1/responses");
+  assert.equal("reasoning" in (bodies[1] ?? {}), false);
+  assert.equal((compacted.output as Array<Record<string, unknown>>)[0]?.type, "message");
+});
+
+test("OpenCode Go routes Qwen through Anthropic Messages with bounded thinking budgets", async (t) => {
+  const bodies: Record<string, unknown>[] = [];
+  const server = createServer((req, response) => {
+    let raw = "";
+    req.on("data", (chunk) => { raw += chunk; });
+    req.on("end", () => {
+      const body = JSON.parse(raw) as Record<string, unknown>;
+      bodies.push(body);
+      assert.equal(req.url, "/v1/messages");
+      assert.equal(req.headers["x-api-key"], "messages-test-key");
+      assert.equal(req.headers["anthropic-version"], "2023-06-01");
+      if (body.stream === true) {
+        response.writeHead(200, { "content-type": "text/event-stream" });
+        response.end([
+          `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "msg_qwen", model: "qwen3.7-max", usage: { input_tokens: 5 } } })}\n\n`,
+          `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "thinking" } })}\n\n`,
+          `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "plan" } })}\n\n`,
+          `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "signature_delta", signature: "qwen-signature" } })}\n\n`,
+          `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n`,
+          `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 1, content_block: { type: "text" } })}\n\n`,
+          `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 1, delta: { type: "text_delta", text: "QWEN_OK" } })}\n\n`,
+          `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 1 })}\n\n`,
+          `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 3 } })}\n\n`,
+          `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`,
+        ].join(""));
+        return;
+      }
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({
+        id: "msg_qwen_compact",
+        content: [{ type: "text", text: "qwen checkpoint" }],
+        usage: { input_tokens: 8, output_tokens: 2 },
+      }));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.gateway.provider = "opencode-go";
+  config.gateway.protocol = "chat";
+  config.gateway.baseURL = `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1`;
+  config.gateway.apiKeyEnv = "LOOKING_GLASS_OPENCODE_MESSAGES_TEST_KEY";
+  process.env.LOOKING_GLASS_OPENCODE_MESSAGES_TEST_KEY = "messages-test-key";
+  t.after(() => { delete process.env.LOOKING_GLASS_OPENCODE_MESSAGES_TEST_KEY; });
+  const client = new CodexLbClient(config);
+  const streamed = await client.stream({
+    ...request,
+    model: "qwen3.7-max",
+    reasoningEffort: "high",
+    supportsParallelToolCalls: false,
+  });
+  assert.equal(streamed.output_text, "QWEN_OK");
+  assert.deepEqual(bodies[0]?.thinking, { type: "enabled", budget_tokens: 32_768 });
+  assert.equal(bodies[0]?.max_tokens, 65_536);
+
+  const compacted = await client.compact({
+    model: "qwen3.7-max",
+    instructions: "Keep context",
+    input: request.input,
+    promptCacheKey: "k",
+    fast: false,
+  });
+  assert.equal(bodies[1]?.stream, false);
+  assert.equal(bodies[1]?.max_tokens, 8_192);
+  assert.equal("thinking" in (bodies[1] ?? {}), false);
+  assert.deepEqual(compacted.usage, { input_tokens: 8, output_tokens: 2, total_tokens: 10 });
 });
 
 test("LM Studio tool schemas omit long maxLength bounds without changing source tools", () => {
@@ -461,6 +1039,36 @@ test("OpenRouter reasoning requires the standard reasoning parameter", () => {
   const model = openRouterModelInfo({ id: "demo/model", supported_parameters: ["include_reasoning"] });
   assert.equal(model.supportsReasoning, false);
   assert.equal(model.defaultReasoningEffort, "none");
+});
+
+test("OpenRouter uses advertised model-specific effort levels including minimal", () => {
+  const model = openRouterModelInfo({
+    id: "demo/reasoning-model",
+    supported_parameters: ["reasoning", "reasoning_effort"],
+    reasoning: {
+      mandatory: true,
+      supported_efforts: ["xhigh", "high", "medium", "low", "minimal", "none"],
+      default_effort: "minimal",
+    },
+  });
+  assert.deepEqual(model.reasoningEfforts, ["xhigh", "high", "medium", "low", "minimal"]);
+  assert.equal(model.defaultReasoningEffort, "minimal");
+
+  const unrestricted = openRouterModelInfo({
+    id: "demo/unrestricted-reasoning",
+    supported_parameters: ["reasoning"],
+    reasoning: { supported_efforts: null },
+  });
+  assert.deepEqual(unrestricted.reasoningEfforts, ["none", "minimal", "low", "medium", "high", "xhigh", "max"]);
+
+  const omitted = openRouterModelInfo({
+    id: "demo/omitted-reasoning-efforts",
+    supported_parameters: ["reasoning", "reasoning_effort"],
+    reasoning: {},
+  });
+  assert.deepEqual(omitted.reasoningEfforts, ["low", "medium", "high"]);
+  const params = buildResponseParams("openrouter", { ...request, reasoningEffort: "none" }) as Record<string, unknown>;
+  assert.deepEqual(params.reasoning, { effort: "none" });
 });
 
 test("lists and sorts OpenRouter catalog models with free pricing markers", async (t) => {

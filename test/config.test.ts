@@ -3,7 +3,22 @@ import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { loadConfig } from "../src/config.js";
+import { defaultApiKeyEnv, defaultProtocol, loadConfig } from "../src/config.js";
+
+function withIsolatedGlobalConfig<T>(root: string, run: () => T): T {
+  const previousConfigHome = process.env.XDG_CONFIG_HOME;
+  const previousExplicitConfig = process.env.LOOKING_GLASS_CONFIG;
+  process.env.XDG_CONFIG_HOME = join(root, "config-home");
+  delete process.env.LOOKING_GLASS_CONFIG;
+  try {
+    return run();
+  } finally {
+    if (previousConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = previousConfigHome;
+    if (previousExplicitConfig === undefined) delete process.env.LOOKING_GLASS_CONFIG;
+    else process.env.LOOKING_GLASS_CONFIG = previousExplicitConfig;
+  }
+}
 
 test("loads scheduler.env with a leading UTF-8 BOM", () => {
   const root = mkdtempSync(join(tmpdir(), "looking-glass-config-"));
@@ -51,13 +66,40 @@ test("custom gateway defaults to Responses and CUSTOM_API_KEY", () => {
   }
 });
 
+test("OpenCode Go gateway defaults to Chat and OPENCODE_API_KEY", () => {
+  assert.equal(defaultProtocol("opencode-go"), "chat");
+  assert.equal(defaultApiKeyEnv("opencode-go"), "OPENCODE_API_KEY");
+  const root = mkdtempSync(join(tmpdir(), "looking-glass-config-opencode-go-"));
+  try {
+    writeFileSync(join(root, ".looking-glass.json"), JSON.stringify({
+      gateway: { provider: "opencode-go", baseURL: "https://opencode.ai/zen/go/v1" },
+    }));
+    const config = loadConfig(root);
+    assert.equal(config.gateway.provider, "opencode-go");
+    assert.equal(config.gateway.protocol, "chat");
+    assert.equal(config.gateway.apiKeyEnv, "OPENCODE_API_KEY");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("accepts the standard minimal reasoning effort", () => {
+  const root = mkdtempSync(join(tmpdir(), "looking-glass-config-minimal-effort-"));
+  try {
+    writeFileSync(join(root, ".looking-glass.json"), JSON.stringify({ reasoningEffort: "minimal" }));
+    assert.equal(loadConfig(root).reasoningEffort, "minimal");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("skips an invalid custom gateway protocol", () => {
   const root = mkdtempSync(join(tmpdir(), "looking-glass-config-protocol-"));
   try {
     writeFileSync(join(root, ".looking-glass.json"), JSON.stringify({
       gateway: { provider: "custom", protocol: "invalid", baseURL: "http://127.0.0.1:9999/v1" },
     }));
-    assert.equal(loadConfig(root).gateway.provider, "codex-lb");
+    withIsolatedGlobalConfig(root, () => assert.equal(loadConfig(root).gateway.provider, "codex-lb"));
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -69,7 +111,19 @@ test("skips a protocol that does not match a built-in gateway profile", () => {
     writeFileSync(join(root, ".looking-glass.json"), JSON.stringify({
       gateway: { provider: "openrouter", protocol: "responses", baseURL: "https://gateway.invalid/v1" },
     }));
-    assert.equal(loadConfig(root).gateway.provider, "codex-lb");
+    withIsolatedGlobalConfig(root, () => assert.equal(loadConfig(root).gateway.provider, "codex-lb"));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("skips a Responses protocol for OpenCode Go", () => {
+  const root = mkdtempSync(join(tmpdir(), "looking-glass-config-opencode-go-protocol-"));
+  try {
+    writeFileSync(join(root, ".looking-glass.json"), JSON.stringify({
+      gateway: { provider: "opencode-go", protocol: "responses", baseURL: "https://opencode.ai/zen/go/v1" },
+    }));
+    withIsolatedGlobalConfig(root, () => assert.equal(loadConfig(root).gateway.provider, "codex-lb"));
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

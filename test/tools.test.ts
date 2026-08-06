@@ -16,6 +16,7 @@ import { createScheduleTools } from "../src/tools/schedule.js";
 import { bashApprovalExecutable, bashCommandRisk, isSensitiveMutationPath, patchRisk, powershellCommandRisk, shellEnvironment, workspacePatchRisk } from "../src/tools/safety.js";
 import { powershellArguments, powershellExecutable, shellCommand, shellDefinition, shellKind, taskkillExecutable, windowsSystemRoot } from "../src/tools/shell.js";
 import { globTool, grepTool } from "../src/tools/search.js";
+import { taskPlanTool } from "../src/tools/task-plan.js";
 import type { GlassTool, ToolContext } from "../src/tools/types.js";
 import {
   compoundWriteCommand,
@@ -269,6 +270,44 @@ test("registry lets unrestricted persistent actions run without approval", async
   assert.equal((await registry.execute("persistent_test", args, context)).output, "ok");
   assert.equal(approvals, 1);
   assert.throws(() => registry.parseArguments("persistent_test", '{"value":1}'), /Invalid arguments/);
+});
+
+test("registry conservatively normalizes compatible model argument drift", () => {
+  const registry = new ToolRegistry().register(readTool).register(bashTool).register(taskPlanTool);
+
+  assert.deepEqual(
+    registry.parseArguments("read", '{"path":"src/index.ts","offset":"1360","limit":"240"}'),
+    { path: "src/index.ts", offset: 1360, limit: 240 },
+  );
+  assert.deepEqual(
+    registry.parseArguments("read", '{"path":"src/index.ts","offset":"null","limit":"240"}'),
+    { path: "src/index.ts", offset: null, limit: 240 },
+  );
+  assert.deepEqual(
+    registry.parseArguments("read", '{"path":"src/index.ts"}'),
+    { path: "src/index.ts", offset: null, limit: null },
+  );
+  assert.deepEqual(
+    registry.parseArguments("task_plan", '{"action":"read","items":"null"}'),
+    { action: "read", items: null },
+  );
+  assert.deepEqual(
+    registry.parseArguments("bash", '{"command":"null"}'),
+    { command: "null", workdir: null, timeout_ms: null },
+  );
+
+  assert.throws(
+    () => registry.parseArguments("read", '{"path":"x","offset":"1.5","limit":null}'),
+    /Invalid arguments/,
+  );
+  assert.throws(
+    () => registry.parseArguments("read", '{"path":"x","offset":"9007199254740992","limit":null}'),
+    /Invalid arguments/,
+  );
+  assert.throws(
+    () => registry.parseArguments("task_plan", '{"action":"set","items":"[]"}'),
+    /Invalid arguments/,
+  );
 });
 
 test("unrestricted mode runs critical shell and patch operations without approval", async (t) => {

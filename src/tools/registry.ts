@@ -13,6 +13,68 @@ interface RegisteredTool {
   validate: ValidateFunction;
 }
 
+type JsonSchema = Record<string, unknown>;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function asSchema(value: unknown): JsonSchema | null {
+  return isRecord(value) ? value : null;
+}
+
+function schemaAllowsType(schema: JsonSchema, expected: string): boolean {
+  const type = schema.type;
+  return type === expected || (Array.isArray(type) && type.includes(expected));
+}
+
+function normalizeCompatibleArgument(value: unknown, schema: JsonSchema): unknown {
+  if (typeof value === "string" && !schemaAllowsType(schema, "string")) {
+    if (schemaAllowsType(schema, "integer") && /^-?(?:0|[1-9]\d*)$/.test(value)) {
+      const number = Number(value);
+      if (Number.isSafeInteger(number)) return number;
+    }
+    if (schemaAllowsType(schema, "null") && value === "null") return null;
+    return value;
+  }
+
+  if (Array.isArray(value)) {
+    const itemSchema = asSchema(schema.items);
+    if (!itemSchema) return value;
+    let changed = false;
+    const normalized = value.map((item) => {
+      const next = normalizeCompatibleArgument(item, itemSchema);
+      if (next !== item) changed = true;
+      return next;
+    });
+    return changed ? normalized : value;
+  }
+
+  if (!isRecord(value)) return value;
+  const properties = asSchema(schema.properties);
+  if (!properties) return value;
+
+  let normalized: Record<string, unknown> | null = null;
+  const set = (key: string, next: unknown): void => {
+    normalized ??= { ...value };
+    normalized[key] = next;
+  };
+  for (const [key, candidateSchema] of Object.entries(properties)) {
+    const propertySchema = asSchema(candidateSchema);
+    if (!propertySchema || !Object.hasOwn(value, key)) continue;
+    const next = normalizeCompatibleArgument(value[key], propertySchema);
+    if (next !== value[key]) set(key, next);
+  }
+  if (Array.isArray(schema.required)) {
+    for (const key of schema.required) {
+      if (typeof key !== "string" || Object.hasOwn(value, key)) continue;
+      const propertySchema = asSchema(properties[key]);
+      if (propertySchema && schemaAllowsType(propertySchema, "null")) set(key, null);
+    }
+  }
+  return normalized ?? value;
+}
+
 const RISK_RANK: Record<GlassTool["risk"], number> = {
   read: 0,
   write: 1,
@@ -116,6 +178,9 @@ export class ToolRegistry {
       args = JSON.parse(raw) as unknown;
     } catch (error) {
       throw new Error(`Invalid JSON arguments for ${name}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (!registered.validate(args)) {
+      args = normalizeCompatibleArgument(args, registered.tool.parameters);
     }
     if (!registered.validate(args)) {
       const detail = this.ajv.errorsText(registered.validate.errors, { separator: "; " });
