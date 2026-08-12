@@ -11,6 +11,7 @@ import { SchedulerStore } from "../src/scheduler/store.js";
 import { applyPatchTool } from "../src/tools/apply-patch.js";
 import { bashTool, powershellApprovalExecutable } from "../src/tools/bash.js";
 import { readTool } from "../src/tools/read.js";
+import { resolveWorkspacePath } from "../src/tools/paths.js";
 import { ToolPreflightError, ToolRegistry, toolApprovalSignature } from "../src/tools/registry.js";
 import { createScheduleTools } from "../src/tools/schedule.js";
 import { bashApprovalExecutable, bashCommandRisk, isSensitiveMutationPath, patchRisk, powershellCommandRisk, shellEnvironment, workspacePatchRisk } from "../src/tools/safety.js";
@@ -110,6 +111,23 @@ test("read rejects symlink escapes when the host permits symlink creation", asyn
     readTool.execute({ path: "escape.txt", offset: null, limit: null }, context),
     /outside the workspace/,
   );
+});
+
+test("workspace path resolution accepts aliases that resolve inside the workspace", (t) => {
+  const { base, workspace } = fixture(t);
+  const alias = join(base, "workspace-alias");
+  try {
+    symlinkSync(workspace, alias, "dir");
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (process.platform === "win32" && (code === "EPERM" || code === "EACCES")) {
+      t.skip("directory symlink creation requires elevated Windows privileges");
+      return;
+    }
+    throw error;
+  }
+  assert.equal(resolveWorkspacePath(workspace, alias), resolveWorkspacePath(workspace, "."));
+  assert.equal(resolveWorkspacePath(workspace, join(alias, "new.txt"), true), join(alias, "new.txt"));
 });
 
 test("registry centrally bounds UTF-8 tool output and preserves the full artifact", async (t) => {
@@ -1081,4 +1099,35 @@ test("unrestricted schedule actions never prompt for destructive commands", asyn
   }));
   assert.match((await registry.execute("schedule_manage", resolveUnknown, context)).output, /Unknown outcome/);
   assert.equal(approvals, 0);
+});
+
+test("schedule ownership accepts a workspace alias that resolves inside the workspace", async (t) => {
+  const { base, context, db } = fixture(t);
+  const alias = join(base, "workspace-alias");
+  try {
+    symlinkSync(context.workspace, alias, "dir");
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (process.platform === "win32" && (code === "EPERM" || code === "EACCES")) {
+      t.skip("directory symlink creation requires elevated Windows privileges");
+      return;
+    }
+    throw error;
+  }
+  context.approvalMode = "unrestricted";
+  const store = new SchedulerStore(db);
+  const job = store.createCommand({
+    command: "printf safe",
+    cwd: alias,
+    scheduleKind: "once",
+    schedule: "2099-01-02T00:00:00Z",
+    timezone: "UTC",
+    startGraceMs: 60_000,
+    timeoutMs: 5_000,
+    outputBytes: 1_024,
+  });
+  const registry = new ToolRegistry();
+  for (const tool of createScheduleTools(store)) registry.register(tool);
+  const input = registry.parseArguments("schedule_manage", JSON.stringify({ action: "pause", id: job.id }));
+  assert.match((await registry.execute("schedule_manage", input, context)).output, /Paused/);
 });

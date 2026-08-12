@@ -39,7 +39,7 @@ import { projectContext } from "../engine/context.js";
 import type { InboxRecord, SchedulerJob } from "../scheduler/types.js";
 import { initialDue } from "../scheduler/schedule.js";
 import type { ApprovalDecision, ApprovalRequest, QuestionRequest } from "../tools/types.js";
-import { isWithin } from "../tools/paths.js";
+import { isWorkspacePath } from "../tools/paths.js";
 import { windowsSystemExecutable } from "../tools/shell.js";
 import { normalizeTaskPlan, type TaskPlanItem, type TaskPlanSnapshot, type TaskPlanStatus } from "../task-plan.js";
 import type {
@@ -2709,7 +2709,7 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
       : app.scheduler.listJobs().filter((job) => {
           if (job.kind === "reminder") return true;
           if (job.kind === "session_prompt") return job.sessionId === session.id;
-          return job.cwd !== null && isWithin(app.workspace, job.cwd);
+          return job.cwd !== null && isWorkspacePath(app.workspace, job.cwd);
         });
     if (jobs.length === 0) {
       addNotice("cron", sessionOnly

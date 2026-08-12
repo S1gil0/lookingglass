@@ -10,13 +10,13 @@ export function resolveWorkspacePath(workspace: string, requested: string, allow
   if (requested.includes("\0")) throw new Error("Path contains a NUL byte");
   const root = realpathSync(workspace);
   const lexical = resolve(root, requested);
-  if (!isWithin(root, lexical)) throw new Error(`Path is outside the workspace: ${requested}`);
 
   if (existsSync(lexical)) {
     const actual = realpathSync(lexical);
     if (!isWithin(root, actual)) throw new Error(`Path resolves outside the workspace: ${requested}`);
     return actual;
   }
+  if (!isWithin(root, lexical) && !allowMissing) throw new Error(`Path is outside the workspace: ${requested}`);
   if (!allowMissing) throw new Error(`Path does not exist: ${requested}`);
 
   let existingParent = dirname(lexical);
@@ -28,4 +28,13 @@ export function resolveWorkspacePath(workspace: string, requested: string, allow
   const actualParent = realpathSync(existingParent);
   if (!isWithin(root, actualParent)) throw new Error(`Path parent resolves outside the workspace: ${requested}`);
   return lexical;
+}
+
+export function isWorkspacePath(workspace: string, candidate: string, allowMissing = true): boolean {
+  try {
+    resolveWorkspacePath(workspace, candidate, allowMissing);
+    return true;
+  } catch {
+    return false;
+  }
 }

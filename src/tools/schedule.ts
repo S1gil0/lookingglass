@@ -1,6 +1,6 @@
 import type { SchedulerStore } from "../scheduler/store.js";
 import type { GlassTool } from "./types.js";
-import { isWithin, resolveWorkspacePath } from "./paths.js";
+import { isWorkspacePath, resolveWorkspacePath } from "./paths.js";
 import { shellCommandRisk } from "./safety.js";
 import { shellKind } from "./shell.js";
 
@@ -41,8 +41,7 @@ function formatJob(job: ReturnType<SchedulerStore["getJob"]>): string {
 function canManageJob(job: NonNullable<ReturnType<SchedulerStore["getJob"]>>, context: Parameters<GlassTool["execute"]>[1]): boolean {
   if (job.kind === "session_prompt") return job.sessionId === context.sessionId;
   if (job.kind === "command") {
-    const root = resolveWorkspacePath(context.workspace, ".");
-    return job.cwd !== null && isWithin(root, job.cwd);
+    return job.cwd !== null && isWorkspacePath(context.workspace, job.cwd);
   }
   return true;
 }
