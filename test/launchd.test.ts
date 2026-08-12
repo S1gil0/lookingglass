@@ -78,12 +78,14 @@ test("runs the lifecycle through injected launchctl commands", () => {
   const backend = createLaunchdScheduler(options(home, runner));
   const plistPath = join(home, "Library", "LaunchAgents", `${LAUNCHD_LABEL}.plist`);
   assert.equal(backend.installService(cli, db), plistPath);
-  assert.equal(statSync(plistPath).mode & 0o777, 0o600);
+  if (process.platform !== "win32") assert.equal(statSync(plistPath).mode & 0o777, 0o600);
   assert.equal(backend.serviceStatus(), "LoadState=loaded\nActiveState=active\nSubState=running");
   assert.equal(backend.uninstallService(), true);
   assert.equal(existsSync(join(home, "Library", "LaunchAgents", `${LAUNCHD_LABEL}.plist`)), false);
   assert.deepEqual(calls.map((args) => args[0]), ["print", "bootstrap", "kickstart", "print", "print", "bootout"]);
-  assert.equal(statSync(join(home, "Library", "LaunchAgents")).mode & 0o777, 0o700);
+  if (process.platform !== "win32") {
+    assert.equal(statSync(join(home, "Library", "LaunchAgents")).mode & 0o777, 0o700);
+  }
   rmSync(home, { recursive: true, force: true });
 });
 
