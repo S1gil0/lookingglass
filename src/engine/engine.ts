@@ -585,6 +585,7 @@ export class ConversationEngine {
             promptCacheKey: session.promptCacheKey,
             fast: session.fast,
             signal: budgetSignal.signal,
+            ...(options.callbacks?.onStatus ? { onStatus: options.callbacks.onStatus } : {}),
           });
           budgetSignal.signal.throwIfAborted();
           if (retryBudgetExpired(retryBudget)) throw retryBudgetError(retryBudget);

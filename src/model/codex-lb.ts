@@ -1,4 +1,4 @@
-import { providerError, providerHttpError, type ProviderErrorContext } from "../errors.js";
+import { isTransientProviderError, providerError, providerHttpError, type ProviderErrorContext } from "../errors.js";
 import type {
   FunctionTool,
   Response,
@@ -135,6 +135,7 @@ export interface CompactRequest {
   promptCacheKey: string;
   fast: boolean;
   signal?: AbortSignal;
+  onStatus?(status: string): void;
 }
 
 interface ResponseParams {
@@ -476,6 +477,31 @@ export function responseText(response: Pick<Response, "output" | "output_text">)
   return parts.join("");
 }
 
+function strictSemanticResponseText(response: Record<string, unknown>): string {
+  if (!Array.isArray(response.output)) throw new Error("response output was not an array");
+  const parts: string[] = [];
+  for (const value of response.output) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("response output item was invalid");
+    const item = value as Record<string, unknown>;
+    if (item.type !== "message") continue;
+    if (!Array.isArray(item.content)) throw new Error("response message content was not an array");
+    for (const contentValue of item.content) {
+      if (!contentValue || typeof contentValue !== "object" || Array.isArray(contentValue)) {
+        throw new Error("response message content item was invalid");
+      }
+      const content = contentValue as Record<string, unknown>;
+      if (content.type !== "output_text") continue;
+      if (typeof content.text !== "string") throw new Error("response output content was not text");
+      parts.push(content.text);
+    }
+  }
+  if (response.output_text !== undefined && response.output_text !== null) {
+    if (typeof response.output_text !== "string") throw new Error("response output_text was not text");
+    if (response.output_text) return response.output_text;
+  }
+  return parts.join("");
+}
+
 function redactLmStudioReasoning(response: Response): Response {
   const output: Response["output"] = [];
   for (const item of response.output) {
@@ -509,16 +535,76 @@ function redactLmStudioReasoning(response: Response): Response {
   };
 }
 
-function compactTranscript(input: ResponseInputItem[]): string {
+const MAX_SEMANTIC_FUNCTION_TEXT = 8_192;
+const SEMANTIC_TEXT_OMISSION_MARKER = (length: number): string => `\n...[omitted ${length} chars]...\n`;
+
+function boundedSemanticFunctionText(value: string): string {
+  if (value.length <= MAX_SEMANTIC_FUNCTION_TEXT) return value;
+  let marker = SEMANTIC_TEXT_OMISSION_MARKER(value.length);
+  if (marker.length >= MAX_SEMANTIC_FUNCTION_TEXT) marker = "\n...[omitted]...\n";
+  const contentLimit = MAX_SEMANTIC_FUNCTION_TEXT - marker.length;
+  const headLimit = Math.ceil(contentLimit / 2);
+  const tailLimit = contentLimit - headLimit;
+  return `${codePointPrefix(value, headLimit)}${marker}${codePointSuffix(value, tailLimit)}`;
+}
+
+function safeJsonText(value: unknown): string {
+  try {
+    const serialized = JSON.stringify(value);
+    return typeof serialized === "string" ? serialized : "[unserializable value]";
+  } catch {
+    return "[unserializable value]";
+  }
+}
+
+function applyPatchMarker(patch: string): string {
+  const paths: string[] = [];
+  const pathPattern = /^\*\*\*\s+(Add File|Update File|Delete File|Move to):\s*(.*?)\s*$/gmu;
+  for (const match of patch.matchAll(pathPattern)) {
+    const operation = match[1];
+    const path = match[2];
+    if (operation && path) paths.push(`${operation}: ${path}`);
+  }
+  return `[apply_patch patch omitted; original_chars=${patch.length}; ${paths.length > 0 ? paths.join("; ") : "no file paths found"}]`;
+}
+
+function semanticFunctionCallArguments(name: unknown, value: unknown): string {
+  const raw = typeof value === "string" ? value : safeJsonText(value);
+  if (name !== "apply_patch") return boundedSemanticFunctionText(raw);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw) as unknown;
+  } catch {
+    return boundedSemanticFunctionText(raw);
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return boundedSemanticFunctionText(raw);
+  const patch = (parsed as Record<string, unknown>).patch;
+  if (typeof patch !== "string") return boundedSemanticFunctionText(raw);
+  try {
+    return boundedSemanticFunctionText(JSON.stringify({ ...parsed, patch: applyPatchMarker(patch) }));
+  } catch {
+    return boundedSemanticFunctionText(raw);
+  }
+}
+
+function compactTranscript(input: ResponseInputItem[], semanticFallback = false): string {
   const lines: string[] = [];
   for (const item of input) {
     if (item.type === "reasoning") continue;
     if (item.type === "function_call") {
-      lines.push(`ASSISTANT TOOL CALL ${item.name} [${item.call_id}]: ${item.arguments}`);
+      const argumentsText = semanticFallback
+        ? semanticFunctionCallArguments(item.name, item.arguments)
+        : (typeof item.arguments === "string" ? item.arguments : safeJsonText(item.arguments));
+      const itemId = (item as unknown as { id?: unknown }).id;
+      const callIdentity = semanticFallback && typeof itemId === "string" && itemId !== item.call_id
+        ? `${item.call_id}; id=${itemId}`
+        : item.call_id;
+      lines.push(`ASSISTANT TOOL CALL ${item.name} [${callIdentity}]: ${argumentsText}`);
       continue;
     }
     if (item.type === "function_call_output") {
-      lines.push(`TOOL RESULT ${item.call_id}: ${typeof item.output === "string" ? item.output : JSON.stringify(item.output)}`);
+      const output = typeof item.output === "string" ? item.output : safeJsonText(item.output);
+      lines.push(`TOOL RESULT ${item.call_id}: ${semanticFallback ? boundedSemanticFunctionText(output) : output}`);
       continue;
     }
     const message = item as unknown as { role?: string; content?: unknown };
@@ -586,12 +672,70 @@ function portableCodexReplayInput(input: ResponseInputItem[]): ResponseInputItem
 
 const MAX_COMPACTION_CHUNKS = 32;
 const MAX_COMPACTION_OUTPUT_TOKENS = 8_192;
+const CODEX_FALLBACK_CHUNK_CHARS = 32_768;
+const MAX_SEMANTIC_COMPACTION_ATTEMPTS = 3;
+const MAX_CHECKPOINT_CHARS = 32_768;
+const CHECKPOINT_PREFIX = "Conversation checkpoint generated by Looking Glass:\n";
+const CHECKPOINT_SEPARATOR = "\n\n";
+const CHECKPOINT_TRUNCATION_MARKER = "\n...[truncated]...\n";
+const LOCAL_CHECKPOINT_EXCERPT_PREFIX = "[Semantic summary unavailable; bounded local transcript excerpt]\n";
+
+function codePointPrefix(value: string, maxChars: number): string {
+  if (value.length <= maxChars) return value;
+  let result = "";
+  for (const character of value) {
+    if (result.length + character.length > maxChars) break;
+    result += character;
+  }
+  return result;
+}
+
+function codePointSuffix(value: string, maxChars: number): string {
+  if (value.length <= maxChars) return value;
+  const characters = Array.from(value);
+  let result = "";
+  for (let index = characters.length - 1; index >= 0; index -= 1) {
+    const character = characters[index] as string;
+    if (result.length + character.length > maxChars) break;
+    result = character + result;
+  }
+  return result;
+}
+
+/** Bound generated text without splitting a Unicode code point, retaining both ends. */
+function boundCheckpointPart(value: string, maxChars: number): string {
+  const limit = Math.max(0, Math.floor(maxChars));
+  if (value.length <= limit) return value;
+  if (limit <= CHECKPOINT_TRUNCATION_MARKER.length) return codePointPrefix(CHECKPOINT_TRUNCATION_MARKER, limit);
+  const contentLimit = limit - CHECKPOINT_TRUNCATION_MARKER.length;
+  const headLimit = Math.ceil(contentLimit / 2);
+  const tailLimit = contentLimit - headLimit;
+  return `${codePointPrefix(value, headLimit)}${CHECKPOINT_TRUNCATION_MARKER}${codePointSuffix(value, tailLimit)}`;
+}
+
+function checkpointPartBudgets(partCount: number): number[] {
+  const separators = CHECKPOINT_SEPARATOR.length * Math.max(0, partCount - 1);
+  const available = Math.max(0, MAX_CHECKPOINT_CHARS - CHECKPOINT_PREFIX.length - separators);
+  const base = Math.floor(available / Math.max(1, partCount));
+  const remainder = available - base * Math.max(1, partCount);
+  return Array.from({ length: partCount }, (_, index) => base + (index < remainder ? 1 : 0));
+}
+
+function boundedCheckpointText(summaries: string[]): string {
+  const budgets = checkpointPartBudgets(summaries.length);
+  const parts = summaries.map((summary, index) => {
+    const label = summaries.length > 1 ? `Checkpoint part ${index + 1} of ${summaries.length}:\n` : "";
+    return boundCheckpointPart(`${label}${summary}`, budgets[index] ?? 0);
+  });
+  return `${CHECKPOINT_PREFIX}${parts.join(CHECKPOINT_SEPARATOR)}`;
+}
 
 function chunkTranscript(transcript: string, maxChars: number): string[] {
   const limit = Math.max(16_384, Math.floor(maxChars));
   if (transcript.length <= limit) return [transcript];
   const chunks: string[] = [];
   let offset = 0;
+  let continuesFromPrevious = false;
   while (offset < transcript.length) {
     if (chunks.length >= MAX_COMPACTION_CHUNKS) {
       throw Object.assign(new Error("conversation is too large for bounded checkpoint generation"), {
@@ -599,15 +743,21 @@ function chunkTranscript(transcript: string, maxChars: number): string[] {
       });
     }
     let end = Math.min(transcript.length, offset + limit);
+    let forcedSplit = false;
     if (end < transcript.length) {
       const boundary = transcript.lastIndexOf("\n\n", end);
       if (boundary > offset + Math.floor(limit / 2)) end = boundary;
+      else forcedSplit = true;
       if (/^[\uDC00-\uDFFF]$/.test(transcript[end] ?? "")) end -= 1;
     }
-    const chunk = transcript.slice(offset, end).trim();
+    const chunk = [
+      ...(continuesFromPrevious ? ["[CONTINUED FROM PREVIOUS TRANSCRIPT PART]\n"] : []),
+      transcript.slice(offset, end),
+      ...(forcedSplit ? ["\n[CONTINUES IN NEXT TRANSCRIPT PART]"] : []),
+    ].join("");
     if (chunk) chunks.push(chunk);
     offset = end;
-    while (transcript.startsWith("\n", offset)) offset += 1;
+    continuesFromPrevious = forcedSplit;
   }
   return chunks;
 }
@@ -618,6 +768,28 @@ function combinedUsage(values: Array<Record<string, number> | undefined>): Recor
   const inputTokens = present.reduce((sum, value) => sum + (value.input_tokens ?? 0), 0);
   const outputTokens = present.reduce((sum, value) => sum + (value.output_tokens ?? 0), 0);
   return { input_tokens: inputTokens, output_tokens: outputTokens, total_tokens: inputTokens + outputTokens };
+}
+
+function isSemanticProtocolError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const details = error as Record<string, unknown>;
+  const status = details.status ?? details.responseStatus;
+  return status === undefined
+    && details.kind === "protocol"
+    && (details.code === "malformed_response" || details.code === "empty_response");
+}
+
+function isRetryableSemanticPartError(error: unknown): boolean {
+  return isSemanticProtocolError(error) || isTransientProviderError(error);
+}
+
+function semanticPartRetryExhausted(error: unknown, context: ProviderErrorContext): Error {
+  const exhausted = providerError({
+    code: "compaction_part_retry_exhausted",
+    message: "semantic compaction part retries exhausted",
+  }, context);
+  Object.assign(exhausted, { cause: error, retryable: false });
+  return exhausted;
 }
 
 function lmStudioModelsURL(baseURL: string): string {
@@ -830,7 +1002,10 @@ async function readJsonResponse(response: globalThis.Response, context: Provider
   try {
     return JSON.parse(text) as unknown;
   } catch (error) {
-    throw providerError(Object.assign(new Error("response was not valid JSON"), { cause: error }), {
+    throw providerError(Object.assign(new Error("response was not valid JSON"), {
+      cause: error,
+      code: "malformed_response",
+    }), {
       ...context,
       protocol: true,
     });
@@ -1357,6 +1532,200 @@ export class CodexLbClient {
     };
   }
 
+  private async codexSemanticCompact(request: CompactRequest): Promise<Record<string, unknown>> {
+    const transcript = compactTranscript(request.input, true);
+    const compactContext = requestContext("codex-lb", "compact", this.apiKey, request.signal);
+    if (!transcript) throw providerError({ code: "malformed_response", message: "compaction received no semantic transcript" }, {
+      ...compactContext,
+      protocol: true,
+    });
+    const transcriptChunks = chunkTranscript(transcript, CODEX_FALLBACK_CHUNK_CHARS);
+    const maxTokens = Math.max(1, Math.floor(MAX_COMPACTION_OUTPUT_TOKENS / transcriptChunks.length));
+    const partBudgets = checkpointPartBudgets(transcriptChunks.length);
+    const checkpointInstructions = [
+      request.instructions,
+      "Create a dense, durable checkpoint of the supplied conversation.",
+      "Preserve user requirements, decisions, relevant facts, file paths, code changes, tool outcomes, unresolved work, and safety constraints.",
+      "Do not continue the task, call tools, or add commentary. Return only the checkpoint text.",
+    ].filter((part) => part.trim()).join(" ");
+    const summaries: Array<string | undefined> = Array.from({ length: transcriptChunks.length });
+    const usages: Array<Record<string, number> | undefined> = Array.from({ length: transcriptChunks.length });
+    const fallbackErrors: Array<Error | undefined> = Array.from({ length: transcriptChunks.length });
+    const workerController = new AbortController();
+    let nextIndex = 0;
+    let completed = 0;
+    let semanticParts = 0;
+    let failed = false;
+    let firstError: unknown;
+    const processPart = async (index: number): Promise<"semantic" | "local"> => {
+      const chunk = transcriptChunks[index] as string;
+      const label = transcriptChunks.length > 1 ? `Checkpoint part ${index + 1} of ${transcriptChunks.length}:\n` : "";
+      const partCharacterCeiling = Math.max(1, (partBudgets[index] ?? 1) - label.length);
+      const profile: ResponseRequest = {
+        model: request.model,
+        instructions: `${checkpointInstructions} This is transcript part ${index + 1} of ${transcriptChunks.length}; produce a self-contained checkpoint for this part. Keep this part's checkpoint text at or below ${partCharacterCeiling} characters. Use low verbosity and prioritize durable facts over prose.`,
+        input: [{
+          role: "user",
+          content: [{
+            type: "input_text",
+            text: `Conversation transcript part ${index + 1} of ${transcriptChunks.length}:\n\n${chunk}`,
+          }],
+        }],
+        tools: [],
+        promptCacheKey: request.promptCacheKey,
+        reasoningEffort: "none",
+        supportsReasoning: false,
+        supportsParallelToolCalls: false,
+        verbosity: "low",
+        fast: request.fast,
+        ...(request.signal ? { signal: request.signal } : {}),
+      };
+      const attemptTimeoutMs = Math.min(this.config.gateway.timeoutMs, 120_000);
+      const processAttempt = async (timeout: AbortSignal, context: ProviderErrorContext): Promise<void> => {
+        const signal = AbortSignal.any([workerController.signal, ...(request.signal ? [request.signal] : []), timeout]);
+        let http: globalThis.Response;
+        try {
+          const params = buildResponseParams("codex-lb", profile, "responses") as Record<string, unknown>;
+          // The fallback is deliberately a stateless semantic request. Explicitly
+          // disable reasoning so a backend default cannot consume the small output
+          // budget without emitting checkpoint text. Do not preserve native
+          // reasoning state or route parts through one prompt-cache affinity bridge.
+          const {
+            include: _include,
+            reasoning: _reasoning,
+            previous_response_id: _previousResponseId,
+            prompt_cache_key: _promptCacheKey,
+            ...plainParams
+          } = params;
+          http = await fetch(`${this.config.gateway.baseURL.replace(/\/$/, "")}/responses`, this.fetchOptions({
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${this.apiKey}`,
+              "content-type": "application/json",
+            },
+            body: JSON.stringify({
+              ...plainParams,
+              reasoning: { effort: "none" },
+              max_output_tokens: maxTokens,
+            }),
+            signal,
+          }));
+        } catch (error) {
+          throw providerError(error, context);
+        }
+        const payload = objectPayload(await readJsonResponse(http, context), context, "compaction returned an invalid payload");
+        const response = payload as unknown as Response;
+        const attemptUsage = normalizedUsage(response.usage);
+        const recordAttemptUsage = (): void => {
+          if (attemptUsage) usages[index] = combinedUsage([usages[index], attemptUsage]);
+        };
+        if (!Array.isArray(response.output)
+          || response.output.some((item) => !item || typeof item !== "object" || Array.isArray(item))) {
+          recordAttemptUsage();
+          throw providerError({ code: "malformed_response", message: "compaction response did not contain output items" }, {
+            ...context,
+            protocol: true,
+          });
+        }
+        if (response.output.length === 0) {
+          recordAttemptUsage();
+          throw providerError({ code: "empty_response", message: "compaction returned no checkpoint text" }, {
+            ...context,
+            protocol: true,
+          });
+        }
+        let summary: string;
+        try {
+          summary = strictSemanticResponseText(payload).trim();
+        } catch {
+          recordAttemptUsage();
+          throw providerError({ code: "malformed_response", message: "compaction response contained invalid output items" }, {
+            ...context,
+            protocol: true,
+          });
+        }
+        if (!summary) {
+          recordAttemptUsage();
+          throw providerError({ code: "empty_response", message: "compaction returned no checkpoint text" }, {
+            ...context,
+            protocol: true,
+          });
+        }
+        summaries[index] = boundCheckpointPart(summary, partCharacterCeiling);
+        recordAttemptUsage();
+      };
+      const processPartWithRetries = async (): Promise<"semantic" | "local"> => {
+        for (let attempt = 0; attempt < MAX_SEMANTIC_COMPACTION_ATTEMPTS; attempt += 1) {
+          if (request.signal?.aborted) throw request.signal.reason ?? new Error("compaction was cancelled by the caller");
+          if (workerController.signal.aborted) throw workerController.signal.reason ?? new Error("compaction part was cancelled");
+          const timeout = AbortSignal.timeout(attemptTimeoutMs);
+          const context = requestContext("codex-lb", "compact", this.apiKey, request.signal, timeout);
+          try {
+            await processAttempt(timeout, context);
+            return "semantic";
+          } catch (error) {
+            if (request.signal?.aborted) throw request.signal.reason ?? error;
+            if (workerController.signal.aborted) throw workerController.signal.reason ?? error;
+            if (!isRetryableSemanticPartError(error)) throw error;
+            if (attempt + 1 >= MAX_SEMANTIC_COMPACTION_ATTEMPTS) {
+              fallbackErrors[index] = semanticPartRetryExhausted(error, context);
+              summaries[index] = boundCheckpointPart(
+                `${LOCAL_CHECKPOINT_EXCERPT_PREFIX}${chunk}`,
+                partCharacterCeiling,
+              );
+              return "local";
+            }
+          }
+        }
+        throw new Error("unreachable semantic compaction retry state");
+      };
+      return processPartWithRetries();
+    };
+    const worker = async (): Promise<void> => {
+      while (true) {
+        if (failed) return;
+        const index = nextIndex;
+        nextIndex += 1;
+        if (index >= transcriptChunks.length) return;
+        try {
+          const outcome = await processPart(index);
+          if (failed) return;
+          if (outcome === "semantic") semanticParts += 1;
+          completed += 1;
+          request.onStatus?.(`Compacting context (${completed}/${transcriptChunks.length} parts${outcome === "local" ? "; bounded local fallback" : ""})`);
+        } catch (error) {
+          if (!failed) {
+            failed = true;
+            firstError = error;
+            workerController.abort();
+          }
+          return;
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(4, transcriptChunks.length) }, () => worker()));
+    if (request.signal?.aborted) throw request.signal.reason ?? new Error("compaction was cancelled by the caller");
+    if (failed) throw firstError;
+    if (semanticParts === 0) {
+      throw fallbackErrors.find((error): error is Error => error !== undefined)
+        ?? new Error("semantic compaction produced no summaries");
+    }
+    const summary = boundedCheckpointText(summaries.map((part) => part ?? ""));
+    const usage = combinedUsage(usages);
+    return {
+      id: "compact_semantic_fallback",
+      object: "response.compaction",
+      output: [{
+        id: "msg_compact_semantic_fallback",
+        type: "message",
+        role: "user",
+        status: "completed",
+        content: [{ type: "input_text", text: summary }],
+      }],
+      ...(usage ? { usage } : {}),
+    };
+  }
+
   async compact(request: CompactRequest): Promise<Record<string, unknown>> {
     this.requireOpenCodeApiKey();
     const openCodeProtocol = this.config.gateway.provider === "opencode-go"
@@ -1561,16 +1930,25 @@ export class CodexLbClient {
     } catch (error) {
       throw providerError(error, context);
     }
-    const payload = await readJsonResponse(response, context);
-    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
-      throw providerError({ code: "malformed_response", message: "compaction returned an invalid payload" }, { ...context, protocol: true });
+    try {
+      const payload = await readJsonResponse(response, context);
+      if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+        throw providerError({ code: "malformed_response", message: "compaction returned an invalid payload" }, { ...context, protocol: true });
+      }
+      const output = (payload as Record<string, unknown>).output;
+      if (!Array.isArray(output) || output.length === 0
+        || output.some((item) => !item || typeof item !== "object" || Array.isArray(item))) {
+        throw providerError({ code: "malformed_response", message: "compaction response did not contain valid output items" }, { ...context, protocol: true });
+      }
+      return payload as Record<string, unknown>;
+    } catch (error) {
+      if (error && typeof error === "object" && (error as { code?: unknown }).code === "responses_compact_input_too_large") {
+        request.signal?.throwIfAborted();
+        timeout.throwIfAborted();
+        return this.codexSemanticCompact(request);
+      }
+      throw error;
     }
-    const output = (payload as Record<string, unknown>).output;
-    if (!Array.isArray(output) || output.length === 0
-      || output.some((item) => !item || typeof item !== "object" || Array.isArray(item))) {
-      throw providerError({ code: "malformed_response", message: "compaction response did not contain valid output items" }, { ...context, protocol: true });
-    }
-    return payload as Record<string, unknown>;
   }
 }
 

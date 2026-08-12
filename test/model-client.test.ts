@@ -197,6 +197,703 @@ test("codex-lb compaction canonicalizes foreign replay before transport", async 
   assert.equal(JSON.stringify(body?.input).includes("msg_compact_foreign"), false);
 });
 
+test("codex-lb falls back to bounded semantic Responses checkpoints only for input-too-large compaction", async (t) => {
+  const compactBodies: Record<string, unknown>[] = [];
+  const responseBodies: Record<string, unknown>[] = [];
+  let compactCode = "responses_compact_input_too_large";
+  const server = createServer((req, response) => {
+    let raw = "";
+    req.on("data", (chunk) => { raw += chunk; });
+    req.on("end", () => {
+      const body = JSON.parse(raw) as Record<string, unknown>;
+      if (req.url === "/v1/responses/compact") {
+        compactBodies.push(body);
+        response.writeHead(400, { "content-type": "application/json" });
+        response.end(JSON.stringify({ error: {
+          code: compactCode,
+          message: compactCode === "responses_compact_input_too_large"
+            ? "input cannot be trimmed without removing required state anchors"
+            : "other compact failure",
+        } }));
+        return;
+      }
+      if (req.url === "/v1/responses") {
+        responseBodies.push(body);
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({
+          id: `fallback_${responseBodies.length}`,
+          output: [{
+            id: `fallback_message_${responseBodies.length}`,
+            type: "message",
+            role: "assistant",
+            status: "completed",
+            content: [{ type: "output_text", text: `fallback summary ${responseBodies.length}` }],
+          }],
+          usage: { input_tokens: 11, output_tokens: 3, total_tokens: 14 },
+        }));
+        return;
+      }
+      response.writeHead(404);
+      response.end();
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.gateway.provider = "codex-lb";
+  config.gateway.baseURL = `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1`;
+  const client = new CodexLbClient(config);
+  const oversizedInput = Array.from({ length: 6 }, (_, index) => [
+    {
+      role: "user",
+      content: [{ type: "input_text", text: `transcript ${index} ${"important context ".repeat(2_500)}` }],
+    },
+    {
+      type: "reasoning",
+      id: `rs_anchor_${index}`,
+      encrypted_content: `opaque_${index}`,
+      summary: [],
+      content: [],
+    },
+    {
+      type: "function_call",
+      id: `fc_anchor_${index}`,
+      call_id: `call_${index}`,
+      name: "inspect",
+      arguments: JSON.stringify({ index }),
+    },
+    { type: "function_call_output", call_id: `call_${index}`, output: `result ${index}` },
+  ]).flat() as unknown as ResponseInputItem[];
+  const compacted = await client.compact({
+    model: request.model,
+    instructions: "Keep context",
+    input: oversizedInput,
+    promptCacheKey: request.promptCacheKey,
+    fast: true,
+  });
+
+  assert.equal(compactBodies.length, 1);
+  assert.ok((compactBodies[0]?.input as ResponseInputItem[]).some((item) => item.type === "reasoning"));
+  assert.ok((compactBodies[0]?.input as ResponseInputItem[]).some((item) => item.type === "function_call"));
+  assert.ok(responseBodies.length > 1);
+  const fallbackInputs = responseBodies.map((body) => JSON.stringify(body.input)).join("\n");
+  assert.match(fallbackInputs, /CONTINUES IN NEXT TRANSCRIPT PART/);
+  assert.match(fallbackInputs, /CONTINUED FROM PREVIOUS TRANSCRIPT PART/);
+  for (let index = 0; index < 6; index += 1) {
+    assert.match(fallbackInputs, new RegExp(`transcript ${index}`));
+    assert.match(fallbackInputs, new RegExp(`result ${index}`));
+  }
+  const maxTokens = responseBodies[0]?.max_output_tokens;
+  assert.equal(typeof maxTokens, "number");
+  assert.ok((maxTokens as number) > 0 && (maxTokens as number) <= 8_192);
+  assert.ok(responseBodies.reduce((sum, body) => sum + Number(body.max_output_tokens ?? 0), 0) <= 8_192);
+  for (const body of responseBodies) {
+    assert.equal(body.service_tier, "priority");
+    assert.equal(body.tools && Array.isArray(body.tools) && (body.tools as unknown[]).length, 0);
+    assert.deepEqual(body.reasoning, { effort: "none" });
+    assert.equal("include" in body, false);
+    assert.equal("previous_response_id" in body, false);
+    const input = body.input as Array<Record<string, unknown>>;
+    assert.equal(input.length, 1);
+    assert.equal(input[0]?.role, "user");
+    assert.deepEqual(Object.keys(input[0] ?? {}).sort(), ["content", "role"]);
+    assert.deepEqual((input[0]?.content as Array<Record<string, unknown>>).map((part) => part.type), ["input_text"]);
+    assert.doesNotMatch(JSON.stringify(input), /"type":"(?:reasoning|function_call|function_call_output)"/);
+  }
+  assert.match(JSON.stringify(compacted.output), /Checkpoint part 1 of/);
+  assert.match(JSON.stringify(compacted.output), /fallback summary 1/);
+  assert.match(JSON.stringify(compacted.output), new RegExp(`fallback summary ${responseBodies.length}`));
+  assert.equal(compacted.id, "compact_semantic_fallback");
+  assert.deepEqual(compacted.usage, {
+    input_tokens: responseBodies.length * 11,
+    output_tokens: responseBodies.length * 3,
+    total_tokens: responseBodies.length * 14,
+  });
+
+  const responseCountBeforeOtherError = responseBodies.length;
+  compactCode = "other_compact_failure";
+  await assert.rejects(() => client.compact({
+    model: request.model,
+    instructions: request.instructions,
+    input: request.input,
+    promptCacheKey: request.promptCacheKey,
+    fast: request.fast,
+  }), (error: unknown) => {
+    assert.equal((error as { code?: string }).code, "other_compact_failure");
+    return true;
+  });
+  assert.equal(compactBodies.length, 2);
+  assert.equal(responseBodies.length, responseCountBeforeOtherError);
+});
+
+test("codex-lb semantic fallback normalizes patch calls without changing portable replay", async (t) => {
+  const responseBodies: Record<string, unknown>[] = [];
+  const server = createServer((req, response) => {
+    let raw = "";
+    req.on("data", (chunk) => { raw += chunk; });
+    req.on("end", () => {
+      const body = JSON.parse(raw) as Record<string, unknown>;
+      if (req.url === "/v1/responses/compact") {
+        response.writeHead(400, { "content-type": "application/json" });
+        response.end(JSON.stringify({ error: { code: "responses_compact_input_too_large", message: "too large" } }));
+        return;
+      }
+      responseBodies.push(body);
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({
+        id: `fallback_${responseBodies.length}`,
+        output: [{
+          id: `fallback_message_${responseBodies.length}`,
+          type: "message",
+          role: "assistant",
+          status: "completed",
+          content: [{ type: "output_text", text: `summary ${responseBodies.length}` }],
+        }],
+      }));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.gateway.provider = "codex-lb";
+  config.gateway.baseURL = `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1`;
+  const patch = [
+    "*** Begin Patch",
+    "*** Add File: src/add.ts",
+    "+add body DISTINCTIVE_HUNK_BODY",
+    "*** Update File: src/update.ts",
+    "@@ -1 +1 @@",
+    "-old DISTINCTIVE_HUNK_BODY",
+    "+new",
+    "*** Delete File: src/delete.ts",
+    "*** Update File: src/moved.ts",
+    "*** Move to: src/renamed.ts",
+    "*** End Patch",
+  ].join("\n");
+  const patchCall = {
+    type: "function_call",
+    id: "fc_foreign_patch",
+    call_id: "call_patch",
+    name: "apply_patch",
+    arguments: JSON.stringify({ patch, note: "keep-me", count: 3 }),
+  };
+  const malformedPatchCall = {
+    type: "function_call",
+    id: "fc_malformed_patch",
+    call_id: "call_malformed_patch",
+    name: "apply_patch",
+    arguments: `{"patch":${"MALFORMED_PATCH_HEAD_"}${"x".repeat(20_000)}`,
+  };
+  const input = [{
+    role: "user",
+    content: [{ type: "input_text", text: `source ${"x".repeat(34_000)}` }],
+  }, patchCall, malformedPatchCall, {
+    type: "function_call_output",
+    call_id: "call_patch",
+    output: `OUTPUT_HEAD_${"q".repeat(10_000)}OUTPUT_TAIL`,
+  }, {
+    type: "function_call_output",
+    call_id: "call_agent",
+    output: "agent-result-preserved",
+  }] as unknown as ResponseInputItem[];
+
+  await new CodexLbClient(config).compact({
+    model: request.model,
+    instructions: "Keep context",
+    input,
+    promptCacheKey: request.promptCacheKey,
+    fast: false,
+  });
+  const fallbackText = responseBodies.map((body) => JSON.stringify(body.input)).join("\n");
+  assert.match(fallbackText, /original_chars=\d+/u);
+  assert.match(fallbackText, /Add File: src\/add\.ts/u);
+  assert.match(fallbackText, /Update File: src\/update\.ts/u);
+  assert.match(fallbackText, /Delete File: src\/delete\.ts/u);
+  assert.match(fallbackText, /Move to: src\/renamed\.ts/u);
+  assert.doesNotMatch(fallbackText, /DISTINCTIVE_HUNK_BODY/u);
+  assert.match(fallbackText, /keep-me/u);
+  assert.match(fallbackText, /OUTPUT_HEAD_/u);
+  assert.match(fallbackText, /OUTPUT_TAIL/u);
+  assert.match(fallbackText, /agent-result-preserved/u);
+  assert.match(fallbackText, /MALFORMED_PATCH_HEAD_/u);
+
+  const { previousResponseId: _previousResponseId, ...unanchored } = request;
+  const portablePatchCall = { ...patchCall, id: "foreign_patch_id" };
+  const portable = buildResponseParams("codex-lb", {
+    ...unanchored,
+    input: [portablePatchCall] as unknown as ResponseInputItem[],
+  });
+  assert.match(JSON.stringify(portable.input), /DISTINCTIVE_HUNK_BODY/u);
+  assert.match(JSON.stringify(portable.input), /src\/add\.ts/u);
+});
+
+test("codex-lb semantic fallback bounds oversized parts, preserves usage, and reports bounded progress", async (t) => {
+  const responseBodies: Record<string, unknown>[] = [];
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const statuses: string[] = [];
+  const server = createServer((req, response) => {
+    let raw = "";
+    req.on("data", (chunk) => { raw += chunk; });
+    req.on("end", () => {
+      const body = JSON.parse(raw) as Record<string, unknown>;
+      if (req.url === "/v1/responses/compact") {
+        response.writeHead(400, { "content-type": "application/json" });
+        response.end(JSON.stringify({ error: {
+          code: "responses_compact_input_too_large",
+          message: "input cannot be trimmed without removing required state anchors",
+        } }));
+        return;
+      }
+      responseBodies.push(body);
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      const part = /transcript part (\d+) of (\d+)/u.exec(String(body.instructions));
+      const partNumber = part?.[1] ?? "unknown";
+      setTimeout(() => {
+        inFlight -= 1;
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({
+          id: `fallback_${partNumber}`,
+          output: [{
+            id: `fallback_message_${partNumber}`,
+            type: "message",
+            role: "assistant",
+            status: "completed",
+            content: [{ type: "output_text", text: `HEAD_${partNumber} ${"😀".repeat(20_000)} TAIL_${partNumber}` }],
+          }],
+          usage: { input_tokens: 101, output_tokens: 5_000, total_tokens: 5_101 },
+        }));
+      }, 50);
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.gateway.provider = "codex-lb";
+  config.gateway.baseURL = `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1`;
+  const client = new CodexLbClient(config);
+  const compacted = await client.compact({
+    model: request.model,
+    instructions: "Keep context",
+    input: [{
+      role: "user",
+      content: [{ type: "input_text", text: "source " + "x".repeat(32_768 * 6) }],
+    }] as ResponseInputItem[],
+    promptCacheKey: request.promptCacheKey,
+    fast: true,
+    onStatus: (status) => statuses.push(status),
+  });
+
+  const totalParts = responseBodies.length;
+  assert.ok(totalParts > 1);
+  assert.ok(maxInFlight > 1);
+  assert.ok(maxInFlight <= 4);
+  assert.deepEqual(statuses, Array.from({ length: totalParts }, (_, index) => `Compacting context (${index + 1}/${totalParts} parts)`));
+  const outputText = String(((compacted.output as Array<Record<string, unknown>>)[0]?.content as Array<Record<string, unknown>>)[0]?.text);
+  assert.ok(outputText.length <= 32_768);
+  assert.match(outputText, /\.\.\.\[truncated\]\.\.\./u);
+  for (let index = 1; index <= totalParts; index += 1) {
+    assert.match(outputText, new RegExp(`HEAD_${index} `));
+    assert.match(outputText, new RegExp(`TAIL_${index}`));
+  }
+  assert.deepEqual(compacted.usage, {
+    input_tokens: totalParts * 101,
+    output_tokens: totalParts * 5_000,
+    total_tokens: totalParts * 5_101,
+  });
+  assert.equal(compacted.id, "compact_semantic_fallback");
+  for (const body of responseBodies) {
+    assert.deepEqual(body.text, { verbosity: "low" });
+    assert.deepEqual(body.reasoning, { effort: "none" });
+    assert.equal("prompt_cache_key" in body, false);
+    assert.match(String(body.instructions), /at or below \d+ characters/u);
+  }
+});
+
+test("codex-lb retries an empty semantic part without affinity and combines its usage", async (t) => {
+  const responseBodies: Record<string, unknown>[] = [];
+  const attempts = new Map<number, number>();
+  const statuses: string[] = [];
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const server = createServer((req, response) => {
+    let raw = "";
+    req.on("data", (chunk) => { raw += chunk; });
+    req.on("end", () => {
+      const body = JSON.parse(raw) as Record<string, unknown>;
+      if (req.url === "/v1/responses/compact") {
+        response.writeHead(400, { "content-type": "application/json" });
+        response.end(JSON.stringify({ error: {
+          code: "responses_compact_input_too_large",
+          message: "input cannot be trimmed without removing required state anchors",
+        } }));
+        return;
+      }
+      responseBodies.push(body);
+      const part = /transcript part (\d+) of (\d+)/u.exec(String(body.instructions));
+      const partNumber = Number(part?.[1] ?? 0);
+      const attempt = (attempts.get(partNumber) ?? 0) + 1;
+      attempts.set(partNumber, attempt);
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      setTimeout(() => {
+        inFlight -= 1;
+        response.writeHead(200, { "content-type": "application/json" });
+        if (partNumber === 1 && attempt === 1) {
+          response.end(JSON.stringify({
+            id: "fallback_empty_first",
+            output: [],
+            usage: { input_tokens: 75, output_tokens: 5, total_tokens: 80 },
+          }));
+          return;
+        }
+        response.end(JSON.stringify({
+          id: `fallback_${partNumber}`,
+          output: [{
+            id: `fallback_message_${partNumber}`,
+            type: "message",
+            role: "assistant",
+            status: "completed",
+            content: [{ type: "output_text", text: `summary ${partNumber}` }],
+          }],
+          usage: { input_tokens: 10, output_tokens: 3, total_tokens: 13 },
+        }));
+      }, 15);
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.gateway.provider = "codex-lb";
+  config.gateway.baseURL = `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1`;
+  const client = new CodexLbClient(config);
+  const compacted = await client.compact({
+    model: request.model,
+    instructions: "Keep context",
+    input: [{
+      role: "user",
+      content: [{ type: "input_text", text: "source " + "x".repeat(32_768 * 5) }],
+    }] as ResponseInputItem[],
+    promptCacheKey: request.promptCacheKey,
+    fast: true,
+    onStatus: (status) => statuses.push(status),
+  });
+
+  const totalParts = attempts.size;
+  assert.ok(totalParts > 1);
+  assert.equal(responseBodies.length, totalParts + 1);
+  assert.equal(attempts.get(1), 2);
+  assert.ok(maxInFlight <= 4);
+  for (const body of responseBodies) assert.equal("prompt_cache_key" in body, false);
+  assert.deepEqual(statuses, Array.from({ length: totalParts }, (_, index) => `Compacting context (${index + 1}/${totalParts} parts)`));
+  assert.equal(new Set(statuses).size, totalParts);
+  const outputText = String(((compacted.output as Array<Record<string, unknown>>)[0]?.content as Array<Record<string, unknown>>)[0]?.text);
+  assert.ok(outputText.length <= 32_768);
+  assert.match(outputText, /summary 1/u);
+  assert.deepEqual(compacted.usage, {
+    input_tokens: totalParts * 10 + 75,
+    output_tokens: totalParts * 3 + 5,
+    total_tokens: totalParts * 13 + 80,
+  });
+});
+
+test("codex-lb exhausts empty semantic response retries with no checkpoint", async (t) => {
+  let attempts = 0;
+  let result: Record<string, unknown> | undefined;
+  const server = createServer((req, response) => {
+    let raw = "";
+    req.on("data", (chunk) => { raw += chunk; });
+    req.on("end", () => {
+      JSON.parse(raw);
+      if (req.url === "/v1/responses/compact") {
+        response.writeHead(400, { "content-type": "application/json" });
+        response.end(JSON.stringify({ error: { code: "responses_compact_input_too_large", message: "too large" } }));
+        return;
+      }
+      attempts += 1;
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({
+        id: `empty_${attempts}`,
+        output: [],
+        usage: { input_tokens: 7, output_tokens: 2, total_tokens: 9 },
+      }));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.gateway.provider = "codex-lb";
+  config.gateway.baseURL = `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1`;
+  const client = new CodexLbClient(config);
+  await assert.rejects(async () => {
+    result = await client.compact({
+      model: request.model,
+      instructions: "Keep context",
+      input: request.input,
+      promptCacheKey: request.promptCacheKey,
+      fast: true,
+    });
+  }, (error: unknown) => {
+    assert.equal((error as { code?: string }).code, "compaction_part_retry_exhausted");
+    assert.equal((error as { retryable?: boolean }).retryable, false);
+    assert.ok((error as { cause?: unknown }).cause);
+    return true;
+  });
+  assert.equal(attempts, 3);
+  assert.equal(result, undefined);
+});
+
+test("codex-lb preserves completed semantic parts with a bounded local excerpt after retry exhaustion", async (t) => {
+  const attempts = new Map<number, number>();
+  const statuses: string[] = [];
+  const server = createServer((req, response) => {
+    let raw = "";
+    req.on("data", (chunk) => { raw += chunk; });
+    req.on("end", () => {
+      const body = JSON.parse(raw) as Record<string, unknown>;
+      if (req.url === "/v1/responses/compact") {
+        response.writeHead(400, { "content-type": "application/json" });
+        response.end(JSON.stringify({ error: { code: "responses_compact_input_too_large", message: "too large" } }));
+        return;
+      }
+      const part = Number(/transcript part (\d+) of (\d+)/u.exec(String(body.instructions))?.[1] ?? 0);
+      const attempt = (attempts.get(part) ?? 0) + 1;
+      attempts.set(part, attempt);
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(part === 1 ? {
+        id: "semantic_1",
+        output: [{
+          id: "semantic_message_1",
+          type: "message",
+          role: "assistant",
+          status: "completed",
+          content: [{ type: "output_text", text: "durable semantic summary for part one" }],
+        }],
+        usage: { input_tokens: 11, output_tokens: 3, total_tokens: 14 },
+      } : {
+        id: `malformed_${part}_${attempt}`,
+        output_text: "apparently valid top-level text",
+        output: [{
+          id: `malformed_message_${part}_${attempt}`,
+          type: "message",
+          role: "assistant",
+          status: "completed",
+          content: [{ type: "output_text", text: { invalid: true } }],
+        }],
+        usage: { input_tokens: 7, output_tokens: 2, total_tokens: 9 },
+      }));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.gateway.provider = "codex-lb";
+  config.gateway.baseURL = `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1`;
+  const compacted = await new CodexLbClient(config).compact({
+    model: request.model,
+    instructions: "Keep context",
+    input: [{
+      role: "user",
+      content: [{ type: "input_text", text: "source " + "x".repeat(60_000) + " DURABLE_TAIL_FACT" }],
+    }] as ResponseInputItem[],
+    promptCacheKey: request.promptCacheKey,
+    fast: false,
+    onStatus: (status) => statuses.push(status),
+  });
+
+  assert.equal(attempts.get(1), 1);
+  assert.equal(attempts.get(2), 3);
+  const outputText = String(((compacted.output as Array<Record<string, unknown>>)[0]?.content as Array<Record<string, unknown>>)[0]?.text);
+  assert.ok(outputText.length <= 32_768);
+  assert.match(outputText, /durable semantic summary for part one/u);
+  assert.match(outputText, /Semantic summary unavailable; bounded local transcript excerpt/u);
+  assert.match(outputText, /DURABLE_TAIL_FACT/u);
+  assert.ok(statuses.some((status) => status.includes("bounded local fallback")));
+  assert.deepEqual(compacted.usage, { input_tokens: 32, output_tokens: 9, total_tokens: 41 });
+  assert.equal(compacted.id, "compact_semantic_fallback");
+});
+
+test("codex-lb retries a timed-out semantic part without re-requesting completed parts", async (t) => {
+  const attempts = new Map<number, number>();
+  const responseBodies: Record<string, unknown>[] = [];
+  const server = createServer((req, response) => {
+    let raw = "";
+    req.on("data", (chunk) => { raw += chunk; });
+    req.on("end", () => {
+      const body = JSON.parse(raw) as Record<string, unknown>;
+      if (req.url === "/v1/responses/compact") {
+        response.writeHead(400, { "content-type": "application/json" });
+        response.end(JSON.stringify({ error: { code: "responses_compact_input_too_large", message: "too large" } }));
+        return;
+      }
+      responseBodies.push(body);
+      const part = Number(/transcript part (\d+) of (\d+)/u.exec(String(body.instructions))?.[1] ?? 0);
+      const attempt = (attempts.get(part) ?? 0) + 1;
+      attempts.set(part, attempt);
+      const send = () => {
+        if (response.destroyed) return;
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({
+          id: `fallback_${part}_${attempt}`,
+          output: [{
+            id: `fallback_message_${part}_${attempt}`,
+            type: "message",
+            role: "assistant",
+            status: "completed",
+            content: [{ type: "output_text", text: `summary ${part} attempt ${attempt}` }],
+          }],
+        }));
+      };
+      if (part === 2 && attempt === 1) setTimeout(send, 300);
+      else send();
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.gateway.provider = "codex-lb";
+  config.gateway.timeoutMs = 100;
+  config.gateway.baseURL = `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1`;
+  const compacted = await new CodexLbClient(config).compact({
+    model: request.model,
+    instructions: "Keep context",
+    input: [{ role: "user", content: [{ type: "input_text", text: "source " + "x".repeat(60_000) }] }] as ResponseInputItem[],
+    promptCacheKey: request.promptCacheKey,
+    fast: false,
+  });
+  assert.equal(responseBodies.length, 3);
+  assert.equal(attempts.get(1), 1);
+  assert.equal(attempts.get(2), 2);
+  assert.equal(compacted.id, "compact_semantic_fallback");
+});
+
+test("codex-lb exhausts exactly three timed-out semantic attempts as non-retryable", async (t) => {
+  let attempts = 0;
+  const server = createServer((req, response) => {
+    let raw = "";
+    req.on("data", (chunk) => { raw += chunk; });
+    req.on("end", () => {
+      JSON.parse(raw);
+      if (req.url === "/v1/responses/compact") {
+        response.writeHead(400, { "content-type": "application/json" });
+        response.end(JSON.stringify({ error: { code: "responses_compact_input_too_large", message: "too large" } }));
+        return;
+      }
+      attempts += 1;
+      setTimeout(() => {
+        if (response.destroyed) return;
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({ id: `late_${attempts}`, output: [] }));
+      }, 300);
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.gateway.provider = "codex-lb";
+  config.gateway.timeoutMs = 100;
+  config.gateway.baseURL = `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1`;
+  await assert.rejects(() => new CodexLbClient(config).compact({
+    model: request.model,
+    instructions: "Keep context",
+    input: request.input,
+    promptCacheKey: request.promptCacheKey,
+    fast: false,
+  }), (error: unknown) => {
+    assert.equal((error as { code?: string }).code, "compaction_part_retry_exhausted");
+    assert.equal((error as { retryable?: boolean }).retryable, false);
+    assert.ok((error as { cause?: unknown }).cause);
+    return true;
+  });
+  assert.equal(attempts, 3);
+});
+
+test("codex-lb does not retry a permanently classified semantic HTTP failure", async (t) => {
+  let attempts = 0;
+  const server = createServer((req, response) => {
+    let raw = "";
+    req.on("data", (chunk) => { raw += chunk; });
+    req.on("end", () => {
+      JSON.parse(raw);
+      if (req.url === "/v1/responses/compact") {
+        response.writeHead(400, { "content-type": "application/json" });
+        response.end(JSON.stringify({ error: { code: "responses_compact_input_too_large", message: "too large" } }));
+        return;
+      }
+      attempts += 1;
+      response.writeHead(503, { "content-type": "application/json" });
+      response.end(JSON.stringify({ error: {
+        code: "invalid_api_key",
+        type: "authentication_error",
+        message: "invalid credential",
+      } }));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.gateway.provider = "codex-lb";
+  config.gateway.baseURL = `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1`;
+  await assert.rejects(() => new CodexLbClient(config).compact({
+    model: request.model,
+    instructions: "Keep context",
+    input: request.input,
+    promptCacheKey: request.promptCacheKey,
+    fast: false,
+  }), (error: unknown) => {
+    assert.equal((error as { code?: string }).code, "invalid_api_key");
+    return true;
+  });
+  assert.equal(attempts, 1);
+});
+
+test("codex-lb does not retry a semantic part after caller abort", async (t) => {
+  let attempts = 0;
+  let resolveSemanticRequest!: () => void;
+  const semanticRequest = new Promise<void>((resolve) => { resolveSemanticRequest = resolve; });
+  const server = createServer((req, response) => {
+    let raw = "";
+    req.on("data", (chunk) => { raw += chunk; });
+    req.on("end", () => {
+      JSON.parse(raw);
+      if (req.url === "/v1/responses/compact") {
+        response.writeHead(400, { "content-type": "application/json" });
+        response.end(JSON.stringify({ error: { code: "responses_compact_input_too_large", message: "too large" } }));
+        return;
+      }
+      attempts += 1;
+      resolveSemanticRequest();
+      setTimeout(() => {
+        if (response.destroyed) return;
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({ id: "late", output: [] }));
+      }, 100);
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.gateway.provider = "codex-lb";
+  config.gateway.timeoutMs = 1_000;
+  config.gateway.baseURL = `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1`;
+  const controller = new AbortController();
+  const abortReason = new Error("caller stopped compaction");
+  const compactPromise = new CodexLbClient(config).compact({
+    model: request.model,
+    instructions: "Keep context",
+    input: request.input,
+    promptCacheKey: request.promptCacheKey,
+    fast: false,
+    signal: controller.signal,
+  });
+  await semanticRequest;
+  controller.abort(abortReason);
+  await assert.rejects(compactPromise, (error: unknown) => error === abortReason);
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(attempts, 1);
+});
+
 test("custom Responses profile is stateless and omits gateway-specific fields", () => {
   const params = buildResponseParams("custom", {
     ...request,
