@@ -111,6 +111,7 @@ function resolveOptions(options: WindowsServiceOptions = {}): ResolvedWindowsSer
   };
   requiredText(resolved.configDirectory, "config directory");
   requiredText(resolved.taskName, "task name");
+  if (resolved.taskName.includes("\\")) throw new TypeError("task name must not contain a path separator");
   requiredText(resolved.launcherPath, "launcher path");
   requiredText(resolved.taskXmlPath, "task XML path");
   requiredText(resolved.nodePath, "node path");
@@ -371,15 +372,34 @@ function taskStateScript(taskName: string): string {
   return [
     "$ErrorActionPreference = 'Stop'",
     "try {",
-    // Enumerate tasks and filter exact root-path/name properties instead of
-    // querying an absent path or name. Filtered cmdlet queries throw errors whose
-    // FullyQualifiedErrorId has varied between Windows releases, while this
-    // successful enumeration is independent of localization and error text.
-    `  $tasks = @(Get-ScheduledTask -ErrorAction Stop | Where-Object { $_.TaskPath -eq '\\' -and $_.TaskName -eq ${powerShellLiteral(taskName)} })`,
-    `  if ($tasks.Count -eq 0) { [Console]::Error.Write('${TASK_NOT_FOUND_SENTINEL}'); exit 3 }`,
-    "  [Console]::Out.Write($tasks[0].State.ToString())",
+    // The COM API performs an exact root-folder lookup. Unlike an unfiltered
+    // Get-ScheduledTask call, it does not require permission to enumerate every
+    // task registered on the machine.
+    "  $service = New-Object -ComObject 'Schedule.Service'",
+    "  $service.Connect()",
+    "  $folder = $service.GetFolder('\\')",
+    `  $task = $folder.GetTask(${powerShellLiteral(taskName)})`,
+    "  $state = switch ([int]$task.State) {",
+    "    0 { 'Unknown'; break }",
+    "    1 { 'Disabled'; break }",
+    "    2 { 'Queued'; break }",
+    "    3 { 'Ready'; break }",
+    "    4 { 'Running'; break }",
+    "    default { throw ('Unexpected Task Scheduler state: {0}' -f [int]$task.State) }",
+    "  }",
+    "  [Console]::Out.Write($state)",
     "} catch {",
-    "  [Console]::Error.Write('LOOKING_GLASS_TASK_ERROR')",
+    // PowerShell wraps COM method failures on some releases. Inspect every
+    // exception in the chain and retain the deepest HRESULT for diagnostics.
+    "  $exception = $_.Exception",
+    "  $hresult = [uint32]0",
+    "  while ($null -ne $exception) {",
+    "    $hresult = [uint32]([int64]$exception.HResult -band 0xffffffffL)",
+    `    if ($hresult -eq 2147750671 -or $hresult -eq 2147942402) { [Console]::Error.Write('${TASK_NOT_FOUND_SENTINEL}'); exit 3 }`,
+    "    if ($hresult -eq 2147942405) { [Console]::Error.Write('LOOKING_GLASS_TASK_ACCESS_DENIED HRESULT=0x80070005'); exit 4 }",
+    "    $exception = $exception.InnerException",
+    "  }",
+    "  [Console]::Error.Write(('LOOKING_GLASS_TASK_ERROR HRESULT=0x{0:X8}' -f $hresult))",
     "  exit 4",
     "}",
   ].join("\r\n");

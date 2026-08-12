@@ -241,18 +241,20 @@ function merge(base: GlassConfig, override: PartialConfig): GlassConfig {
           : {}),
       }
     : base.gateway;
+  const mergedGateways = (override.gateways
+    ? override.gateways.map((gateway) => ({
+        apiKeyEnv: defaultApiKeyEnv(gateway.provider),
+        protocol: defaultProtocol(gateway.provider),
+        timeoutMs: base.gateway.timeoutMs,
+        ...gateway,
+      }))
+    : base.gateways)
+    .filter((gateway) => gateway.provider !== mergedGateway.provider);
   return {
     ...base,
     ...override,
     gateway: mergedGateway,
-    gateways: override.gateways
-      ? override.gateways.map((gateway) => ({
-          apiKeyEnv: defaultApiKeyEnv(gateway.provider),
-          protocol: defaultProtocol(gateway.provider),
-          timeoutMs: base.gateway.timeoutMs,
-          ...gateway,
-        }))
-      : base.gateways,
+    gateways: mergedGateways,
     tools: { ...base.tools, ...override.tools },
     scheduler: { ...base.scheduler, ...override.scheduler },
     automation: { ...base.automation, ...override.automation },

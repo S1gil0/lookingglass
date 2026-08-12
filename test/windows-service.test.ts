@@ -90,9 +90,14 @@ test("Windows scheduler dispatches without invoking a host scheduler", () => {
   assert.equal(commands.length, 1);
   assert.equal(commands[0]?.command, "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
   const script = commands[0]?.args.at(-1) ?? "";
-  assert.match(script, /Get-ScheduledTask/);
-  assert.equal(script.includes("Get-ScheduledTask -ErrorAction Stop"), true);
-  assert.match(script, /Where-Object \{ \$_.TaskPath -eq '\\' -and \$_.TaskName -eq/);
+  assert.match(script, /New-Object -ComObject 'Schedule\.Service'/);
+  assert.match(script, /\$service\.Connect\(\)/);
+  assert.match(script, /\$service\.GetFolder\('\\'\)/);
+  assert.match(script, /\$folder\.GetTask\('Looking Glass Scheduler'\)/);
+  assert.doesNotMatch(script, /Get-ScheduledTask/);
+  assert.match(script, /2147750671/);
+  assert.match(script, /\$exception = \$exception\.InnerException/);
+  assert.match(script, /LOOKING_GLASS_TASK_ACCESS_DENIED HRESULT=0x80070005/);
   assert.equal(script.includes("FullyQualifiedErrorId"), false);
 });
 
@@ -312,6 +317,7 @@ test("XML text rejects controls and empty scheduler values", () => {
   assert.throws(() => renderTaskXml(""), /launcher path must not be empty/);
   assert.throws(() => renderTaskXml("launcher.ps1", { user: "" }), /task user must not be empty/);
   assert.throws(() => renderTaskXml("launcher.ps1", { taskName: "Task\u0001" }), /invalid XML control/);
+  assert.throws(() => serviceStatus({ taskName: "folder\\task", user: "user" }), /path separator/);
 });
 
 test("dispatcher keeps Linux on the existing systemd backend", () => {

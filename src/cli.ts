@@ -15,7 +15,7 @@ import { serializeConfig } from "./config.js";
 import { collectOperationalSnapshot, type OperationalSnapshot } from "./operations.js";
 import type { MaintenanceMode, MaintenanceReport } from "./maintenance.js";
 
-export const VERSION = "0.11.0";
+export const VERSION = "0.11.1";
 
 function terminalText(value: string): string {
   return value.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/gu, "�");
@@ -441,7 +441,7 @@ async function runPrompt(app: LookingGlassApp, args: string[]): Promise<void> {
   }
   const prompt = promptParts.join(" ").trim();
   if (!prompt) throw new Error("run requires a prompt");
-  const session = await app.currentOrNewSession(sessionId);
+  const session = await app.sessionForRun(sessionId);
   const controller = new AbortController();
   const callbacks = stdioCallbacks();
   const abort = (): void => controller.abort();

@@ -112,18 +112,41 @@ test("attached, future, and minimum-age artifacts are protected", (t) => {
   assert.equal(existsSync(attached.path), true);
 });
 
-test("path escapes and symlinks are refused without exposing paths", (t) => {
+test("path escapes are refused without exposing paths", (t) => {
   const fixtureValue = fixture(t);
   const outside = join(fixtureValue.root, "outside");
   writeFileSync(outside, "do not remove");
   const escapedId = "escaped";
-  const symlinkId = "symlink";
-  const symlinkPath = join(fixtureValue.artifactsDirectory, symlinkId);
-  symlinkSync(outside, symlinkPath);
   fixtureValue.db.prepare(`
     INSERT INTO artifacts(id, session_id, kind, file_path, byte_count, metadata_json, created_at)
     VALUES (?, NULL, 'test', ?, 13, '{}', 100)
   `).run(escapedId, outside);
+
+  const report = fixtureValue.store.applyDetachedArtifactMaintenance({ maxAgeMs: 0 }, 1_000);
+  assert.equal(report.deletedMetadata, 0);
+  assert.equal(report.deletedFiles, 0);
+  assert.equal(report.errors, 1);
+  assert.equal(JSON.stringify(report).includes(outside), false);
+  assert.equal(readFileText(outside), "do not remove");
+  assert.ok(fixtureValue.store.get(escapedId));
+});
+
+test("symlinks are refused without exposing paths when the host permits symlink creation", (t) => {
+  const fixtureValue = fixture(t);
+  const outside = join(fixtureValue.root, "outside");
+  writeFileSync(outside, "do not remove");
+  const symlinkId = "symlink";
+  const symlinkPath = join(fixtureValue.artifactsDirectory, symlinkId);
+  try {
+    symlinkSync(outside, symlinkPath);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (process.platform === "win32" && (code === "EPERM" || code === "EACCES")) {
+      t.skip("symlink creation requires elevated Windows privileges");
+      return;
+    }
+    throw error;
+  }
   fixtureValue.db.prepare(`
     INSERT INTO artifacts(id, session_id, kind, file_path, byte_count, metadata_json, created_at)
     VALUES (?, NULL, 'test', ?, 13, '{}', 100)
@@ -132,11 +155,10 @@ test("path escapes and symlinks are refused without exposing paths", (t) => {
   const report = fixtureValue.store.applyDetachedArtifactMaintenance({ maxAgeMs: 0 }, 1_000);
   assert.equal(report.deletedMetadata, 0);
   assert.equal(report.deletedFiles, 0);
-  assert.equal(report.errors, 2);
+  assert.equal(report.errors, 1);
   assert.equal(JSON.stringify(report).includes(outside), false);
   assert.equal(readFileText(outside), "do not remove");
   assert.equal(lstatSync(symlinkPath).isSymbolicLink(), true);
-  assert.ok(fixtureValue.store.get(escapedId));
   assert.ok(fixtureValue.store.get(symlinkId));
 });
 

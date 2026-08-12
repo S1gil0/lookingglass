@@ -424,6 +424,11 @@ export class LookingGlassApp {
       .find((session) => this.hasProvider(session.provider)) ?? this.createSession(signal);
   }
 
+  /** A bare one-shot run is new; only an explicit id resumes prior context. */
+  async sessionForRun(id?: string, signal?: AbortSignal): Promise<SessionRecord> {
+    return id ? this.currentOrNewSession(id, signal) : this.createSession(signal);
+  }
+
   close(): void {
     this.clients?.forEach((client) => client.close());
     checkpointDatabase(this.db);

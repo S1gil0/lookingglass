@@ -163,3 +163,52 @@ test("preserves inherited custom protocol and credentials when a workspace only 
     rmSync(configHome, { recursive: true, force: true });
   }
 });
+
+test("an explicit primary gateway removes the inherited alternate with the same provider", () => {
+  const root = mkdtempSync(join(tmpdir(), "looking-glass-config-explicit-primary-"));
+  const configHome = mkdtempSync(join(tmpdir(), "looking-glass-config-home-"));
+  const explicitPath = join(root, "explicit.json");
+  const previousConfigHome = process.env.XDG_CONFIG_HOME;
+  const previousExplicitConfig = process.env.LOOKING_GLASS_CONFIG;
+  try {
+    mkdirSync(join(configHome, "looking-glass"), { recursive: true });
+    writeFileSync(join(configHome, "looking-glass", "config.json"), JSON.stringify({
+      gateway: {
+        provider: "codex-lb",
+        baseURL: "http://127.0.0.1:4000/v1",
+      },
+      gateways: [
+        {
+          provider: "lm-studio",
+          baseURL: "http://127.0.0.1:1234/v1",
+        },
+        {
+          provider: "openrouter",
+          baseURL: "https://openrouter.ai/api/v1",
+        },
+      ],
+    }));
+    writeFileSync(explicitPath, JSON.stringify({
+      gateway: {
+        provider: "lm-studio",
+        baseURL: "http://127.0.0.1:1234/v1",
+      },
+      model: "qwen/local",
+    }));
+    process.env.XDG_CONFIG_HOME = configHome;
+    process.env.LOOKING_GLASS_CONFIG = explicitPath;
+
+    const config = loadConfig(root);
+    assert.equal(config.gateway.provider, "lm-studio");
+    assert.equal(config.gateway.baseURL, "http://127.0.0.1:1234/v1");
+    assert.equal(config.model, "qwen/local");
+    assert.deepEqual(config.gateways.map((gateway) => gateway.provider), ["openrouter"]);
+  } finally {
+    if (previousConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = previousConfigHome;
+    if (previousExplicitConfig === undefined) delete process.env.LOOKING_GLASS_CONFIG;
+    else process.env.LOOKING_GLASS_CONFIG = previousExplicitConfig;
+    rmSync(root, { recursive: true, force: true });
+    rmSync(configHome, { recursive: true, force: true });
+  }
+});

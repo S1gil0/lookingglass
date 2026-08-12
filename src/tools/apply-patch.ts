@@ -603,7 +603,7 @@ function preflightPatch(patch: string, workspace: string, platform: NodeJS.Platf
 
 export const applyPatchTool: GlassTool<ApplyPatchArgs> = {
   name: "apply_patch",
-  description: "Only argument is `patch`: use the custom `*** Begin Patch`/`*** End Patch` format. Paths are workspace-relative; prefix hunk context/removal/addition lines with ` `, `-`, or `+`. Match exact current file text and include unique context. Changes are atomic.",
+  description: "Apply an atomic workspace patch. `patch` is the only argument: use exactly `*** Begin Patch` through `*** End Patch` (no Markdown fences or unified diff). Operations are `*** Add File: path`, `*** Update File: path` (optionally followed by `*** Move to: path`), and `*** Delete File: path`. Paths are workspace-relative. Add-file lines start `+`; update hunks start `@@`, with context/removal/addition lines starting with one literal space, `-`, or `+`. Match exact current text and include unique context. Example: `*** Begin Patch\n*** Add File: note.txt\n+text\n*** End Patch`.",
   risk: "write",
   classifyRisk: (args, context) => classifyPatchRisk(args, context.workspace),
   parameters: {
@@ -612,7 +612,7 @@ export const applyPatchTool: GlassTool<ApplyPatchArgs> = {
       patch: {
         type: "string",
         minLength: 1,
-        description: "Required custom patch text; the only argument. Use workspace-relative paths and exact current text with unique hunk context.",
+        description: "Required custom patch text using only the Begin/End wrapper and Add File, Update File, Move to, or Delete File headers.",
       },
     },
     required: ["patch"],
