@@ -63,7 +63,7 @@ export function writeFileCommand(path: string, value: string): string {
 
 export function transformInputCommand(): string {
   return shellCommand(
-    "cat input.txt > output.txt && sed -i 's/before/after/' output.txt",
+    `node -e "const fs=require('node:fs');fs.writeFileSync('output.txt',fs.readFileSync('input.txt','utf8').replace('before','after'))"`,
     "[IO.File]::WriteAllText('output.txt', ([IO.File]::ReadAllText('input.txt')).Replace('before', 'after'))",
   );
 }
