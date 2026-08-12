@@ -1,4 +1,5 @@
 import * as systemd from "./systemd.js";
+import { createLaunchdScheduler, type LaunchdScheduler, type LaunchdServiceOptions } from "./launchd.js";
 import { createWindowsScheduler, type WindowsScheduler, type WindowsServiceOptions } from "./windows.js";
 
 export interface SchedulerService {
@@ -11,8 +12,10 @@ export interface SchedulerService {
 export function schedulerForPlatform(
   platform: NodeJS.Platform = process.platform,
   windowsOptions: WindowsServiceOptions = {},
+  launchdOptions: LaunchdServiceOptions = {},
 ): SchedulerService {
   if (platform === "win32") return createWindowsScheduler(windowsOptions);
+  if (platform === "darwin") return createLaunchdScheduler(launchdOptions);
   return systemd;
 }
 
@@ -31,4 +34,4 @@ export function uninstallService(): boolean {
   return schedulerForPlatform().uninstallService();
 }
 
-export type { WindowsScheduler, WindowsServiceOptions };
+export type { LaunchdScheduler, LaunchdServiceOptions, WindowsScheduler, WindowsServiceOptions };

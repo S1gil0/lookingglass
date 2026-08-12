@@ -13,7 +13,7 @@ jobs:
   test:
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - name: Check out source
@@ -32,6 +32,12 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: choco install ripgrep --no-progress --yes
+      - name: Install ripgrep on macOS
+        if: runner.os == 'macOS'
+        run: |
+          if ! command -v rg >/dev/null 2>&1; then
+            brew install ripgrep
+          fi
       - name: Verify ripgrep
         run: rg --version
       - name: Install dependencies

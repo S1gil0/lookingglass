@@ -6,6 +6,13 @@ export { SchedulerStore } from "./store.js";
 export { installService, platformScheduler, schedulerForPlatform, serviceStatus, uninstallService } from "./service.js";
 export { renderUnit, userUnitPath } from "./systemd.js";
 export {
+  createLaunchdScheduler,
+  LAUNCHD_LABEL,
+  PLIST_FILE_NAME,
+  renderPlist,
+  userPlistPath,
+} from "./launchd.js";
+export {
   createWindowsScheduler,
   powerShellLiteral,
   renderLauncher,
@@ -18,6 +25,13 @@ export {
   xmlText,
 } from "./windows.js";
 export type { SchedulerService } from "./service.js";
+export type {
+  LaunchdCommandResult,
+  LaunchdCommandRunner,
+  LaunchdPlistOptions,
+  LaunchdScheduler,
+  LaunchdServiceOptions,
+} from "./launchd.js";
 export type {
   TaskXmlOptions,
   WindowsCommandResult,

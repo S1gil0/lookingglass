@@ -4,9 +4,9 @@ Thanks for helping improve Looking Glass.
 
 ## Development setup
 
-Looking Glass supports Linux and native Windows. Use Node.js 22.19.0 or newer,
-npm, and `ripgrep` (`rg` on Linux or `rg.exe` on Windows) on `PATH`. On
-Windows, run the commands below from PowerShell:
+Looking Glass supports Linux, experimental macOS, and native Windows. Use
+Node.js 22.19.0 or newer, npm, and `ripgrep` (`rg`, or `rg.exe` on Windows) on
+`PATH`. On Windows, run the commands below from PowerShell:
 
 ```text
 npm ci
@@ -24,6 +24,8 @@ On Windows, keep configuration and state under the user's profile with the
 default profile ACLs; do not put them on shared or UNC paths. Scheduled and
 shell commands use noninteractive PowerShell on Windows, and remembered
 PowerShell approvals are exact command, working-directory, and timeout matches.
+Linux and macOS use noninteractive `/bin/bash`; the macOS scheduler uses a
+per-user launchd LaunchAgent.
 
 ## Pull requests
 

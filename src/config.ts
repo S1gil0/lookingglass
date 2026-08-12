@@ -427,6 +427,65 @@ export interface PersistedGatewayConfig {
   maintenance?: PartialMaintenanceConfig;
 }
 
+export interface PersistedGatewayConfigResult {
+  configPath: string;
+  schedulerEnvPath: string;
+  rollback: () => void;
+  rollbackSchedulerEnv: () => void;
+}
+
+type FileSnapshot =
+  | { path: string; exists: true; bytes: Buffer }
+  | { path: string; exists: false };
+
+class GatewayConfigPersistenceError extends AggregateError {
+  readonly originalError: unknown;
+  readonly rollbackError: unknown;
+  readonly rollbackComplete = false;
+
+  constructor(originalError: unknown, rollbackError: unknown) {
+    super(
+      [originalError, rollbackError],
+      "Gateway configuration persistence failed; rollback incomplete",
+      { cause: originalError },
+    );
+    this.name = "GatewayConfigPersistenceError";
+    this.originalError = originalError;
+    this.rollbackError = rollbackError;
+  }
+}
+
+function snapshotFile(path: string): FileSnapshot {
+  if (!existsSync(path)) return { path, exists: false };
+  return { path, exists: true, bytes: readFileSync(path) };
+}
+
+function restoreFileSnapshot(snapshot: FileSnapshot): void {
+  if (!snapshot.exists) {
+    if (existsSync(snapshot.path)) unlinkSync(snapshot.path);
+    return;
+  }
+  if (existsSync(snapshot.path)) {
+    const current = readFileSync(snapshot.path);
+    if (Buffer.compare(current, snapshot.bytes) === 0) return;
+  }
+  atomicWrite(snapshot.path, snapshot.bytes);
+}
+
+function restoreFileSnapshots(snapshots: readonly FileSnapshot[]): void {
+  const errors: unknown[] = [];
+  for (const snapshot of snapshots) {
+    try {
+      restoreFileSnapshot(snapshot);
+    } catch (error) {
+      errors.push(error);
+    }
+  }
+  if (errors.length > 0) {
+    throw new AggregateError(errors, "Gateway configuration rollback incomplete");
+  }
+}
+
 function assertApiKeyEnv(apiKeyEnv: string): void {
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(apiKeyEnv)) {
     throw new Error("gateway apiKeyEnv must be a valid environment variable name");
@@ -600,10 +659,46 @@ function sanitizedPersistedGateway(value: unknown): GlassConfig["gateway"] | und
   }
 }
 
-function atomicWrite(path: string, contents: string, mode = 0o600): void {
+function aggregateAtomicFailure(message: string, errors: readonly unknown[]): unknown {
+  return errors.length === 1 ? errors[0] : new AggregateError(errors, message);
+}
+
+/**
+ * Restore the destination after the Windows replace sequence has moved the
+ * old destination out of the way. The replacement must first be moved out
+ * of the way; otherwise renameSync(backup, path) cannot restore the old file.
+ */
+function restoreWindowsDestination(path: string, backup: string, replacement: string): unknown[] {
+  const errors: unknown[] = [];
+  if (existsSync(path)) {
+    try {
+      renameSync(path, replacement);
+    } catch (error) {
+      errors.push(error);
+    }
+  }
+  if (existsSync(backup)) {
+    try {
+      renameSync(backup, path);
+    } catch (error) {
+      errors.push(error);
+    }
+  }
+  if (existsSync(replacement)) {
+    try {
+      unlinkSync(replacement);
+    } catch (error) {
+      errors.push(error);
+    }
+  }
+  return errors;
+}
+
+function atomicWrite(path: string, contents: string | Buffer, mode = 0o600): void {
   mkdirSync(configDir(), shouldEnforcePosixPermissions() ? { recursive: true, mode: 0o700 } : { recursive: true });
   const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
   const backup = `${path}.${process.pid}.${randomUUID()}.bak`;
+  const replacement = `${path}.${process.pid}.${randomUUID()}.rollback.tmp`;
   try {
     writeFileSync(temporary, contents, shouldEnforcePosixPermissions() ? { encoding: "utf8", mode } : "utf8");
     if (shouldEnforcePosixPermissions()) chmodSync(temporary, mode);
@@ -614,22 +709,57 @@ function atomicWrite(path: string, contents: string, mode = 0o600): void {
       renameSync(path, backup);
       try {
         renameSync(temporary, path);
-        unlinkSync(backup);
       } catch (replacementError) {
-        try {
-          if (!existsSync(path) && existsSync(backup)) renameSync(backup, path);
-        } catch {
-          // Preserve the replacement failure.
+        const rollbackErrors = restoreWindowsDestination(path, backup, replacement);
+        if (rollbackErrors.length > 0) {
+          throw aggregateAtomicFailure(
+            "Atomic replacement failed and restoring the previous destination was incomplete",
+            [replacementError, ...rollbackErrors],
+          );
         }
         throw replacementError;
       }
+      try {
+        unlinkSync(backup);
+      } catch (cleanupError) {
+        // The replacement is already installed, but deleting the backup can
+        // fail. Restore the old destination instead of leaving the new one in
+        // place while reporting a failed write.
+        const rollbackErrors = restoreWindowsDestination(path, backup, replacement);
+        if (rollbackErrors.length > 0) {
+          throw aggregateAtomicFailure(
+            "Atomic replacement cleanup failed and restoring the previous destination was incomplete",
+            [cleanupError, ...rollbackErrors],
+          );
+        }
+        throw cleanupError;
+      }
     }
   } catch (error) {
-    try {
-      if (existsSync(temporary)) unlinkSync(temporary);
-      if (existsSync(backup) && !existsSync(path)) renameSync(backup, path);
-    } catch {
-      // Ignore cleanup failures.
+    const cleanupErrors: unknown[] = [];
+    if (existsSync(temporary)) {
+      try {
+        unlinkSync(temporary);
+      } catch (cleanupError) {
+        cleanupErrors.push(cleanupError);
+      }
+    }
+    if (existsSync(backup) && !existsSync(path)) {
+      try {
+        renameSync(backup, path);
+      } catch (cleanupError) {
+        cleanupErrors.push(cleanupError);
+      }
+    }
+    if (existsSync(replacement)) {
+      try {
+        unlinkSync(replacement);
+      } catch (cleanupError) {
+        cleanupErrors.push(cleanupError);
+      }
+    }
+    if (cleanupErrors.length > 0) {
+      throw aggregateAtomicFailure("Atomic write cleanup was incomplete", [error, ...cleanupErrors]);
     }
     throw error;
   }
@@ -712,14 +842,40 @@ export function writeGlobalConfig(input: PersistedGatewayConfig): string {
   return path;
 }
 
-export function persistGatewayConfig(input: PersistedGatewayConfig & { apiKey: string }): {
-  configPath: string;
-  schedulerEnvPath: string;
-} {
+export function persistGatewayConfig(input: PersistedGatewayConfig & { apiKey: string }): PersistedGatewayConfigResult {
   const apiKeyEnv = input.apiKeyEnv ?? defaultApiKeyEnv(input.provider);
+  const paths = {
+    configPath: globalConfigPath(),
+    schedulerEnvPath: schedulerEnvPath(),
+  };
+  // Take byte-for-byte snapshots before either writer can create the config
+  // directory or replace a destination. The key itself is never included in
+  // the snapshot error path or any persisted JSON.
+  const snapshots = [snapshotFile(paths.configPath), snapshotFile(paths.schedulerEnvPath)];
+  let rolledBack = false;
+  const rollbackSchedulerEnv = (): void => {
+    restoreFileSnapshot(snapshots[1]!);
+  };
+  const rollback = (): void => {
+    if (rolledBack) return;
+    restoreFileSnapshots(snapshots);
+    rolledBack = true;
+  };
+  try {
+    writeGlobalConfig({ ...input, apiKeyEnv });
+    writeSchedulerEnv(apiKeyEnv, input.apiKey);
+  } catch (error) {
+    try {
+      rollback();
+    } catch (rollbackError) {
+      throw new GatewayConfigPersistenceError(error, rollbackError);
+    }
+    throw error;
+  }
   return {
-    configPath: writeGlobalConfig({ ...input, apiKeyEnv }),
-    schedulerEnvPath: writeSchedulerEnv(apiKeyEnv, input.apiKey),
+    ...paths,
+    rollback,
+    rollbackSchedulerEnv,
   };
 }
 

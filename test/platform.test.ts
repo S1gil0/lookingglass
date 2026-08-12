@@ -16,6 +16,8 @@ test("preserves XDG overrides and POSIX defaults", () => {
   const home = "/test-home";
   assert.equal(configDir("linux", {}, home), posix.join(home, ".config", "looking-glass"));
   assert.equal(dataDir("linux", {}, home), posix.join(home, ".local", "share", "looking-glass"));
+  assert.equal(configDir("darwin", {}, home), posix.join(home, ".config", "looking-glass"));
+  assert.equal(dataDir("darwin", {}, home), posix.join(home, ".local", "share", "looking-glass"));
   assert.equal(configDir("linux", { APPDATA: "/appdata" }, home), posix.join(home, ".config", "looking-glass"));
   assert.equal(dataDir("linux", { LOCALAPPDATA: "/localappdata" }, home), posix.join(home, ".local", "share", "looking-glass"));
   assert.equal(
@@ -51,4 +53,5 @@ test("resolves Windows database overrides without requiring Windows", () => {
 test("only POSIX platforms enforce mode-bit permissions", () => {
   assert.equal(shouldEnforcePosixPermissions("win32"), false);
   assert.equal(shouldEnforcePosixPermissions("linux"), true);
+  assert.equal(shouldEnforcePosixPermissions("darwin"), true);
 });

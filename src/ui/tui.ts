@@ -28,7 +28,7 @@ import {
   type SlashCommand,
 } from "@earendil-works/pi-tui";
 import type { LookingGlassApp } from "../app.js";
-import { defaultApiKeyEnv, defaultProtocol, persistGatewayConfig, writeSchedulerEnv } from "../config.js";
+import { defaultApiKeyEnv, defaultProtocol, persistGatewayConfig } from "../config.js";
 import { CodexLbClient } from "../model/codex-lb.js";
 import type {
   EngineCallbacks,
@@ -50,6 +50,7 @@ import type {
   SessionRecord,
 } from "../types.js";
 import { ModalArbiter, type ModalPresentation } from "./modal-arbiter.js";
+import { enableWindowsVirtualTerminalInput } from "./windows-console.js";
 import {
   prepareQueuedValue,
   SubmissionQueue,
@@ -188,7 +189,7 @@ function displaySafe(text: string): string {
   return text
     .replace(/\r\n?/g, "\n")
     .replace(/\t/g, "    ")
-    .replace(/[\x00-\x08\x0b-\x1f\x7f]/g, (character) => {
+    .replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, (character) => {
       return `\\x${character.charCodeAt(0).toString(16).padStart(2, "0")}`;
     });
 }
@@ -197,9 +198,25 @@ function operationStatus(text: string): string {
   return displaySafe(text).replaceAll("Press Ctrl+C to stop.", "Press Esc twice to stop.");
 }
 
+function truncatePlainText(text: string, width: number, ellipsis = "..."): string {
+  const safeWidth = Math.max(0, Math.floor(width));
+  if (visibleWidth(text) <= safeWidth) return text;
+  const suffix = safeWidth >= visibleWidth(ellipsis) ? ellipsis : ".".repeat(safeWidth);
+  const contentWidth = Math.max(0, safeWidth - visibleWidth(suffix));
+  let output = "";
+  let used = 0;
+  for (const { segment } of graphemeSegmenter.segment(text)) {
+    const segmentWidth = visibleWidth(segment);
+    if (used + segmentWidth > contentWidth) break;
+    output += segment;
+    used += segmentWidth;
+  }
+  return output + suffix;
+}
+
 function oneLine(text: string, limit = MAX_TOOL_PREVIEW): string {
   const compact = displaySafe(text).replace(/\s+/g, " ").trim();
-  return compact.length > limit ? `${compact.slice(0, Math.max(0, limit - 3))}...` : compact;
+  return truncatePlainText(compact, limit);
 }
 
 export function formatTokenCount(inputTokens: number | null | undefined): string | null {
@@ -284,10 +301,10 @@ export function sessionMetadataLine(
   startup = false,
 ): string {
   const narrow = Number.isFinite(width) && width < 100;
-  const modelInfo = `${session.model} (${session.reasoningEffort})`;
+  const modelInfo = `${session.provider}:${session.model} (${session.reasoningEffort})`;
   const middle = [
     session.agentsEnabled
-      ? `agent: ${session.agentModel} (${session.agentReasoningEffort})`
+      ? `agent: ${session.agentProvider}:${session.agentModel} (${session.agentReasoningEffort})`
       : "agent: off",
     ...(!startup ? [contextUsage] : []),
     approval,
@@ -296,22 +313,24 @@ export function sessionMetadataLine(
   if (startup) {
     const separators = 3 * middle.length;
     const modelWidth = Number.isFinite(width)
-      ? Math.max(4, Math.floor(width) - middle.reduce((sum, value) => sum + value.length, 0) - separators)
-      : modelInfo.length;
+      ? Math.max(4, Math.floor(width) - middle.reduce((sum, value) => sum + visibleWidth(value), 0) - separators)
+      : visibleWidth(modelInfo);
     return [oneLine(modelInfo, modelWidth), ...middle].join(" | ");
   }
   const separators = 3 * (middle.length + 1);
   const available = Number.isFinite(width)
-    ? Math.max(8, Math.floor(width) - middle.reduce((sum, value) => sum + value.length, 0) - separators)
-    : modelInfo.length + session.title.length;
+    ? Math.max(8, Math.floor(width) - middle.reduce((sum, value) => sum + visibleWidth(value), 0) - separators)
+    : visibleWidth(modelInfo) + visibleWidth(session.title);
   let modelWidth = Math.max(4, Math.floor(available * 0.6));
   let titleWidth = Math.max(4, available - modelWidth);
-  if (modelInfo.length < modelWidth) {
-    titleWidth += modelWidth - modelInfo.length;
-    modelWidth = modelInfo.length;
-  } else if (session.title.length < titleWidth) {
-    modelWidth += titleWidth - session.title.length;
-    titleWidth = session.title.length;
+  const modelInfoWidth = visibleWidth(modelInfo);
+  const titleInfoWidth = visibleWidth(session.title);
+  if (modelInfoWidth < modelWidth) {
+    titleWidth += modelWidth - modelInfoWidth;
+    modelWidth = modelInfoWidth;
+  } else if (titleInfoWidth < titleWidth) {
+    modelWidth += titleWidth - titleInfoWidth;
+    titleWidth = titleInfoWidth;
   }
   return [
     oneLine(modelInfo, modelWidth),
@@ -465,7 +484,7 @@ class AlternateScreenTerminal extends ProcessTerminal {
 
     let command: string | undefined;
     let args: string[] = [];
-    if (platform() === "darwin") command = "pbcopy";
+    if (platform() === "darwin") command = "/usr/bin/pbcopy";
     else if (platform() === "win32") command = windowsSystemExecutable("clip.exe");
     else if (process.env.WAYLAND_DISPLAY) command = "wl-copy";
     else if (process.env.DISPLAY) {
@@ -484,8 +503,11 @@ class AlternateScreenTerminal extends ProcessTerminal {
     try {
       super.start(onInput, onResize);
       this.active = true;
-      this.write("\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[2J\x1b[H");
+      // pi-tui's optional native helper is not present in every package build.
+      // Keep mouse and modified-key VT input functional through a safe fallback.
+      enableWindowsVirtualTerminalInput();
       this.alternate = true;
+      this.write("\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[2J\x1b[H");
     } catch (error) {
       try {
         super.stop();
@@ -669,11 +691,9 @@ export function renderStartupScreen(
     safeWidth,
     Math.max(1, Math.floor(options.panelWidth ?? startupPanelWidth(safeWidth))),
   );
-  const art = safeWidth >= 50
-    ? startupWideMark
-    : safeWidth >= 37
-      ? startupDenseMark
-      : startupCompactMark;
+  const art = [startupWideMark, startupDenseMark, startupCompactMark]
+    .find((candidate) => candidate.every((line) => visibleWidth(line) <= safeWidth))
+    ?? startupCompactMark;
   const artLines = [
     ...art.map((line) => centerAnsiLine(bold(startupGradientLine(line)), safeWidth)),
     "",
@@ -1836,17 +1856,19 @@ export function parseSessionSchedule(argument: string): ParsedSessionSchedule {
 }
 
 export function parseTerminalMouse(data: string): TerminalMouseEvent | null {
-  const match = /^\x1b\[<(\d+);(\d+);(\d+)([mM])$/.exec(data);
-  if (!match?.[1] || !match[2] || !match[3] || !match[4]) return null;
-  const code = Number(match[1]);
-  const column = Math.max(0, Number(match[2]) - 1);
-  const row = Math.max(0, Number(match[3]) - 1);
+  const sgr = /^\x1b\[<(\d+);(\d+);(\d+)([mM])$/.exec(data);
+  const legacy = /^\x1b\[M([\s\S])([\s\S])([\s\S])$/.exec(data);
+  if (!sgr && !legacy) return null;
+  const code = sgr ? Number(sgr[1]) : legacy![1]!.charCodeAt(0) - 32;
+  const column = sgr ? Number(sgr[2]) - 1 : legacy![2]!.charCodeAt(0) - 33;
+  const row = sgr ? Number(sgr[3]) - 1 : legacy![3]!.charCodeAt(0) - 33;
+  if (![code, column, row].every(Number.isSafeInteger) || code < 0 || column < 0 || row < 0) return null;
   const button = code & 3;
   const motion = (code & 32) !== 0;
   const wheel = (code & 64) !== 0;
   const action = wheel
     ? (["wheel_up", "wheel_down", "wheel_left", "wheel_right"] as const)[button]!
-    : match[4] === "m" || button === 3
+    : sgr?.[4] === "m" || button === 3
       ? "release"
       : motion
         ? "drag"
@@ -2470,7 +2492,7 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
     if (models.length > 0) {
       const selected = await selectValue("Model", models.map((model) => ({
         value: model.id,
-        label: model.name,
+        label: `[${provider}] ${model.name}`,
         description: `${model.id} | context ${model.contextWindow.toLocaleString()}`,
       })), "Select a model for responses and agents.");
       if (!selected || stopping) return;
@@ -2485,7 +2507,7 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
     }
     signal.throwIfAborted();
 
-    persistGatewayConfig({
+    const persisted = persistGatewayConfig({
       provider,
       protocol,
       baseURL,
@@ -2494,14 +2516,6 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
       apiKey,
     });
     const apiKeyBeforeReload = process.env[apiKeyEnv];
-    const restorePersistedApiKey = (): void => {
-      try {
-        writeSchedulerEnv(apiKeyEnv, apiKeyBeforeReload ?? "");
-      } catch {
-        // Preserve the original configuration error; the next /config retry
-        // can repair the environment file if its write failed.
-      }
-    };
     // loadEnvironmentFile does not overwrite an already-exported variable.
     // Update the current process too, so the newly configured client is used
     // immediately rather than only after restarting the CLI.
@@ -2516,8 +2530,24 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
       // The new key is only valid for the configuration that was just saved.
       // Do not leave it exported when reload failed before that configuration
       // became effective.
-      restorePersistedApiKey();
+      const rollbackErrors: unknown[] = [];
+      try {
+        persisted.rollback();
+      } catch (rollbackError) {
+        rollbackErrors.push(rollbackError);
+      }
       restoreApiKeyEnvironment(apiKeyEnv, apiKeyBeforeReload);
+      try {
+        app.reloadConfig();
+      } catch (reloadError) {
+        rollbackErrors.push(reloadError);
+      }
+      if (rollbackErrors.length > 0) {
+        throw new AggregateError(
+          [error, ...rollbackErrors],
+          "Gateway setup failed and restoring the previous configuration was incomplete",
+        );
+      }
       throw error;
     }
     const persistedModel = modelId === "unconfigured" ? null : modelId;
@@ -2528,8 +2558,25 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
       && effectiveGateway.apiKeyEnv === apiKeyEnv;
     if (!gatewayMatches || app.config.model !== persistedModel) {
       if (!gatewayMatches) {
-        restorePersistedApiKey();
+        const cleanupErrors: unknown[] = [];
+        try {
+          persisted.rollbackSchedulerEnv();
+        } catch (cleanupError) {
+          cleanupErrors.push(cleanupError);
+        }
         restoreApiKeyEnvironment(apiKeyEnv, apiKeyBeforeReload);
+        try {
+          app.reloadConfig();
+          if (app.configurationError) cleanupErrors.push(app.configurationError);
+        } catch (reloadError) {
+          cleanupErrors.push(reloadError);
+        }
+        if (cleanupErrors.length > 0) {
+          throw new AggregateError(
+            cleanupErrors,
+            "Global settings were saved, but restoring the active overridden gateway was incomplete",
+          );
+        }
       }
       // Workspace or explicit config has higher precedence than the global
       // file written above. Do not attach a model to a provider that the
@@ -2754,7 +2801,7 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
       { value: "rename", label: "Rename session", description: session.title },
       { value: "schedules", label: "Manage schedules", description: `${jobs.length} attached` },
       { value: "approvals", label: "Manage always approvals", description: `${approvals.length} registered` },
-    ], `${session.id}\n${session.model}`);
+    ], `${session.id}\n${session.provider}:${session.model}`);
     if (!action || stopping) return;
     if (action === "persist") setPersistence(!session.persistent);
     else if (action === "schedules") await showCronBrowser(true);
@@ -2775,7 +2822,7 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
       const selected = await selectValue("Sessions", sessions.map((item) => ({
         value: item.id,
         label: `${item.persistent ? "[persistent] " : ""}${item.title}`,
-        description: `${app.scheduler.listJobsForSession(item.id).length} schedules | ${item.model} | ${new Date(item.updatedAt).toISOString()} | ${item.id.slice(0, 8)}`,
+        description: `${app.scheduler.listJobsForSession(item.id).length} schedules | ${item.provider}:${item.model} | ${new Date(item.updatedAt).toISOString()} | ${item.id.slice(0, 8)}`,
       })), "Enter switches session. Delete/Supr removes the highlighted session.", { deletable: true });
       if (!selected || stopping) return;
       if (!selected.startsWith(DELETE_SELECTION_PREFIX)) {

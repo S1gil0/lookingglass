@@ -235,6 +235,67 @@ test("writeGlobalConfig rejects gateway URL query and fragment credentials", () 
   }
 });
 
+test("persistGatewayConfig restores both files when scheduler credential validation fails", () => {
+  const root = mkdtempSync(join(tmpdir(), "looking-glass-config-transaction-failure-"));
+  const previousConfigHome = process.env.XDG_CONFIG_HOME;
+  try {
+    process.env.XDG_CONFIG_HOME = root;
+    const configDirectory = join(root, "looking-glass");
+    mkdirSync(configDirectory, { recursive: true, mode: 0o700 });
+    const configPath = join(configDirectory, "config.json");
+    const envPath = join(configDirectory, "scheduler.env");
+    const previousConfig = '{"gateway":{"provider":"codex-lb","baseURL":"http://127.0.0.1:2455/v1"}}\n';
+    const previousEnv = "LOOKING_GLASS_TRANSACTION_KEY=preserved-value\n";
+    writeFileSync(configPath, previousConfig, "utf8");
+    writeFileSync(envPath, previousEnv, "utf8");
+
+    assert.throws(() => persistGatewayConfig({
+      provider: "custom",
+      baseURL: "https://new.example/v1",
+      apiKey: "new\nvalue",
+    }));
+    assert.equal(readFileSync(configPath, "utf8"), previousConfig);
+    assert.equal(readFileSync(envPath, "utf8"), previousEnv);
+  } finally {
+    if (previousConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = previousConfigHome;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("persistGatewayConfig rollback restores exact config and environment bytes", () => {
+  const root = mkdtempSync(join(tmpdir(), "looking-glass-config-transaction-rollback-"));
+  const previousConfigHome = process.env.XDG_CONFIG_HOME;
+  try {
+    process.env.XDG_CONFIG_HOME = root;
+    const configDirectory = join(root, "looking-glass");
+    mkdirSync(configDirectory, { recursive: true, mode: 0o700 });
+    const configPath = join(configDirectory, "config.json");
+    const envPath = join(configDirectory, "scheduler.env");
+    const previousConfig = '{\n  "gateway": { "provider": "codex-lb", "baseURL": "http://127.0.0.1:2455/v1" }\n}\n';
+    const previousEnv = "OTHER_KEY=keep\nCODEX_LB_API_KEY=old-value\n";
+    writeFileSync(configPath, previousConfig, "utf8");
+    writeFileSync(envPath, previousEnv, "utf8");
+
+    const transaction = persistGatewayConfig({
+      provider: "custom",
+      baseURL: "https://new.example/v1",
+      apiKey: "new-value",
+    });
+    transaction.rollbackSchedulerEnv();
+    assert.notEqual(readFileSync(configPath, "utf8"), previousConfig);
+    assert.equal(readFileSync(envPath, "utf8"), previousEnv);
+    transaction.rollback();
+    transaction.rollback();
+    assert.equal(readFileSync(configPath, "utf8"), previousConfig);
+    assert.equal(readFileSync(envPath, "utf8"), previousEnv);
+  } finally {
+    if (previousConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = previousConfigHome;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("writeSchedulerEnv removes duplicate assignments and rejects control characters", () => {
   const root = mkdtempSync(join(tmpdir(), "looking-glass-env-write-"));
   const previousConfigHome = process.env.XDG_CONFIG_HOME;

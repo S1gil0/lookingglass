@@ -350,6 +350,15 @@ test("startup logo renders the neon block wordmark without separate subtext", ()
   }
 });
 
+test("startup chooses only logo variants that fit the terminal width", () => {
+  const narrow = renderStartupScreen(37, 20, [], { inputEmpty: false }).map(stripVTControlCharacters);
+  const dense = renderStartupScreen(38, 20, [], { inputEmpty: false }).map(stripVTControlCharacters);
+  assert.equal(narrow.filter((line) => line.includes("█")).length, 8);
+  assert.equal(dense.filter((line) => line.includes("█")).length, 4);
+  assert.ok(narrow.every((line) => visibleWidth(line) <= 37));
+  assert.ok(dense.every((line) => visibleWidth(line) <= 38));
+});
+
 test("startup truncation keeps the latest notice label before its tail", () => {
   const width = 40;
   const panelWidth = startupPanelWidth(width);
@@ -442,7 +451,7 @@ test("restores or clears the TUI API key environment snapshot", () => {
   }
 });
 
-test("recognizes SGR mouse wheel events", () => {
+test("recognizes SGR and legacy mouse events", () => {
   assert.equal(mouseWheelDelta("\x1b[<64;10;20M"), 3);
   assert.equal(mouseWheelDelta("\x1b[<65;10;20M"), -3);
   assert.equal(mouseWheelDelta("ordinary input"), 0);
@@ -453,6 +462,16 @@ test("recognizes SGR mouse wheel events", () => {
   assert.equal(parseTerminalMouse("\x1b[<0;4;5m")?.action, "release");
   assert.equal(parseTerminalMouse("\x1b[<66;4;5M")?.action, "wheel_left");
   assert.equal(mouseWheelDelta("\x1b[<66;4;5M"), 0);
+  assert.deepEqual(parseTerminalMouse("\x1b[M" + String.fromCharCode(32, 34, 35)), {
+    action: "press", button: 0, column: 1, row: 2, shift: false, alt: false, ctrl: false,
+  });
+  assert.deepEqual(parseTerminalMouse("\x1b[M" + String.fromCharCode(32, 33, 33)), {
+    action: "press", button: 0, column: 0, row: 0, shift: false, alt: false, ctrl: false,
+  });
+  assert.equal(parseTerminalMouse("\x1b[M" + String.fromCharCode(35, 34, 35))?.action, "release");
+  assert.equal(parseTerminalMouse("\x1b[M" + String.fromCharCode(96, 34, 35))?.action, "wheel_up");
+  assert.equal(parseTerminalMouse("\x1b[M" + String.fromCharCode(97, 34, 35))?.action, "wheel_down");
+  assert.equal(parseTerminalMouse("\x1b[M" + String.fromCharCode(32, 31, 35)), null);
   assert.equal(parseTerminalMouse(`pasted\x1b[<0;4;5Mtext`), null);
 });
 
@@ -504,6 +523,10 @@ test("scopes automatic session inbox notices and includes session titles", () =>
 
 test("strips terminal control sequences from model-controlled stdio text", () => {
   assert.equal(terminalSafe("safe\x1b[2Jforged\r\nnext"), "safe[2Jforged\nnext");
+  const rendered = new AssistantMessage("safe\u0085next\u009bforged").render(80)
+    .map(stripVTControlCharacters)
+    .join("\n");
+  assert.match(rendered, /safe\\x85next\\x9bforged/);
 });
 
 test("renders activity separately from ordered session metadata", () => {
@@ -530,7 +553,7 @@ test("renders activity separately from ordered session metadata", () => {
     createdAt: 1,
     updatedAt: 1,
   }, "unrestricted", "ctx:42%/1.2k");
-  assert.equal(metadata, "coordinator-model (medium) | agent: worker-model (high) | ctx:42%/1.2k | unrestricted | persist:on | Session name");
+  assert.equal(metadata, "lm-studio:coordinator-model (medium) | agent: codex-lb:worker-model (high) | ctx:42%/1.2k | unrestricted | persist:on | Session name");
   const narrow = sessionMetadataLine({
     id: "session",
     workspace: "/tmp",
@@ -554,9 +577,9 @@ test("renders activity separately from ordered session metadata", () => {
     createdAt: 1,
     updatedAt: 1,
   }, "unrestricted", "ctx:42%/1.2k", 79);
-  assert.match(narrow, /^coordinator-mode\.\.\. \| agent: off \| ctx:42%\/1.2k \| unrestricted \| A/);
+  assert.match(narrow, /^lm-studio:coordi\.\.\. \| agent: off \| ctx:42%\/1.2k \| unrestricted \| A/);
   assert.doesNotMatch(narrow, /(?:^|\| )p(?:ersist)?:/);
-  assert.ok(narrow.length <= 79);
+  assert.ok(visibleWidth(narrow) <= 79);
   const startup = sessionMetadataLine({
     id: "session",
     workspace: "/tmp",
@@ -580,8 +603,33 @@ test("renders activity separately from ordered session metadata", () => {
     createdAt: 1,
     updatedAt: 1,
   }, "unrestricted", "ctx:?", 62, true);
-  assert.equal(startup, "coordinator-model (medium) | agent: off | unrestricted");
+  assert.equal(startup, "lm-studio:coordinator-model (me... | agent: off | unrestricted");
   assert.doesNotMatch(startup, /ctx:|New session/);
+  const wideMetadata = sessionMetadataLine({
+    id: "wide",
+    workspace: "/tmp",
+    provider: "lm-studio",
+    agentProvider: "codex-lb",
+    title: "界面 🚀 session",
+    model: "模型🚀coordinator",
+    agentModel: "worker",
+    reasoningEffort: "medium",
+    agentReasoningEffort: "high",
+    agentsEnabled: false,
+    verbosity: "low",
+    fast: false,
+    approvalMode: "code",
+    showReasoning: true,
+    persistent: false,
+    promptCacheKey: "cache",
+    lastResponseId: null,
+    kind: "interactive",
+    parentSessionId: null,
+    createdAt: 1,
+    updatedAt: 1,
+  }, "code", "ctx:?", 48);
+  assert.ok(visibleWidth(wideMetadata) <= 48);
+  assert.doesNotMatch(wideMetadata, /[\uD800-\uDFFF]/u);
   assert.equal(formatTokenCount(512), "512");
   assert.equal(formatTokenCount(1_000), "1k");
   assert.equal(formatTokenCount(1_200), "1.2k");
