@@ -326,6 +326,90 @@ test("codex-lb falls back to bounded semantic Responses checkpoints only for inp
   assert.equal(responseBodies.length, responseCountBeforeOtherError);
 });
 
+test("codex-lb falls back to semantic compaction when the native endpoint is unavailable", async (t) => {
+  let nativeRequests = 0;
+  let semanticRequests = 0;
+  const server = createServer((req, response) => {
+    let raw = "";
+    req.on("data", (chunk) => { raw += chunk; });
+    req.on("end", () => {
+      JSON.parse(raw) as Record<string, unknown>;
+      if (req.url === "/v1/responses/compact") {
+        nativeRequests += 1;
+        response.writeHead(404, { "content-type": "text/plain" });
+        response.end("Not Found");
+        return;
+      }
+      semanticRequests += 1;
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({
+        id: "fallback_endpoint_missing",
+        output: [{
+          id: "fallback_endpoint_missing_message",
+          type: "message",
+          role: "assistant",
+          status: "completed",
+          content: [{ type: "output_text", text: "durable fallback checkpoint" }],
+        }],
+      }));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.gateway.provider = "codex-lb";
+  config.gateway.baseURL = `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1`;
+
+  const compacted = await new CodexLbClient(config).compact({
+    model: request.model,
+    instructions: request.instructions,
+    input: request.input,
+    promptCacheKey: request.promptCacheKey,
+    fast: request.fast,
+  });
+
+  assert.equal(nativeRequests, 1);
+  assert.equal(semanticRequests, 1);
+  assert.equal(compacted.id, "compact_semantic_fallback");
+  assert.match(JSON.stringify(compacted.output), /durable fallback checkpoint/);
+});
+
+test("codex-lb does not drop a native checkpoint when semantic fallback is unavailable", async (t) => {
+  let nativeRequests = 0;
+  let semanticRequests = 0;
+  const server = createServer((req, response) => {
+    req.resume();
+    req.on("end", () => {
+      if (req.url === "/v1/responses/compact") {
+        nativeRequests += 1;
+        response.writeHead(404, { "content-type": "text/plain" });
+        response.end("Not Found");
+        return;
+      }
+      semanticRequests += 1;
+      response.writeHead(500).end();
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.gateway.provider = "codex-lb";
+  config.gateway.baseURL = `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1`;
+
+  await assert.rejects(() => new CodexLbClient(config).compact({
+    model: request.model,
+    instructions: request.instructions,
+    input: [{ type: "compaction", encrypted_content: "native-state" }] as ResponseInputItem[],
+    promptCacheKey: request.promptCacheKey,
+    fast: request.fast,
+  }), (error: unknown) => {
+    assert.equal((error as { status?: number }).status, 404);
+    return true;
+  });
+  assert.equal(nativeRequests, 1);
+  assert.equal(semanticRequests, 0);
+});
+
 test("codex-lb semantic fallback normalizes patch calls without changing portable replay", async (t) => {
   const responseBodies: Record<string, unknown>[] = [];
   const server = createServer((req, response) => {

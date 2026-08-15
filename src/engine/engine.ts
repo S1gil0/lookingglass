@@ -7,7 +7,7 @@ import { randomUUID } from "node:crypto";
 import type { CodexLbClient } from "../model/codex-lb.js";
 import { isStaleResponseError, requiresPortableCodexReplay } from "../model/codex-lb.js";
 import type { ArtifactStore } from "../storage/artifact-store.js";
-import type { OperationLeaseState, SessionStore } from "../storage/session-store.js";
+import { isPortableCheckpoint, type OperationLeaseState, type SessionStore } from "../storage/session-store.js";
 import type { GatewayProvider, GlassConfig, ModelInfo, SessionRecord } from "../types.js";
 import type { SessionPromptReservation } from "../scheduler/types.js";
 import type { ApprovalDecision, ApprovalRequest, QuestionRequest, ToolContext, ToolResult } from "../tools/types.js";
@@ -430,6 +430,15 @@ export class ConversationEngine {
     const session = this.requireSession(sessionId);
     const client = this.clientFor(session.provider);
     const secrets = configuredCredentialValues(this.config);
+    let compacted = false;
+    const existingCheckpoint = this.store.latestCheckpoint(sessionId);
+    if (client.supportsResponseContinuity?.() === false
+      && existingCheckpoint
+      && !isPortableCheckpoint(existingCheckpoint.compact)) {
+      options.callbacks?.onStatus?.("Converting migrated conversation context");
+      await this.compactLocked(sessionId, options, executionToken, metrics);
+      compacted = true;
+    }
     const firstInput = userItem(text);
     const storedText = redactSensitiveText(text, secrets);
     if (!this.store.appendUserAndSetTitleFenced<StoredUserPayload>(
@@ -443,9 +452,15 @@ export class ConversationEngine {
     let pendingInput: ResponseInputItem[] = previousResponseId
       ? [firstInput]
       : projectContext(this.store, sessionId).input;
+    if (previousResponseId === undefined
+      && client.supportsResponseContinuity?.() === false
+      && this.estimatedRequestTokens(session, pendingInput) >= this.compactionThresholdTokens(options.modelInfo)) {
+      await this.compactLocked(sessionId, options, executionToken, metrics);
+      compacted = true;
+      pendingInput = projectContext(this.store, sessionId).input;
+    }
     let response: Response | null = null;
     let toolCallCount = 0;
-    let compacted = false;
 
     try {
       for (let round = 0; round < this.config.tools.maxToolRounds; round += 1) {
@@ -493,7 +508,9 @@ export class ConversationEngine {
         if (calls.length === 0 || response.status === "incomplete" || response.status === "failed") {
           if (calls.length === 0 && response.status !== "incomplete" && response.status !== "failed" && session.kind !== "agent") {
             try {
-              compacted = await this.autoCompact(sessionId, response, options.modelInfo, options, executionToken, metrics)
+              compacted = await this.autoCompact(
+                sessionId, response, options.modelInfo, request.unanchored, options, executionToken, metrics,
+              )
                 || compacted;
             } catch (error) {
               if (options.signal.aborted) throw error;
@@ -513,7 +530,7 @@ export class ConversationEngine {
         toolCallCount += calls.length;
         metrics.toolCalls += calls.length;
         const outputs = await this.executeCalls(sessionId, calls, options, executionToken, metrics);
-        if (await this.shouldCompact(sessionId, response, options.modelInfo)) {
+        if (await this.shouldCompact(sessionId, response, options.modelInfo, request.unanchored)) {
           await this.compactLocked(sessionId, options, executionToken, metrics);
           compacted = true;
           pendingInput = projectContext(this.store, sessionId).input;
@@ -558,8 +575,21 @@ export class ConversationEngine {
     essential = true,
   ): Promise<void> {
     const session = this.requireSession(sessionId);
-    const context = projectContext(this.store, sessionId);
-    if (context.input.length === 0) return;
+    const client = this.clientFor(session.provider);
+    const checkpoint = this.store.latestCheckpoint(sessionId);
+    const portableRequired = client.supportsResponseContinuity?.() === false;
+    let context = portableRequired && checkpoint && !isPortableCheckpoint(checkpoint.compact)
+      ? projectContext(this.store, sessionId, { ignoreCheckpoint: true })
+      : projectContext(this.store, sessionId);
+    let reconstructedFullHistory = portableRequired && checkpoint !== null && !isPortableCheckpoint(checkpoint.compact);
+    if (context.input.length === 0) {
+      if (portableRequired && checkpoint && !isPortableCheckpoint(checkpoint.compact)) {
+        throw Object.assign(new Error("Native checkpoint cannot be converted because no semantic history is available"), {
+          code: "checkpoint_conversion_unavailable",
+        });
+      }
+      return;
+    }
     const retryBudget = createRetryBudget(options.automated
       ? {
           maxAttempts: this.config.automation.providerRetryMaxAttempts,
@@ -578,7 +608,7 @@ export class ConversationEngine {
         const attempt = markRetryAttempt(retryBudget);
         options.callbacks?.onStatus?.("Compacting context");
         try {
-          compact = await this.clientFor(session.provider).compact({
+          compact = await client.compact({
             model: session.model,
             instructions: this.instructionsFor(session),
             input: context.input,
@@ -594,6 +624,21 @@ export class ConversationEngine {
           if (options.signal.aborted) throw options.signal.reason ?? error;
           if (budgetSignal.signal.aborted) throw retryBudgetError(retryBudget);
           if (isStoreLeaseLoss(error) || errorCode(error) === "session_operation_lease_lost") throw error;
+          const status = error && typeof error === "object" && typeof (error as { status?: unknown }).status === "number"
+            ? (error as { status: number }).status
+            : null;
+          const needsNativeHistoryFallback = session.provider === "codex-lb"
+            && !reconstructedFullHistory
+            && context.input.some((item) => item.type === "compaction")
+            && (status === 404 || errorCode(error) === "responses_compact_input_too_large");
+          if (needsNativeHistoryFallback) {
+            context = projectContext(this.store, sessionId, { ignoreCheckpoint: true });
+            if (context.input.length === 0) throw error;
+            reconstructedFullHistory = true;
+            if (metrics) metrics.providerRetries += 1;
+            options.callbacks?.onStatus?.("Recovering native checkpoint from full history");
+            continue;
+          }
           if (!isTransientProviderError(error)) throw error;
           if (!essential) throw error;
           if (!retryBudgetCanRetry(retryBudget)) throw retryBudgetError(retryBudget);
@@ -605,6 +650,11 @@ export class ConversationEngine {
     } finally {
       budgetSignal.dispose();
     }
+    if (portableRequired && !isPortableCheckpoint(compact)) {
+      throw Object.assign(new Error("Stateless provider compaction did not return a portable text checkpoint"), {
+        code: "nonportable_compaction",
+      });
+    }
     const usage = compact.usage;
     const inputTokens = usage && typeof usage === "object" && !Array.isArray(usage)
       && typeof (usage as Record<string, unknown>).input_tokens === "number"
@@ -612,6 +662,7 @@ export class ConversationEngine {
       : null;
     if (!this.store.saveCheckpointAndResetContinuityFenced(
       sessionId, executionToken, context.latestSequence, compact, inputTokens,
+      portableRequired || reconstructedFullHistory,
     )) {
       throw this.operationLeaseError(sessionId, executionToken, "saving compacted context");
     }
@@ -647,7 +698,7 @@ export class ConversationEngine {
     options: TurnOptions,
     executionToken: string,
     metrics: TurnMetricsState,
-  ): Promise<{ response: Response; compacted: boolean }> {
+  ): Promise<{ response: Response; compacted: boolean; unanchored: boolean }> {
     let currentSession = session;
     let currentInput = input;
     let currentPreviousResponseId = previousResponseId;
@@ -726,7 +777,7 @@ export class ConversationEngine {
           const streamed = await streamAttempt();
           budgetSignal.signal.throwIfAborted();
           if (retryBudgetExpired(retryBudget)) throw retryBudgetError(retryBudget);
-          return { response: streamed, compacted };
+          return { response: streamed, compacted, unanchored: currentPreviousResponseId === undefined };
         } catch (error) {
           if (options.signal.aborted) throw options.signal.reason ?? error;
           if (budgetSignal.signal.aborted) throw retryBudgetError(retryBudget);
@@ -1027,7 +1078,6 @@ export class ConversationEngine {
     const payload = {
       name: call.name,
       callId: call.call_id,
-      output,
       ...(result?.artifactUri ? { artifactUri: result.artifactUri } : {}),
       ...(result?.truncated ? { truncated: true } : {}),
     };
@@ -1071,30 +1121,35 @@ export class ConversationEngine {
     sessionId: string,
     response: Response,
     model: ModelInfo,
+    requestWasUnanchored: boolean,
     options: TurnOptions,
     executionToken: string,
     metrics: TurnMetricsState,
   ): Promise<boolean> {
-    if (!await this.shouldCompact(sessionId, response, model)) return false;
+    if (!await this.shouldCompact(sessionId, response, model, requestWasUnanchored)) return false;
     await this.compactLocked(sessionId, options, executionToken, metrics, false);
     return true;
   }
 
-  private async shouldCompact(sessionId: string, response: Response, model: ModelInfo): Promise<boolean> {
+  private async shouldCompact(
+    sessionId: string,
+    response: Response,
+    model: ModelInfo,
+    requestWasUnanchored: boolean,
+  ): Promise<boolean> {
     const checkpointSequence = this.store.latestCheckpoint(sessionId)?.throughSequence ?? 0;
     const semanticGrowth = this.store.semanticEventCount(sessionId, checkpointSequence);
-    const usableTokens = this.usableContextTokens(model);
-    const threshold = usableTokens * 0.8;
     const providerTokens = response.usage?.input_tokens ?? 0;
     const session = this.requireSession(sessionId);
-    const estimatedTokens = this.estimatedRequestTokens(session, projectContext(this.store, sessionId).input);
-    if (providerTokens > 0) {
-      const providerTruncatedReplay = this.clientFor(session.provider)
-        .supportsResponseContinuity?.() === false
-        && estimatedTokens >= usableTokens;
-      return semanticGrowth >= 2 && (providerTokens >= threshold || providerTruncatedReplay);
-    }
-    return estimatedTokens >= usableTokens;
+    const estimatedTokens = requestWasUnanchored
+      ? this.estimatedRequestTokens(session, projectContext(this.store, sessionId).input)
+      : 0;
+    return semanticGrowth >= 2
+      && Math.max(providerTokens, estimatedTokens) >= this.compactionThresholdTokens(model);
+  }
+
+  private compactionThresholdTokens(model: ModelInfo): number {
+    return this.usableContextTokens(model) * 0.8;
   }
 
   private usableContextTokens(model: ModelInfo): number {

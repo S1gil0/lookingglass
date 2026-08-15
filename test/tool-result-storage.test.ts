@@ -115,7 +115,7 @@ test("legacy and compact tool-result payloads project the same function output",
   assert.deepEqual(projectContext(sessions, compactSession.id).input, [item]);
 });
 
-test("new tool-result persistence omits the duplicated input item", async (t) => {
+test("new tool lifecycle events keep arguments and output only in the tool-call row", async (t) => {
   const { root, sessions, session, artifacts } = fixture(t);
   const read: GlassTool<Record<string, never>> = {
     name: "read_test",
@@ -167,8 +167,14 @@ test("new tool-result persistence omits the duplicated input item", async (t) =>
 
   const event = sessions.events(session.id).find((candidate) => candidate.kind === "tool_result");
   assert.ok(event);
-  assert.deepEqual(event.payload, { name: "read_test", callId: "call_read", output: "TOOL_OK" });
+  assert.deepEqual(event.payload, { name: "read_test", callId: "call_read" });
   assert.equal("item" in (event.payload as Record<string, unknown>), false);
+  assert.equal("output" in (event.payload as Record<string, unknown>), false);
+  const started = sessions.events(session.id).find((candidate) => candidate.kind === "tool_started");
+  assert.ok(started);
+  assert.deepEqual(started.payload, { name: "read_test", callId: "call_read" });
+  assert.equal("arguments" in (started.payload as Record<string, unknown>), false);
+  assert.deepEqual(sessions.getToolCall(session.id, "call_read")?.arguments, {});
   assert.equal(sessions.getToolCall(session.id, "call_read")?.output, "TOOL_OK");
   assert.deepEqual(projectContext(sessions, session.id).input.find((item) => item.type === "function_call_output"), {
     type: "function_call_output",

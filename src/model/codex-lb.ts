@@ -783,6 +783,12 @@ function isRetryableSemanticPartError(error: unknown): boolean {
   return isSemanticProtocolError(error) || isTransientProviderError(error);
 }
 
+function shouldUseCodexSemanticCompaction(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const detail = error as { code?: unknown; status?: unknown };
+  return detail.code === "responses_compact_input_too_large" || detail.status === 404;
+}
+
 function semanticPartRetryExhausted(error: unknown, context: ProviderErrorContext): Error {
   const exhausted = providerError({
     code: "compaction_part_retry_exhausted",
@@ -1942,9 +1948,10 @@ export class CodexLbClient {
       }
       return payload as Record<string, unknown>;
     } catch (error) {
-      if (error && typeof error === "object" && (error as { code?: unknown }).code === "responses_compact_input_too_large") {
+      if (shouldUseCodexSemanticCompaction(error)) {
         request.signal?.throwIfAborted();
         timeout.throwIfAborted();
+        if (request.input.some((item) => item.type === "compaction")) throw error;
         return this.codexSemanticCompact(request);
       }
       throw error;

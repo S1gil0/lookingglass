@@ -81,6 +81,18 @@ function response(id: string, text: string): Response {
   } as unknown as Response;
 }
 
+function portableCheckpoint(id: string, text: string, inputTokens = 100) {
+  return {
+    id,
+    output: [{
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text }],
+    }],
+    usage: { input_tokens: inputTokens },
+  };
+}
+
 const modelInfo: ModelInfo = {
   id: "test-model",
   name: "Test",
@@ -158,6 +170,30 @@ test("context replay strips SDK-only parsed fields and normalizes compact summar
   const context = projectContext(sessions, session.id);
   assert.deepEqual(context.input.map((item) => item.type ?? "message"), ["message", "compaction", "function_call"]);
   assert.doesNotMatch(JSON.stringify(context.input), /parsed(?:_arguments)?/);
+});
+
+test("context checkpoints stop before a trailing tool-start event", (t) => {
+  const { sessions, session } = fixture(t);
+  sessions.appendEvent<StoredUserPayload>(session.id, "user", { item: user("safe boundary") });
+  sessions.appendEvent<StoredResponsePayload>(session.id, "response", {
+    response: {
+      id: "tool-response",
+      status: "completed",
+      output: [{
+        id: "fc_boundary",
+        type: "function_call",
+        call_id: "call_boundary",
+        name: "read",
+        arguments: "{}",
+        status: "completed",
+      }],
+    },
+  });
+  sessions.appendEvent(session.id, "tool_started", { callId: "call_boundary", name: "read" });
+
+  const context = projectContext(sessions, session.id);
+  assert.equal(context.latestSequence, 2);
+  assert.deepEqual(context.input.map((item) => item.type ?? "message"), ["message", "function_call"]);
 });
 
 test("a turn without a response anchor replays prior semantic context", async (t) => {
@@ -242,13 +278,15 @@ test("stateless providers replay full context after tool calls", async (t) => {
   assert.match(JSON.stringify(requests[1]?.input), /TOOL_OK/);
 });
 
-test("OpenRouter compacts oversized local replay even when provider usage was truncated", async (t) => {
+test("OpenRouter proactively compacts estimated replay at the 80 percent threshold", async (t) => {
   const { root, sessions, session, artifacts } = fixture(t);
   sessions.updateSettings(session.id, { provider: "openrouter" });
   let compactions = 0;
+  const requests: ResponseRequest[] = [];
   const client = {
     supportsResponseContinuity: () => false,
-    async stream() {
+    async stream(request: ResponseRequest) {
+      requests.push(request);
       return {
         ...response("truncated-provider-view", "OK"),
         usage: { input_tokens: 100, output_tokens: 2, total_tokens: 102 },
@@ -256,18 +294,14 @@ test("OpenRouter compacts oversized local replay even when provider usage was tr
     },
     async compact() {
       compactions += 1;
-      return {
-        id: "compact_local_replay",
-        output: [{ type: "compaction_summary", encrypted_content: "bounded local replay" }],
-        usage: { input_tokens: 100 },
-      };
+      return portableCheckpoint("compact_local_replay", "bounded local replay");
     },
   } as unknown as CodexLbClient;
   const engine = new ConversationEngine(
     structuredClone(DEFAULT_CONFIG), root, sessions, artifacts, client, new ToolRegistry(), "instructions",
   );
 
-  const result = await engine.turn(session.id, "x".repeat(330_000), {
+  const result = await engine.turn(session.id, "x".repeat(260_000), {
     signal: new AbortController().signal,
     interaction: { approve: async () => "once", ask: async () => "" },
     modelInfo,
@@ -276,6 +310,9 @@ test("OpenRouter compacts oversized local replay even when provider usage was tr
   assert.equal(result.compacted, true);
   assert.equal(result.metrics?.compactions, 1);
   assert.equal(compactions, 1);
+  assert.equal(requests.length, 1);
+  assert.match(JSON.stringify(requests[0]?.input), /bounded local replay/);
+  assert.doesNotMatch(JSON.stringify(requests[0]?.input), /x{1000}/);
   assert.match(JSON.stringify(sessions.latestCheckpoint(session.id)?.compact), /bounded local replay/);
 });
 
@@ -342,6 +379,65 @@ test("high-usage tool rounds compact before the next model request", async (t) =
   assert.equal(requests.length, 2);
   assert.equal(requests[1]?.previousResponseId, undefined);
   assert.match(JSON.stringify(requests[1]?.input), /bounded checkpoint/);
+});
+
+test("stateless tool rounds compact when estimated replay crosses the 80 percent threshold", async (t) => {
+  const { root, sessions, session, artifacts } = fixture(t);
+  sessions.updateSettings(session.id, { provider: "openrouter" });
+  const read: GlassTool<Record<string, never>> = {
+    name: "large_read",
+    description: "large test read",
+    risk: "read",
+    parameters: { type: "object", properties: {}, required: [], additionalProperties: false },
+    summarize: () => "large read",
+    async execute() {
+      return { output: "z".repeat(100_000) };
+    },
+  };
+  const requests: ResponseRequest[] = [];
+  let compactions = 0;
+  const client = {
+    supportsResponseContinuity: () => false,
+    async stream(request: ResponseRequest) {
+      requests.push(request);
+      if (requests.length === 1) {
+        return {
+          ...response("large-tool", ""),
+          output: [{
+            id: "fc_large",
+            type: "function_call",
+            call_id: "call_large",
+            name: "large_read",
+            arguments: "{}",
+            status: "completed",
+          }],
+          output_text: "",
+          usage: { input_tokens: 100, output_tokens: 10, total_tokens: 110 },
+        } as unknown as Response;
+      }
+      return response("after-estimated-compact", "ESTIMATED_COMPACTED");
+    },
+    async compact() {
+      compactions += 1;
+      return portableCheckpoint("compact_estimated_tool", "estimated tool checkpoint");
+    },
+  } as unknown as CodexLbClient;
+  const engine = new ConversationEngine(
+    structuredClone(DEFAULT_CONFIG), root, sessions, artifacts, client,
+    new ToolRegistry().register(read), "instructions",
+  );
+
+  const result = await engine.turn(session.id, "use the large tool", {
+    signal: new AbortController().signal,
+    interaction: { approve: async () => "once", ask: async () => "" },
+    modelInfo: { ...modelInfo, contextWindow: 40_000 },
+  });
+
+  assert.equal(result.text, "ESTIMATED_COMPACTED");
+  assert.equal(compactions, 1);
+  assert.equal(requests.length, 2);
+  assert.match(JSON.stringify(requests[1]?.input), /estimated tool checkpoint/);
+  assert.doesNotMatch(JSON.stringify(requests[1]?.input), /z{1000}/);
 });
 
 test("long scoped turns can continue beyond forty tool rounds", async (t) => {
@@ -517,7 +613,46 @@ test("provider context overflow compacts and retries exactly once", async (t) =>
   assert.equal(result.metrics?.compactions, 1);
 });
 
-test("oversized stateless empty streams compact and retry exactly once", async (t) => {
+test("codex compaction rebuilds full history when a native checkpoint endpoint is unavailable", async (t) => {
+  const { root, sessions, session, artifacts, db } = fixture(t);
+  sessions.appendEvent<StoredUserPayload>(session.id, "user", { item: user("history behind checkpoint") });
+  sessions.appendEvent<StoredResponsePayload>(session.id, "response", {
+    response: { id: "old-native", status: "completed", output: response("old-native", "old answer").output },
+  });
+  sessions.appendEvent(session.id, "note", { message: "trailing note" });
+  sessions.saveCheckpoint(session.id, 3, {
+    output: [{ type: "compaction", encrypted_content: "OPAQUE_NATIVE_STATE" }],
+  }, 10);
+  const compactInputs: ResponseInputItem[][] = [];
+  const client = {
+    supportsResponseContinuity: () => true,
+    async compact(request: { input: ResponseInputItem[] }) {
+      compactInputs.push(request.input);
+      if (compactInputs.length === 1) throw Object.assign(new Error("Not Found"), { status: 404 });
+      return portableCheckpoint("compact_rebuilt", "rebuilt full-history checkpoint");
+    },
+  } as unknown as CodexLbClient;
+  const engine = new ConversationEngine(
+    structuredClone(DEFAULT_CONFIG), root, sessions, artifacts, client, new ToolRegistry(), "instructions",
+  );
+
+  await engine.compactNow(session.id, {
+    signal: new AbortController().signal,
+    automated: false,
+  });
+
+  assert.equal(compactInputs.length, 2);
+  assert.match(JSON.stringify(compactInputs[0]), /OPAQUE_NATIVE_STATE/);
+  assert.match(JSON.stringify(compactInputs[1]), /history behind checkpoint/);
+  assert.doesNotMatch(JSON.stringify(compactInputs[1]), /OPAQUE_NATIVE_STATE/);
+  assert.equal(sessions.latestCheckpoint(session.id)?.throughSequence, 2);
+  assert.match(JSON.stringify(sessions.latestCheckpoint(session.id)?.compact), /rebuilt full-history checkpoint/);
+  assert.equal((db.prepare(
+    "SELECT COUNT(*) AS total FROM context_checkpoints WHERE session_id = ?",
+  ).get(session.id) as { total: number }).total, 1);
+});
+
+test("oversized stateless input is compacted before its first stream request", async (t) => {
   const { root, sessions, session, artifacts } = fixture(t);
   sessions.updateSettings(session.id, { provider: "openrouter" });
   const requests: ResponseRequest[] = [];
@@ -526,18 +661,11 @@ test("oversized stateless empty streams compact and retry exactly once", async (
     supportsResponseContinuity: () => false,
     async stream(request: ResponseRequest) {
       requests.push(request);
-      if (requests.length === 1) {
-        throw Object.assign(new Error("empty completion stream"), { code: "empty_response" });
-      }
       return response("empty-recovered", "EMPTY_RECOVERED");
     },
     async compact() {
       compactions += 1;
-      return {
-        id: "compact_empty",
-        output: [{ type: "compaction_summary", encrypted_content: "empty-stream checkpoint" }],
-        usage: { input_tokens: 1_000 },
-      };
+      return portableCheckpoint("compact_empty", "preflight checkpoint", 1_000);
     },
   } as unknown as CodexLbClient;
   const engine = new ConversationEngine(
@@ -549,11 +677,11 @@ test("oversized stateless empty streams compact and retry exactly once", async (
     modelInfo: { ...modelInfo, contextWindow: 25_000 },
   });
   assert.equal(result.text, "EMPTY_RECOVERED");
-  assert.equal(requests.length, 2);
+  assert.equal(requests.length, 1);
   assert.equal(compactions, 1);
   assert.equal(result.compacted, true);
   assert.equal(result.metrics?.compactions, 1);
-  assert.match(JSON.stringify(requests[1]?.input), /empty-stream checkpoint/);
+  assert.match(JSON.stringify(requests[0]?.input), /preflight checkpoint/);
 });
 
 test("small stateless empty streams remain provider failures without compaction", async (t) => {
@@ -731,6 +859,40 @@ test("anchored codex input rejections do not discard continuity or compact", asy
   });
   assert.equal(requests.length, 1);
   assert.equal(requests[0]?.previousResponseId, "response-anchor");
+  assert.equal(compactions, 0);
+});
+
+test("anchored codex requests do not preflight-compact large local history", async (t) => {
+  const { root, sessions, session, artifacts } = fixture(t);
+  sessions.appendEvent<StoredUserPayload>(session.id, "user", { item: user("h".repeat(300_000)) });
+  sessions.appendEvent<StoredResponsePayload>(session.id, "response", {
+    response: { id: "response-anchor", status: "completed", output: response("response-anchor", "old").output },
+  });
+  sessions.setLastResponseId(session.id, "response-anchor");
+  const requests: ResponseRequest[] = [];
+  let compactions = 0;
+  const client = {
+    supportsResponseContinuity: () => true,
+    async stream(request: ResponseRequest) {
+      requests.push(request);
+      return response("anchored-success", "ANCHORED_OK");
+    },
+    async compact() { compactions += 1; return {}; },
+  } as unknown as CodexLbClient;
+  const engine = new ConversationEngine(
+    structuredClone(DEFAULT_CONFIG), root, sessions, artifacts, client, new ToolRegistry(), "instructions",
+  );
+
+  const result = await engine.turn(session.id, "continue", {
+    signal: new AbortController().signal,
+    interaction: { approve: async () => "once", ask: async () => "" },
+    modelInfo,
+  });
+
+  assert.equal(result.text, "ANCHORED_OK");
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0]?.previousResponseId, "response-anchor");
+  assert.doesNotMatch(JSON.stringify(requests[0]?.input), /h{1000}/);
   assert.equal(compactions, 0);
 });
 
@@ -1184,7 +1346,7 @@ test("session operation leases serialize turns and fence expired owners", (t) =>
   assert.equal(sessions.assertOperationLease(session.id, "two", "token-two", now + 151), true);
 });
 
-test("explicit provider migration rotates continuity and cache identity", (t) => {
+test("explicit provider migration rotates continuity without discarding a native checkpoint", (t) => {
   const { sessions, session } = fixture(t);
   sessions.registerCommandApproval(session.id, '["bash-exec",1,"npm test","/workspace",120000]');
   assert.equal(sessions.updateSettings(session.id, { approvalMode: "unrestricted" }).approvalMode, "unrestricted");
@@ -1201,9 +1363,143 @@ test("explicit provider migration rotates continuity and cache identity", (t) =>
   assert.equal(migrated.model, "coordinator-model");
   assert.equal(migrated.lastResponseId, null);
   assert.notEqual(migrated.promptCacheKey, session.promptCacheKey);
-  assert.equal(sessions.latestCheckpoint(session.id), null);
-  assert.match(JSON.stringify(projectContext(sessions, session.id).input), /retained history/);
+  assert.deepEqual(sessions.latestCheckpoint(session.id)?.compact, {
+    output: [{ type: "compaction", encrypted_content: "provider-specific" }],
+  });
   assert.equal(sessions.listCommandApprovals(session.id).length, 1);
+});
+
+test("provider migration discards unusable checkpoints without hiding durable history", (t) => {
+  const { sessions, session } = fixture(t);
+  sessions.appendEvent<StoredUserPayload>(session.id, "user", { item: user("durable fallback history") });
+  sessions.saveCheckpoint(session.id, 1, { summary: "invalid checkpoint shape" }, 10);
+
+  sessions.updateSettings(session.id, { provider: "openrouter" });
+
+  assert.equal(sessions.latestCheckpoint(session.id), null);
+  assert.match(JSON.stringify(projectContext(sessions, session.id).input), /durable fallback history/);
+});
+
+test("stateless provider migration converts full history before the first request", async (t) => {
+  const { root, sessions, session, artifacts, db } = fixture(t);
+  sessions.appendEvent<StoredUserPayload>(session.id, "user", { item: user("history before native checkpoint") });
+  sessions.appendEvent<StoredResponsePayload>(session.id, "response", {
+    response: { id: "old", status: "completed", output: response("old", "old answer").output },
+  });
+  sessions.appendEvent<StoredUserPayload>(session.id, "user", { item: user("tail after native checkpoint") });
+  sessions.appendEvent(session.id, "note", { message: "nonsemantic trailing event" });
+  sessions.saveCheckpoint(session.id, 4, {
+    output: [{ type: "compaction", encrypted_content: "provider-specific" }],
+  }, 10);
+  sessions.updateSettings(session.id, { provider: "openrouter" });
+
+  const operations: string[] = [];
+  const compactInputs: ResponseInputItem[][] = [];
+  const requests: ResponseRequest[] = [];
+  const client = {
+    supportsResponseContinuity: () => false,
+    async compact(request: { input: ResponseInputItem[] }) {
+      operations.push("compact");
+      compactInputs.push(request.input);
+      return {
+        id: "compact_migration",
+        output: [{
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: "portable migrated checkpoint" }],
+        }],
+        usage: { input_tokens: 100 },
+      };
+    },
+    async stream(request: ResponseRequest) {
+      operations.push("stream");
+      requests.push(request);
+      return response("after-migration", "MIGRATED");
+    },
+  } as unknown as CodexLbClient;
+  const engine = new ConversationEngine(
+    structuredClone(DEFAULT_CONFIG), root, sessions, artifacts, client, new ToolRegistry(), "instructions",
+  );
+
+  const result = await engine.turn(session.id, "continue on the new provider", {
+    signal: new AbortController().signal,
+    interaction: { approve: async () => "once", ask: async () => "" },
+    modelInfo,
+  });
+
+  assert.equal(result.compacted, true);
+  assert.deepEqual(operations, ["compact", "stream"]);
+  assert.match(JSON.stringify(compactInputs[0]), /history before native checkpoint/);
+  assert.match(JSON.stringify(compactInputs[0]), /tail after native checkpoint/);
+  assert.doesNotMatch(JSON.stringify(compactInputs[0]), /provider-specific/);
+  assert.match(JSON.stringify(requests[0]?.input), /portable migrated checkpoint/);
+  assert.match(JSON.stringify(requests[0]?.input), /continue on the new provider/);
+  assert.doesNotMatch(JSON.stringify(requests[0]?.input), /history before native checkpoint/);
+  assert.equal(sessions.latestCheckpoint(session.id)?.throughSequence, 3);
+  assert.equal((db.prepare(
+    "SELECT COUNT(*) AS total FROM context_checkpoints WHERE session_id = ?",
+  ).get(session.id) as { total: number }).total, 1);
+});
+
+test("failed stateless checkpoint conversion leaves history and checkpoint unchanged", async (t) => {
+  const { root, sessions, session, artifacts } = fixture(t);
+  sessions.appendEvent<StoredUserPayload>(session.id, "user", { item: user("preserved history") });
+  const native = { output: [{ type: "compaction", encrypted_content: "provider-specific" }] };
+  sessions.saveCheckpoint(session.id, 1, native, 10);
+  sessions.updateSettings(session.id, { provider: "openrouter" });
+  const beforeEvents = sessions.events(session.id);
+  let streams = 0;
+  const client = {
+    supportsResponseContinuity: () => false,
+    async compact() {
+      throw Object.assign(new Error("conversion unavailable"), { status: 400 });
+    },
+    async stream() {
+      streams += 1;
+      return response("unexpected", "unexpected");
+    },
+  } as unknown as CodexLbClient;
+  const engine = new ConversationEngine(
+    structuredClone(DEFAULT_CONFIG), root, sessions, artifacts, client, new ToolRegistry(), "instructions",
+  );
+
+  await assert.rejects(() => engine.turn(session.id, "must not be appended", {
+    signal: new AbortController().signal,
+    interaction: { approve: async () => "once", ask: async () => "" },
+    modelInfo,
+  }), /conversion unavailable/);
+
+  assert.equal(streams, 0);
+  assert.deepEqual(sessions.events(session.id), beforeEvents);
+  assert.deepEqual(sessions.latestCheckpoint(session.id)?.compact, native);
+});
+
+test("stateless migration refuses an unconvertible native-only checkpoint", async (t) => {
+  const { root, sessions, session, artifacts } = fixture(t);
+  const native = { output: [{ type: "compaction", encrypted_content: "provider-specific" }] };
+  sessions.saveCheckpoint(session.id, 0, native, 10);
+  sessions.updateSettings(session.id, { provider: "openrouter" });
+  let providerCalls = 0;
+  const client = {
+    supportsResponseContinuity: () => false,
+    async compact() { providerCalls += 1; return portableCheckpoint("unexpected", "unexpected"); },
+    async stream() { providerCalls += 1; return response("unexpected", "unexpected"); },
+  } as unknown as CodexLbClient;
+  const engine = new ConversationEngine(
+    structuredClone(DEFAULT_CONFIG), root, sessions, artifacts, client, new ToolRegistry(), "instructions",
+  );
+
+  await assert.rejects(() => engine.turn(session.id, "must not be appended", {
+    signal: new AbortController().signal,
+    interaction: { approve: async () => "once", ask: async () => "" },
+    modelInfo,
+  }), (error: unknown) => {
+    assert.equal((error as { code?: string }).code, "checkpoint_conversion_unavailable");
+    return true;
+  });
+  assert.equal(providerCalls, 0);
+  assert.equal(sessions.events(session.id).length, 0);
+  assert.deepEqual(sessions.latestCheckpoint(session.id)?.compact, native);
 });
 
 test("provider migration retains only the latest portable text checkpoint", (t) => {
@@ -1394,8 +1690,62 @@ test("reconciles response/tool crash windows into a replayable unknown result", 
   assert.equal(sessions.hasUnanchoredContext(session.id), true);
   const results = sessions.events(session.id).filter((event) => event.kind === "tool_denied");
   assert.equal(results.length, 1);
+  assert.deepEqual(results[0]?.payload, {
+    name: "bash",
+    callId: "call_crash",
+    output: "No durable tool result was recorded.",
+  });
   const replay = projectContext(sessions, session.id);
   assert.deepEqual(replay.input.map((item) => item.type), ["function_call", "function_call_output"]);
+  assert.match(JSON.stringify(replay.input), /No durable tool result was recorded/);
+
+  sessions.appendResponseAndSetContinuity<StoredResponsePayload>(session.id, {
+    response: {
+      id: "tool_response_retry",
+      status: "completed",
+      output: [{
+        id: "fc_crash_retry",
+        type: "function_call",
+        call_id: "call_crash",
+        name: "bash",
+        arguments: '{"command":"touch marker"}',
+        status: "completed",
+      }],
+    },
+  }, "tool_response_retry");
+  assert.equal(sessions.resetUnknownToolCall(session.id, "call_crash", "reconcile-token").acquired, true);
+  assert.deepEqual(sessions.events(session.id).find((event) => event.kind === "tool_started")?.payload, {
+    callId: "call_crash",
+    name: "bash",
+    rerun: true,
+  });
+  sessions.finishToolCallWithEvent(
+    session.id,
+    "call_crash",
+    "reconcile-token",
+    "completed",
+    "rerun succeeded",
+    null,
+    "tool_result",
+    { name: "bash", callId: "call_crash" },
+  );
+  const outputs = projectContext(sessions, session.id).input
+    .filter((item) => item.type === "function_call_output")
+    .map((item) => item.output);
+  assert.deepEqual(outputs, ["No durable tool result was recorded.", "rerun succeeded"]);
+});
+
+test("reconciliation restores missing failed-call events as tool results", (t) => {
+  const { sessions, session } = fixture(t);
+  assert.equal(sessions.acquireOperationLease(session.id, "reconciler", "failed-token", "turn"), true);
+  sessions.beginToolCall(session.id, "call_failed", "read", {}, "failed-token");
+  sessions.finishToolCall(session.id, "call_failed", "failed", "Tool error: failed", "failed");
+
+  assert.equal(sessions.reconcileToolCallEvents(session.id, "failed-token"), 1);
+  const result = sessions.events(session.id).find((event) => event.kind === "tool_result");
+  assert.ok(result);
+  assert.deepEqual(result.payload, { name: "read", callId: "call_failed" });
+  assert.match(JSON.stringify(projectContext(sessions, session.id).input), /Tool error: failed/);
 });
 
 test("interrupted mutating tools become unknown and stop the turn", async (t) => {

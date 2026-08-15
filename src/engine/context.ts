@@ -34,15 +34,21 @@ function normalizeCompactionOutput(items: unknown[]): ResponseInputItem[] {
   );
 }
 
-function toolResultItem(payload: StoredToolResultPayload): ResponseInputItem {
+function toolResultItem(
+  payload: StoredToolResultPayload,
+  storedOutput: (callId: string) => string | undefined,
+): ResponseInputItem {
   return payload.item ?? {
     type: "function_call_output",
     call_id: payload.callId,
-    output: payload.output,
+    output: payload.output ?? storedOutput(payload.callId) ?? "Tool result is unavailable.",
   };
 }
 
-function itemsFromEvent(event: SessionEvent): ResponseInputItem[] {
+function itemsFromEvent(
+  event: SessionEvent,
+  storedOutput: (callId: string) => string | undefined,
+): ResponseInputItem[] {
   switch (event.kind) {
     case "user":
       return [(event.payload as StoredUserPayload).item];
@@ -52,16 +58,21 @@ function itemsFromEvent(event: SessionEvent): ResponseInputItem[] {
     }
     case "tool_result":
     case "tool_denied":
-      return [toolResultItem(event.payload as StoredToolResultPayload)];
+      return [toolResultItem(event.payload as StoredToolResultPayload, storedOutput)];
     default:
       return [];
   }
 }
 
-export function projectContext(store: SessionStore, sessionId: string): ProjectedContext {
-  const checkpoint = store.latestCheckpoint(sessionId);
+export function projectContext(
+  store: SessionStore,
+  sessionId: string,
+  options: { ignoreCheckpoint?: boolean } = {},
+): ProjectedContext {
+  const checkpoint = options.ignoreCheckpoint ? null : store.latestCheckpoint(sessionId);
   const input: ResponseInputItem[] = [];
   let checkpointSequence = 0;
+  let latestSequence = 0;
 
   if (checkpoint) {
     checkpointSequence = checkpoint.throughSequence;
@@ -71,11 +82,24 @@ export function projectContext(store: SessionStore, sessionId: string): Projecte
   }
 
   const events = store.events(sessionId, checkpointSequence);
-  for (const event of events) input.push(...itemsFromEvent(event));
+  const outputlessCallIds = events.flatMap((event) => {
+    if (event.kind !== "tool_result" && event.kind !== "tool_denied") return [];
+    const payload = event.payload as StoredToolResultPayload;
+    return payload.item === undefined && payload.output === undefined ? [payload.callId] : [];
+  });
+  const toolOutputs = store.toolCallOutputs(sessionId, outputlessCallIds);
+  const storedOutput = (callId: string): string | undefined => toolOutputs.get(callId);
+  latestSequence = checkpointSequence;
+  for (const event of events) {
+    const items = itemsFromEvent(event, storedOutput);
+    if (items.length === 0) continue;
+    input.push(...items);
+    latestSequence = event.sequence;
+  }
   return {
     input,
     checkpointSequence,
-    latestSequence: events.at(-1)?.sequence ?? checkpointSequence,
+    latestSequence,
   };
 }
 

@@ -2187,7 +2187,10 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
       if (event.kind === "tool_started" && isRecord(event.payload)) {
         const callId = typeof event.payload.callId === "string" ? event.payload.callId : `event-${event.sequence}`;
         const name = typeof event.payload.name === "string" ? event.payload.name : "tool";
-        const summary = "arguments" in event.payload ? jsonPreview(event.payload.arguments) : name;
+        const storedCall = app.sessions.getToolCall(session.id, callId);
+        const summary = "arguments" in event.payload
+          ? jsonPreview(event.payload.arguments)
+          : storedCall ? jsonPreview(storedCall.arguments) : name;
         const card = new ToolCard(callId, name, summary);
         toolCards.set(callId, card);
         root.addEntry(card);
@@ -2196,7 +2199,10 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
       if ((event.kind === "tool_result" || event.kind === "tool_denied") && isRecord(event.payload)) {
         const callId = typeof event.payload.callId === "string" ? event.payload.callId : `event-${event.sequence}`;
         const name = typeof event.payload.name === "string" ? event.payload.name : "tool";
-        const output = typeof event.payload.output === "string" ? event.payload.output : "No recorded output";
+        const storedCall = app.sessions.getToolCall(session.id, callId);
+        const output = typeof event.payload.output === "string"
+          ? event.payload.output
+          : storedCall?.output ?? storedCall?.error ?? "No recorded output";
         let card = toolCards.get(callId);
         if (!card) {
           card = new ToolCard(callId, name, name);

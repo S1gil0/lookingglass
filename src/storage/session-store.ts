@@ -299,11 +299,15 @@ function validateNow(now: number): void {
   finiteInteger("now", now);
 }
 
-function isPortableCheckpoint(compact: unknown): boolean {
+function hasCheckpointOutput(compact: unknown): compact is Record<string, unknown> & { output: unknown[] } {
   if (compact === null || typeof compact !== "object" || Array.isArray(compact)) return false;
   const output = (compact as Record<string, unknown>).output;
-  if (!Array.isArray(output) || output.length === 0) return false;
-  return output.every((item) => {
+  return Array.isArray(output) && output.length > 0;
+}
+
+export function isPortableCheckpoint(compact: unknown): boolean {
+  if (!hasCheckpointOutput(compact)) return false;
+  return compact.output.every((item) => {
     if (item === null || typeof item !== "object" || Array.isArray(item)) return false;
     const message = item as Record<string, unknown>;
     if (message.type !== "message" || message.role !== "user") return false;
@@ -714,19 +718,23 @@ export class SessionStore {
           ORDER BY through_sequence DESC
         `).all(id) as Array<{ id: number; compact_json: string }>;
         let portableCheckpointId: number | null = null;
+        let nativeCheckpointId: number | null = null;
         for (const checkpoint of checkpoints) {
           try {
-            if (isPortableCheckpoint(JSON.parse(checkpoint.compact_json) as unknown)) {
+            const compact = JSON.parse(checkpoint.compact_json) as unknown;
+            if (isPortableCheckpoint(compact)) {
               portableCheckpointId = checkpoint.id;
               break;
             }
+            if (nativeCheckpointId === null && hasCheckpointOutput(compact)) nativeCheckpointId = checkpoint.id;
           } catch {
             // Skip malformed checkpoints and continue to an older portable one.
           }
         }
-        if (portableCheckpointId !== null) {
+        const retainedCheckpointId = portableCheckpointId ?? nativeCheckpointId;
+        if (retainedCheckpointId !== null) {
           this.db.prepare("DELETE FROM context_checkpoints WHERE session_id = ? AND id <> ?")
-            .run(id, portableCheckpointId);
+            .run(id, retainedCheckpointId);
         } else {
           this.db.prepare("DELETE FROM context_checkpoints WHERE session_id = ?").run(id);
         }
@@ -1171,6 +1179,7 @@ export class SessionStore {
     throughSequence: number,
     compact: Record<string, unknown>,
     inputTokens: number | null,
+    replaceExisting = false,
   ): ContextCheckpoint | null {
     const save = this.db.transaction(() => {
       const createdAt = Date.now();
@@ -1185,6 +1194,10 @@ export class SessionStore {
           created_at = excluded.created_at
         RETURNING id
       `).get(sessionId, throughSequence, JSON.stringify(compact), inputTokens, createdAt) as { id: number };
+      if (replaceExisting) {
+        this.db.prepare("DELETE FROM context_checkpoints WHERE session_id = ? AND id <> ?")
+          .run(sessionId, result.id);
+      }
       this.db.prepare("UPDATE sessions SET last_response_id = NULL, updated_at = ? WHERE id = ?")
         .run(createdAt, sessionId);
       return { id: result.id, sessionId, throughSequence, compact, inputTokens, createdAt };
@@ -1235,7 +1248,7 @@ export class SessionStore {
         ) VALUES (?, ?, ?, ?, 'started', ?, ?)
       `).run(sessionId, callId, name, JSON.stringify(args), now, executionToken);
       if (result.changes === 1) {
-        this.appendEventRow(sessionId, "tool_started", { callId, name, arguments: args }, now);
+        this.appendEventRow(sessionId, "tool_started", { callId, name }, now);
       }
       return { record: this.requireToolCall(sessionId, callId), acquired: result.changes === 1 };
     });
@@ -1320,7 +1333,11 @@ export class SessionStore {
             started_at = ?, finished_at = NULL, execution_token = ?
         WHERE session_id = ? AND call_id = ? AND state = 'unknown'
       `).run(now, executionToken, sessionId, callId);
-      return { record: this.requireToolCall(sessionId, callId), acquired: result.changes === 1 };
+      const record = this.requireToolCall(sessionId, callId);
+      if (result.changes === 1) {
+        this.appendEventRow(sessionId, "tool_started", { callId, name: record.name, rerun: true }, now);
+      }
+      return { record, acquired: result.changes === 1 };
     });
     return reset.immediate();
   }
@@ -1531,10 +1548,10 @@ export class SessionStore {
         const payload = {
           name: call.name,
           callId: call.callId,
-          item: { type: "function_call_output", call_id: call.callId, output },
-          output,
+          ...(call.state === "unknown" ? { output } : {}),
         };
-        this.appendEventRow(sessionId, call.state === "completed" ? "tool_result" : "tool_denied", payload, now);
+        const kind = call.state === "completed" || call.state === "failed" ? "tool_result" : "tool_denied";
+        this.appendEventRow(sessionId, kind, payload, now);
       }
       return missing.length;
     });
@@ -1572,6 +1589,23 @@ export class SessionStore {
       "SELECT * FROM tool_calls WHERE session_id = ? AND call_id = ?",
     ).get(sessionId, callId) as ToolCallRow | undefined;
     return row ? toolCallFromRow(row) : null;
+  }
+
+  toolCallOutputs(sessionId: string, callIds: readonly string[]): Map<string, string> {
+    const outputs = new Map<string, string>();
+    const uniqueIds = [...new Set(callIds)];
+    for (let offset = 0; offset < uniqueIds.length; offset += 500) {
+      const chunk = uniqueIds.slice(offset, offset + 500);
+      const placeholders = chunk.map(() => "?").join(", ");
+      const rows = this.db.prepare(`
+        SELECT call_id, output_text, error_text
+        FROM tool_calls WHERE session_id = ? AND call_id IN (${placeholders})
+      `).all(sessionId, ...chunk) as Array<{ call_id: string; output_text: string | null; error_text: string | null }>;
+      for (const row of rows) {
+        outputs.set(row.call_id, row.output_text ?? row.error_text ?? "Tool result is unavailable.");
+      }
+    }
+    return outputs;
   }
 
   /**
