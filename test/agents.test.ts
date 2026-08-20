@@ -16,6 +16,7 @@ import { ToolPreflightError } from "../src/tools/registry.js";
 import type { AgentBatchRunner } from "../src/tools/agents.js";
 import type { GlassTool, ToolContext } from "../src/tools/types.js";
 import type { GatewayModel } from "../src/types.js";
+import { VisualizerEventBus, type VisualizerEvent } from "../src/visualizer/events.js";
 
 function response(id: string, text: string): Response {
   return {
@@ -109,6 +110,9 @@ test("agent coordinator runs isolated tasks concurrently with configured model m
       return response(id, `result-${id}`);
     },
   } as unknown as CodexLbClient;
+  const visualizer = new VisualizerEventBus();
+  const visualizerEvents: VisualizerEvent[] = [];
+  visualizer.subscribe((event) => visualizerEvents.push(event));
   let instructionLoads = 0;
   const coordinator = new AgentCoordinator(
     structuredClone(DEFAULT_CONFIG),
@@ -119,6 +123,7 @@ test("agent coordinator runs isolated tasks concurrently with configured model m
     createWorkerToolRegistry(),
     () => `main instructions snapshot ${instructionLoads += 1}`,
     async () => agentModel,
+    visualizer,
   );
   const progress: string[] = [];
   const context: ToolContext = {
@@ -161,6 +166,11 @@ test("agent coordinator runs isolated tasks concurrently with configured model m
   assert.equal(children.length, 3);
   assert.ok(children.every((child) => child.session_kind === "agent"));
   assert.ok(children.every((child) => child.model === "worker-model" && child.reasoning_effort === "high"));
+  assert.equal(visualizerEvents.filter((event) => event.type === "agent.spawn").length, 3);
+  assert.equal(visualizerEvents.filter((event) => event.type === "agent.start").length, 3);
+  assert.equal(visualizerEvents.filter((event) => event.type === "agent.result").length, 3);
+  assert.equal(visualizerEvents.filter((event) => event.type === "agent.end").length, 3);
+  assert.ok(visualizerEvents.some((event) => event.type === "turn.start" && event.agentId === "fast"));
 });
 
 test("agent coordinator redacts credentials from successful aggregate and oversized results", async (t) => {

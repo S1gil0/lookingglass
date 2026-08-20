@@ -13,6 +13,31 @@ function fixture() {
   return { root, db, sessions };
 }
 
+test("visualizer preference defaults off and persists independently per session", (t) => {
+  const { root, db, sessions } = fixture();
+  t.after(() => {
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+  const create = () => sessions.create({
+    workspace: root,
+    model: "model",
+    reasoningEffort: "medium",
+    verbosity: "low",
+    fast: false,
+  });
+  const first = create();
+  const second = create();
+
+  assert.equal(first.visualizerEnabled, false);
+  assert.equal(second.visualizerEnabled, false);
+  sessions.updateSettings(first.id, { visualizerEnabled: true });
+  assert.equal(sessions.get(first.id)?.visualizerEnabled, true);
+  assert.equal(sessions.get(second.id)?.visualizerEnabled, false);
+  sessions.updateSettings(first.id, { visualizerEnabled: false });
+  assert.equal(sessions.get(first.id)?.visualizerEnabled, false);
+});
+
 test("session forks migrate and copy only independent conversation state", (t) => {
   const { root, db, sessions } = fixture();
   t.after(() => {
@@ -22,6 +47,7 @@ test("session forks migrate and copy only independent conversation state", (t) =
 
   assert.equal((db.prepare("SELECT 1 FROM schema_migrations WHERE version = 15").get() as object | undefined) !== undefined, true);
   assert.equal((db.prepare("SELECT 1 FROM schema_migrations WHERE version = 16").get() as object | undefined) !== undefined, true);
+  assert.equal((db.prepare("SELECT 1 FROM schema_migrations WHERE version = 19").get() as object | undefined) !== undefined, true);
   const forkColumn = (db.prepare("PRAGMA table_info(sessions)").all() as { name: string; type: string; notnull: number; dflt_value: string }[])
     .find((column) => column.name === "fork_count");
   assert.deepEqual(forkColumn && {
@@ -30,6 +56,14 @@ test("session forks migrate and copy only independent conversation state", (t) =
     notnull: forkColumn.notnull,
     dflt_value: forkColumn.dflt_value,
   }, { name: "fork_count", type: "INTEGER", notnull: 1, dflt_value: "0" });
+  const visualizerColumn = (db.prepare("PRAGMA table_info(sessions)").all() as { name: string; type: string; notnull: number; dflt_value: string }[])
+    .find((column) => column.name === "visualizer_enabled");
+  assert.deepEqual(visualizerColumn && {
+    name: visualizerColumn.name,
+    type: visualizerColumn.type,
+    notnull: visualizerColumn.notnull,
+    dflt_value: visualizerColumn.dflt_value,
+  }, { name: "visualizer_enabled", type: "INTEGER", notnull: 1, dflt_value: "0" });
 
   const source = sessions.create({
     workspace: root,
@@ -44,8 +78,10 @@ test("session forks migrate and copy only independent conversation state", (t) =
     agentReasoningEffort: "low",
     agentsEnabled: false,
   });
+  assert.equal(source.visualizerEnabled, false);
   sessions.rename(source.id, "A useful conversation");
-  sessions.updateSettings(source.id, { showReasoning: true, persistent: true });
+  sessions.updateSettings(source.id, { showReasoning: true, visualizerEnabled: true, persistent: true });
+  assert.equal(sessions.get(source.id)?.visualizerEnabled, true);
   sessions.setLastResponseId(source.id, "response-source");
   sessions.appendEvent(source.id, "user", { text: "hello" });
   sessions.appendEvent(source.id, "response", { text: "world" });
@@ -77,6 +113,7 @@ test("session forks migrate and copy only independent conversation state", (t) =
   assert.equal(fork.model, source.model);
   assert.equal(fork.approvalMode, source.approvalMode);
   assert.equal(fork.showReasoning, true);
+  assert.equal(fork.visualizerEnabled, true);
   assert.equal(fork.persistent, true);
   assert.deepEqual(sessions.events(fork.id).map(({ id, sessionId, ...event }) => event),
     sourceEvents.map(({ id, sessionId, ...event }) => event));
@@ -117,6 +154,7 @@ test("session forks reject active leases and agent sessions", (t) => {
   });
   const source = sessions.create({ workspace: root, model: "model", reasoningEffort: "medium", verbosity: "low", fast: false });
   assert.equal(sessions.acquireOperationLease(source.id, "owner", "token", "turn", Date.now(), 30_000), true);
+  assert.equal(sessions.updateSettings(source.id, { visualizerEnabled: true }).visualizerEnabled, true);
   assert.throws(() => sessions.fork(source.id), /active turn/);
   sessions.releaseOperationLease(source.id, "owner", "token");
 

@@ -112,7 +112,7 @@ test("installs current migrations and validates scheduler definitions", (t) => {
   const { db, root, store } = fixture(t);
   const now = Date.parse("2026-01-01T00:00:30Z");
   const versions = db.prepare("SELECT version FROM schema_migrations ORDER BY version").all() as { version: number }[];
-  assert.deepEqual(versions.map((row) => row.version), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]);
+  assert.deepEqual(versions.map((row) => row.version), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]);
   const sessionId = createSession(db, root, true);
   const approval = db.prepare("SELECT approval_mode FROM sessions WHERE id = ?").get(sessionId) as { approval_mode: string };
   assert.equal(approval.approval_mode, "review");

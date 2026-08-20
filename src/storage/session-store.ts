@@ -32,6 +32,7 @@ interface SessionRow {
   fast: number;
   approval_mode: ApprovalMode;
   show_reasoning: number;
+  visualizer_enabled: number;
   persistent: number;
   prompt_cache_key: string;
   last_response_id: string | null;
@@ -450,6 +451,7 @@ function sessionFromRow(row: SessionRow): SessionRecord {
     fast: row.fast === 1,
     approvalMode: row.approval_mode,
     showReasoning: row.show_reasoning === 1,
+    visualizerEnabled: row.visualizer_enabled === 1,
     persistent: row.persistent === 1,
     promptCacheKey: row.prompt_cache_key,
     lastResponseId: row.last_response_id,
@@ -506,6 +508,7 @@ export class SessionStore {
       fast: input.fast,
       approvalMode: input.approvalMode ?? "code",
       showReasoning: false,
+      visualizerEnabled: false,
       persistent: false,
       promptCacheKey: randomUUID(),
       lastResponseId: null,
@@ -569,9 +572,9 @@ export class SessionStore {
         INSERT INTO sessions(
           id, workspace, provider, agent_provider, title, model, agent_model,
           reasoning_effort, agent_reasoning_effort, agents_enabled, verbosity, fast,
-          approval_mode, show_reasoning, persistent, prompt_cache_key, last_response_id,
+          approval_mode, show_reasoning, visualizer_enabled, persistent, prompt_cache_key, last_response_id,
           session_kind, parent_session_id, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'interactive', NULL, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'interactive', NULL, ?, ?)
       `).run(
         forkId,
         source.workspace,
@@ -587,6 +590,7 @@ export class SessionStore {
         source.fast ? 1 : 0,
         source.approvalMode,
         source.showReasoning ? 1 : 0,
+        source.visualizerEnabled ? 1 : 0,
         source.persistent ? 1 : 0,
         randomUUID(),
         now,
@@ -669,7 +673,8 @@ export class SessionStore {
     changes: Partial<Pick<
       SessionRecord,
       "provider" | "model" | "reasoningEffort" | "agentProvider" | "agentModel" | "agentReasoningEffort"
-      | "agentsEnabled" | "verbosity" | "fast" | "approvalMode" | "showReasoning" | "persistent"
+      | "agentsEnabled" | "verbosity" | "fast" | "approvalMode" | "showReasoning" | "visualizerEnabled"
+      | "persistent"
     >>,
   ): SessionRecord {
     const update = this.db.transaction(() => {
@@ -677,7 +682,8 @@ export class SessionStore {
       const lease = this.db.prepare(
         "SELECT 1 FROM session_operation_leases WHERE session_id = ? AND expires_at > ?",
       ).get(id, now);
-      if (lease) throw new Error("Session is busy with another operation");
+      const visualizerOnly = changes.visualizerEnabled !== undefined && Object.keys(changes).length === 1;
+      if (lease && !visualizerOnly) throw new Error("Session is busy with another operation");
       const current = this.require(id);
       const resetContinuity = changes.model !== undefined || changes.provider !== undefined;
       const next = {
@@ -690,7 +696,7 @@ export class SessionStore {
         UPDATE sessions
         SET provider = ?, model = ?, reasoning_effort = ?,
             agent_provider = ?, agent_model = ?, agent_reasoning_effort = ?, agents_enabled = ?, verbosity = ?, fast = ?,
-            approval_mode = ?, show_reasoning = ?, persistent = ?,
+            approval_mode = ?, show_reasoning = ?, visualizer_enabled = ?, persistent = ?,
             prompt_cache_key = ?, last_response_id = ?, updated_at = ?
         WHERE id = ?
       `).run(
@@ -705,6 +711,7 @@ export class SessionStore {
         next.fast ? 1 : 0,
         next.approvalMode,
         next.showReasoning ? 1 : 0,
+        next.visualizerEnabled ? 1 : 0,
         next.persistent ? 1 : 0,
         next.promptCacheKey,
         next.lastResponseId,

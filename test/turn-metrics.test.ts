@@ -13,6 +13,7 @@ import { SessionStore } from "../src/storage/session-store.js";
 import { ToolRegistry } from "../src/tools/registry.js";
 import type { GlassTool } from "../src/tools/types.js";
 import type { ModelInfo } from "../src/types.js";
+import { VisualizerEventBus, type VisualizerEvent } from "../src/visualizer/events.js";
 
 const modelInfo: ModelInfo = {
   id: "test-model",
@@ -47,8 +48,8 @@ function response(id: string, output: unknown[], text = ""): Response {
   return { id, status: "completed", output, output_text: text, usage: { input_tokens: 10, output_tokens: 2, total_tokens: 12 } } as unknown as Response;
 }
 
-function toolCall(id: string, name: string): unknown {
-  return { id: `function-${id}`, type: "function_call", status: "completed", name, arguments: "{}", call_id: `call-${id}` };
+function toolCall(id: string, name: string, argumentsJson = "{}"): unknown {
+  return { id: `function-${id}`, type: "function_call", status: "completed", name, arguments: argumentsJson, call_id: `call-${id}` };
 }
 
 test("turn metrics count logical rounds, tools, leaf tasks, and bounded refusals", async (t) => {
@@ -85,9 +86,12 @@ test("turn metrics count logical rounds, tools, leaf tasks, and bounded refusals
       ]);
     },
   } as unknown as CodexLbClient;
+  const visualizer = new VisualizerEventBus();
+  const visualizerEvents: VisualizerEvent[] = [];
+  visualizer.subscribe((event) => visualizerEvents.push(event));
   const engine = new ConversationEngine(
     structuredClone(DEFAULT_CONFIG), root, sessions, artifacts, client,
-    new ToolRegistry().register(runAgents), "instructions",
+    new ToolRegistry().register(runAgents), "instructions", undefined, visualizer,
   );
   const callbacks: TurnMetrics[] = [];
   const reasoningSummaries: string[] = [];
@@ -114,6 +118,84 @@ test("turn metrics count logical rounds, tools, leaf tasks, and bounded refusals
   assert.deepEqual(reasoningSummaries, ["**Summarizing the delegated result**"]);
   assert.ok((result.metrics?.durationMs ?? -1) >= 0);
   assert.equal(callbacks.length, 1);
+  const eventTypes = visualizerEvents.map((event) => event.type);
+  assert.equal(eventTypes[0], "turn.start");
+  assert.equal(eventTypes.at(-1), "turn.end");
+  assert.equal(eventTypes.filter((type) => type === "model.request").length, 2);
+  assert.ok(eventTypes.includes("model.reasoning.start"));
+  assert.ok(eventTypes.includes("model.reasoning.summary"));
+  assert.ok(eventTypes.includes("model.response"));
+  assert.ok(eventTypes.includes("tool.request"));
+  assert.ok(eventTypes.includes("tool.start"));
+  assert.ok(eventTypes.includes("tool.output"));
+  assert.ok(eventTypes.includes("tool.end"));
+  assert.ok(eventTypes.includes("context.update"));
+  assert.equal(
+    visualizerEvents.find((event) => event.type === "model.reasoning.summary")?.summary,
+    "**Summarizing the delegated result**",
+  );
+  assert.equal(visualizerEvents.find((event) => event.type === "model.response")?.inputTokens, 10);
+});
+
+test("successful apply_patch calls emit ordered code-change telemetry", async (t) => {
+  const { root, sessions, session, artifacts } = fixture(t);
+  const applyPatch: GlassTool<{ patch: string }> = {
+    name: "apply_patch",
+    description: "test patch tool",
+    risk: "write",
+    parameters: {
+      type: "object",
+      properties: { patch: { type: "string" } },
+      required: ["patch"],
+      additionalProperties: false,
+    },
+    summarize: () => "apply patch",
+    async execute() {
+      return { output: "Updated src/value.ts" };
+    },
+  };
+  const patch = [
+    "*** Begin Patch",
+    "*** Update File: src/value.ts",
+    "@@",
+    "-export const value = 1;",
+    "+export const value = 2;",
+    "*** End Patch",
+  ].join("\n");
+  let requests = 0;
+  const client = {
+    supportsResponseContinuity: () => true,
+    async stream() {
+      requests += 1;
+      return requests === 1
+        ? response("patch", [toolCall("patch", "apply_patch", JSON.stringify({ patch }))])
+        : response("done", []);
+    },
+  } as unknown as CodexLbClient;
+  const visualizer = new VisualizerEventBus();
+  const visualizerEvents: VisualizerEvent[] = [];
+  visualizer.subscribe((event) => visualizerEvents.push(event));
+  const engine = new ConversationEngine(
+    structuredClone(DEFAULT_CONFIG), root, sessions, artifacts, client,
+    new ToolRegistry().register(applyPatch), "instructions", undefined, visualizer,
+  );
+
+  await engine.turn(session.id, "update the value", {
+    signal: new AbortController().signal,
+    interaction: { approve: async () => "once", ask: async () => "" },
+    modelInfo,
+  });
+
+  const event = visualizerEvents.find((candidate) => candidate.type === "tool.end");
+  assert.deepEqual(event?.codeChanges, [{
+    path: "src/value.ts",
+    operation: "update",
+    lines: [
+      { kind: "remove", text: "export const value = 1;" },
+      { kind: "add", text: "export const value = 2;" },
+    ],
+  }]);
+  assert.equal(visualizerEvents.find((candidate) => candidate.type === "tool.output")?.codeChanges, undefined);
 });
 
 test("turn-complete metrics are emitted for incomplete failures", async (t) => {

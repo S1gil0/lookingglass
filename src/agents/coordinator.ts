@@ -8,6 +8,7 @@ import type { ToolContext, ToolResult } from "../tools/types.js";
 import { ConversationEngine } from "../engine/engine.js";
 import { AutomatedTurnTimeoutError, type ProviderRetryBudgetOptions } from "../retry.js";
 import { configuredCredentialValues, redactSensitiveText } from "../security.js";
+import type { VisualizerEventBus } from "../visualizer/events.js";
 
 interface AgentTaskResult {
   id: string;
@@ -93,6 +94,7 @@ export class AgentCoordinator implements AgentBatchRunner {
       signal?: AbortSignal,
       retryBudget?: ProviderRetryBudgetOptions,
     ) => Promise<GatewayModel>,
+    private readonly visualizerEvents?: VisualizerEventBus,
   ) {}
 
   private createEngine(): ConversationEngine {
@@ -105,6 +107,8 @@ export class AgentCoordinator implements AgentBatchRunner {
       this.clientFor,
       this.workerTools,
       `${sharedInstructions}\n\n${LEAF_INSTRUCTIONS}`,
+      undefined,
+      this.visualizerEvents,
     );
   }
 
@@ -162,6 +166,21 @@ export class AgentCoordinator implements AgentBatchRunner {
         parentSessionId: parent.id,
       });
       this.sessions.rename(child.id, `Agent ${task.id}`);
+      const agentEntityId = `agent:${child.id}`;
+      const agentParentId = context.callId ? `tool:${context.callId}` : undefined;
+      const agentStartedAt = Date.now();
+      this.visualizerEvents?.emit({
+        type: "agent.spawn",
+        sessionId: parent.id,
+        entityId: agentEntityId,
+        agentId: task.id,
+        ...(agentParentId ? { parentId: agentParentId } : {}),
+        model: model.id,
+        provider: model.provider,
+        reasoningEffort: parent.agentReasoningEffort,
+        status: "waiting",
+        summary: `spawned child session ${child.id}`,
+      });
       const timeoutMs = this.config.automation?.agentTurnTimeoutMs ?? 45 * 60_000;
       const timeout = new AbortController();
       let timedOut = false;
@@ -171,6 +190,17 @@ export class AgentCoordinator implements AgentBatchRunner {
       }, timeoutMs);
       const childSignal = AbortSignal.any([context.signal, timeout.signal]);
       try {
+        this.visualizerEvents?.emit({
+          type: "agent.start",
+          sessionId: child.id,
+          entityId: agentEntityId,
+          agentId: task.id,
+          ...(agentParentId ? { parentId: agentParentId } : {}),
+          model: model.id,
+          provider: model.provider,
+          reasoningEffort: parent.agentReasoningEffort,
+          status: "active",
+        });
         const turn = await this.createEngine().turn(child.id, taskPrompt(task), {
           signal: childSignal,
           interaction: {
@@ -205,6 +235,8 @@ export class AgentCoordinator implements AgentBatchRunner {
           automated: true,
           readOnly: context.readOnly || parent.approvalMode === "review",
           authorizationSessionId: context.authorizationSessionId ?? parent.id,
+          visualizerParentId: agentEntityId,
+          visualizerAgentId: task.id,
         });
         if (timedOut) throw timeout.signal.reason ?? new AutomatedTurnTimeoutError(timeoutMs);
         results[index] = {
@@ -216,8 +248,47 @@ export class AgentCoordinator implements AgentBatchRunner {
           text: turn.text.trim() || "Agent completed without a text response.",
         };
         reportAgentAction(context, identity, task.id, "done");
+        this.visualizerEvents?.emit({
+          type: "agent.result",
+          sessionId: child.id,
+          entityId: agentEntityId,
+          agentId: task.id,
+          ...(agentParentId ? { parentId: agentParentId } : {}),
+          model: model.id,
+          provider: model.provider,
+          reasoningEffort: parent.agentReasoningEffort,
+          status: "complete",
+          summary: "result returned to parent",
+        });
+        this.visualizerEvents?.emit({
+          type: "agent.end",
+          sessionId: child.id,
+          entityId: agentEntityId,
+          agentId: task.id,
+          ...(agentParentId ? { parentId: agentParentId } : {}),
+          model: model.id,
+          provider: model.provider,
+          reasoningEffort: parent.agentReasoningEffort,
+          status: "complete",
+          duration: Math.max(0, Date.now() - agentStartedAt),
+        });
       } catch (error) {
-        if (context.signal.aborted) throw error;
+        if (context.signal.aborted) {
+          this.visualizerEvents?.emit({
+            type: "agent.end",
+            sessionId: child.id,
+            entityId: agentEntityId,
+            agentId: task.id,
+            ...(agentParentId ? { parentId: agentParentId } : {}),
+            model: model.id,
+            provider: model.provider,
+            reasoningEffort: parent.agentReasoningEffort,
+            status: "cancelled",
+            duration: Math.max(0, Date.now() - agentStartedAt),
+            summary: "cancelled by parent",
+          });
+          throw error;
+        }
         const timeoutError = timedOut || error instanceof AutomatedTurnTimeoutError;
         const code = timeoutError ? "automated_turn_timeout" : errorCode(error);
         const message = timeoutError
@@ -235,6 +306,19 @@ export class AgentCoordinator implements AgentBatchRunner {
           ...(code ? { code } : {}),
         };
         reportAgentAction(context, identity, task.id, timeoutError ? "timed out" : "failed", message);
+        this.visualizerEvents?.emit({
+          type: "agent.end",
+          sessionId: child.id,
+          entityId: agentEntityId,
+          agentId: task.id,
+          ...(agentParentId ? { parentId: agentParentId } : {}),
+          model: model.id,
+          provider: model.provider,
+          reasoningEffort: parent.agentReasoningEffort,
+          status: timeoutError ? "cancelled" : "failed",
+          duration: Math.max(0, Date.now() - agentStartedAt),
+          summary: message,
+        });
       } finally {
         clearTimeout(timeoutTimer);
       }

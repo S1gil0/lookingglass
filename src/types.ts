@@ -125,6 +125,7 @@ export interface SessionRecord {
   fast: boolean;
   approvalMode: ApprovalMode;
   showReasoning: boolean;
+  visualizerEnabled: boolean;
   persistent: boolean;
   promptCacheKey: string;
   lastResponseId: string | null;

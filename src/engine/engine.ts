@@ -34,6 +34,8 @@ import type {
   StoredResponsePayload,
   StoredUserPayload,
 } from "./types.js";
+import type { VisualizerEventBus, VisualizerEventInput } from "../visualizer/events.js";
+import { toolCodeChanges, toolFiles } from "../visualizer/events.js";
 
 const OPERATION_LEASE_MS = 30_000;
 const OPERATION_HEARTBEAT_MS = Math.max(1, Math.floor(OPERATION_LEASE_MS / 3));
@@ -131,6 +133,9 @@ export interface TurnOptions {
   readOnly?: boolean;
   automated?: boolean;
   authorizationSessionId?: string;
+  /** Optional causal linkage for observability; it never affects execution. */
+  visualizerParentId?: string;
+  visualizerAgentId?: string;
 }
 
 export interface TurnResult {
@@ -168,6 +173,10 @@ interface TurnMetricsState {
   providerRetries: number;
   termination?: string;
   errorCode?: string;
+  turnId?: string;
+  currentModelCallId?: string;
+  visualizerParentId?: string;
+  visualizerAgentId?: string;
 }
 
 function userItem(text: string): ResponseInputItem {
@@ -193,6 +202,14 @@ function responseReasoningSummary(response: Response): string | undefined {
   });
   const text = summaries.join("\n").trim();
   return text || undefined;
+}
+
+function responseReasoningTokens(response: Response): number | undefined {
+  const usage = response.usage as unknown as Record<string, unknown> | null | undefined;
+  const details = usage?.output_tokens_details;
+  if (!details || typeof details !== "object" || Array.isArray(details)) return undefined;
+  const value = (details as Record<string, unknown>).reasoning_tokens;
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
 }
 
 function toolOutputItem(callId: string, output: string): ResponseInputItem {
@@ -280,6 +297,12 @@ function utf8Prefix(value: string, maxBytes: number): string {
 
 export class ConversationEngine {
   private readonly operationOwner = randomUUID();
+  private readonly visualizerToolStarts = new Map<string, {
+    startedAt: number;
+    turnId?: string;
+    parentId?: string;
+    agentId?: string;
+  }>();
 
   constructor(
     private readonly config: GlassConfig,
@@ -290,7 +313,12 @@ export class ConversationEngine {
     private readonly tools: ToolRegistry,
     private readonly instructions: string,
     private readonly delay: RetryDelay = abortableRetryDelay,
+    private readonly visualizerEvents?: VisualizerEventBus,
   ) {}
+
+  private emitVisualizer(event: VisualizerEventInput): void {
+    this.visualizerEvents?.emit(event);
+  }
 
   private clientFor(provider: GatewayProvider): CodexLbClient {
     return typeof this.clientOrResolver === "function"
@@ -345,13 +373,31 @@ export class ConversationEngine {
     reservation?: SessionPromptReservation,
   ): Promise<TurnResult> {
     const startedAt = Date.now();
+    const visualizerSession = this.store.get(sessionId);
+    const turnId = this.visualizerEvents?.nextId("turn");
     const state: TurnMetricsState = {
       modelRounds: 0,
       toolCalls: 0,
       leafAgents: 0,
       compactions: 0,
       providerRetries: 0,
+      ...(turnId ? { turnId } : {}),
+      ...(options.visualizerParentId ? { visualizerParentId: options.visualizerParentId } : {}),
+      ...(options.visualizerAgentId ? { visualizerAgentId: options.visualizerAgentId } : {}),
     };
+    if (turnId && visualizerSession) this.emitVisualizer({
+      type: "turn.start",
+      sessionId,
+      turnId,
+      entityId: turnId,
+      ...(options.visualizerParentId ? { parentId: options.visualizerParentId } : {}),
+      ...(options.visualizerAgentId ? { agentId: options.visualizerAgentId } : {}),
+      model: visualizerSession.model,
+      provider: visualizerSession.provider,
+      reasoningEffort: visualizerSession.reasoningEffort,
+      contextWindow: options.modelInfo.contextWindow,
+      status: "active",
+    });
     try {
       const result = await this.withOperationLease(sessionId, "turn", options.signal, async (signal, executionToken) => {
         return this.turnLocked(sessionId, text, { ...options, signal }, executionToken, state);
@@ -359,6 +405,20 @@ export class ConversationEngine {
       state.termination = "completed";
       const metrics = this.completeMetrics(state, startedAt, state.responseStatus ?? result.response.status ?? "completed");
       this.notifyTurnComplete(options.callbacks, metrics);
+      if (turnId && visualizerSession) this.emitVisualizer({
+        type: "turn.end",
+        sessionId,
+        turnId,
+        entityId: turnId,
+        ...(options.visualizerParentId ? { parentId: options.visualizerParentId } : {}),
+        ...(options.visualizerAgentId ? { agentId: options.visualizerAgentId } : {}),
+        model: visualizerSession.model,
+        provider: visualizerSession.provider,
+        reasoningEffort: visualizerSession.reasoningEffort,
+        duration: metrics.durationMs,
+        status: "complete",
+        summary: metrics.responseStatus,
+      });
       return { ...result, metrics };
     } catch (error) {
       state.responseStatus = failedResponseStatus(error);
@@ -379,6 +439,31 @@ export class ConversationEngine {
       );
       const metrics = this.completeMetrics(state, startedAt, state.responseStatus);
       this.notifyTurnComplete(options.callbacks, metrics);
+      if (turnId && visualizerSession) this.emitVisualizer({
+        type: "error",
+        sessionId,
+        turnId,
+        parentId: turnId,
+        ...(options.visualizerAgentId ? { agentId: options.visualizerAgentId } : {}),
+        model: visualizerSession.model,
+        provider: visualizerSession.provider,
+        status: "failed",
+        summary: boundedNotice(errorMessage(error), configuredCredentialValues(this.config)),
+      });
+      if (turnId && visualizerSession) this.emitVisualizer({
+        type: "turn.end",
+        sessionId,
+        turnId,
+        entityId: turnId,
+        ...(options.visualizerParentId ? { parentId: options.visualizerParentId } : {}),
+        ...(options.visualizerAgentId ? { agentId: options.visualizerAgentId } : {}),
+        model: visualizerSession.model,
+        provider: visualizerSession.provider,
+        reasoningEffort: visualizerSession.reasoningEffort,
+        duration: metrics.durationMs,
+        status: state.termination === "cancelled" || state.termination === "timed_out" ? "cancelled" : "failed",
+        summary: boundedNotice(errorMessage(error), configuredCredentialValues(this.config)),
+      });
       throw error;
     }
   }
@@ -502,7 +587,39 @@ export class ConversationEngine {
         if (!this.store.appendResponseAndSetContinuityFenced(sessionId, executionToken, payload, response.id)) {
           throw this.operationLeaseError(sessionId, executionToken, "recording the response");
         }
-        if (reasoningSummary) options.callbacks?.onReasoningSummary?.(reasoningSummary);
+        if (reasoningSummary) {
+          options.callbacks?.onReasoningSummary?.(reasoningSummary);
+          if (metrics.currentModelCallId) this.emitVisualizer({
+            type: "model.reasoning.summary",
+            sessionId,
+            ...(metrics.turnId ? { turnId: metrics.turnId } : {}),
+            entityId: `reasoning:${metrics.currentModelCallId}`,
+            parentId: metrics.currentModelCallId,
+            ...(metrics.visualizerAgentId ? { agentId: metrics.visualizerAgentId } : {}),
+            model: session.model,
+            provider: session.provider,
+            reasoningEffort: session.reasoningEffort,
+            status: "complete",
+            summary: boundedNotice(reasoningSummary, secrets, 1_000),
+          });
+        }
+        if (response.usage) this.emitVisualizer({
+          type: "context.update",
+          sessionId,
+          ...(metrics.turnId ? { turnId: metrics.turnId } : {}),
+          entityId: `context:${sessionId}`,
+          ...(metrics.turnId ? { parentId: metrics.turnId } : {}),
+          ...(metrics.visualizerAgentId ? { agentId: metrics.visualizerAgentId } : {}),
+          inputTokens: response.usage.input_tokens,
+          outputTokens: response.usage.output_tokens,
+          ...(responseReasoningTokens(response) !== undefined
+            ? { reasoningTokens: responseReasoningTokens(response)! }
+            : {}),
+          contextTokens: response.usage.input_tokens,
+          contextWindow: options.modelInfo.contextWindow,
+          status: "complete",
+          summary: "provider usage",
+        });
 
         const calls = functionCalls(response);
         if (calls.length === 0 || response.status === "incomplete" || response.status === "failed") {
@@ -590,6 +707,21 @@ export class ConversationEngine {
       }
       return;
     }
+    const compactionId = this.visualizerEvents?.nextId("compact");
+    const compactionStartedAt = Date.now();
+    if (compactionId) this.emitVisualizer({
+      type: "context.compact",
+      sessionId,
+      ...(metrics?.turnId ? { turnId: metrics.turnId } : {}),
+      entityId: compactionId,
+      ...(metrics?.turnId ? { parentId: metrics.turnId } : {}),
+      ...(metrics?.visualizerAgentId ? { agentId: metrics.visualizerAgentId } : {}),
+      model: session.model,
+      provider: session.provider,
+      contextTokens: Math.ceil(JSON.stringify(context.input).length / 4),
+      status: "active",
+      summary: "compacting context",
+    });
     const retryBudget = createRetryBudget(options.automated
       ? {
           maxAttempts: this.config.automation.providerRetryMaxAttempts,
@@ -636,6 +768,15 @@ export class ConversationEngine {
             if (context.input.length === 0) throw error;
             reconstructedFullHistory = true;
             if (metrics) metrics.providerRetries += 1;
+            this.emitVisualizer({
+              type: "retry",
+              sessionId,
+              ...(metrics?.turnId ? { turnId: metrics.turnId } : {}),
+              ...(compactionId ? { parentId: compactionId } : {}),
+              ...(metrics?.visualizerAgentId ? { agentId: metrics.visualizerAgentId } : {}),
+              status: "complete",
+              summary: "recovering native checkpoint from full history",
+            });
             options.callbacks?.onStatus?.("Recovering native checkpoint from full history");
             continue;
           }
@@ -644,6 +785,15 @@ export class ConversationEngine {
           if (!retryBudgetCanRetry(retryBudget)) throw retryBudgetError(retryBudget);
           retryBudget.retries += 1;
           if (metrics) metrics.providerRetries += 1;
+          this.emitVisualizer({
+            type: "retry",
+            sessionId,
+            ...(metrics?.turnId ? { turnId: metrics.turnId } : {}),
+            ...(compactionId ? { parentId: compactionId } : {}),
+            ...(metrics?.visualizerAgentId ? { agentId: metrics.visualizerAgentId } : {}),
+            status: "complete",
+            summary: `compaction retry ${attempt}`,
+          });
           await this.waitForRetry(options.callbacks, options.signal, attempt, retryBudget);
         }
       }
@@ -667,6 +817,20 @@ export class ConversationEngine {
       throw this.operationLeaseError(sessionId, executionToken, "saving compacted context");
     }
     if (metrics) metrics.compactions += 1;
+    if (compactionId) this.emitVisualizer({
+      type: "context.compact",
+      sessionId,
+      ...(metrics?.turnId ? { turnId: metrics.turnId } : {}),
+      entityId: compactionId,
+      ...(metrics?.turnId ? { parentId: metrics.turnId } : {}),
+      ...(metrics?.visualizerAgentId ? { agentId: metrics.visualizerAgentId } : {}),
+      model: session.model,
+      provider: session.provider,
+      ...(inputTokens !== null ? { inputTokens } : {}),
+      duration: Math.max(0, Date.now() - compactionStartedAt),
+      status: "complete",
+      summary: "context compacted",
+    });
     options.callbacks?.onStatus?.("Context compacted");
   }
 
@@ -716,6 +880,38 @@ export class ConversationEngine {
 
     const streamAttempt = async (): Promise<Response> => {
       const anchorAbort = new AbortController();
+      const modelCallId = this.visualizerEvents?.nextId("model");
+      const modelStartedAt = Date.now();
+      const reasoningId = modelCallId ? `reasoning:${modelCallId}` : undefined;
+      if (modelCallId) {
+        metrics.currentModelCallId = modelCallId;
+        this.emitVisualizer({
+          type: "model.request",
+          sessionId: currentSession.id,
+          ...(metrics.turnId ? { turnId: metrics.turnId } : {}),
+          entityId: modelCallId,
+          ...(metrics.turnId ? { parentId: metrics.turnId } : {}),
+          ...(metrics.visualizerAgentId ? { agentId: metrics.visualizerAgentId } : {}),
+          model: currentSession.model,
+          provider: currentSession.provider,
+          reasoningEffort: currentSession.reasoningEffort,
+          contextTokens: this.estimatedRequestTokens(currentSession, currentInput),
+          contextWindow: options.modelInfo.contextWindow,
+          status: "active",
+        });
+        if (options.modelInfo.supportsReasoning && reasoningId) this.emitVisualizer({
+          type: "model.reasoning.start",
+          sessionId: currentSession.id,
+          ...(metrics.turnId ? { turnId: metrics.turnId } : {}),
+          entityId: reasoningId,
+          parentId: modelCallId,
+          ...(metrics.visualizerAgentId ? { agentId: metrics.visualizerAgentId } : {}),
+          model: currentSession.model,
+          provider: currentSession.provider,
+          reasoningEffort: currentSession.reasoningEffort,
+          status: "active",
+        });
+      }
       let anchorTimedOut = false;
       let firstEventTimer: NodeJS.Timeout | undefined;
       const clearFirstEventTimer = (): void => {
@@ -730,7 +926,7 @@ export class ConversationEngine {
         firstEventTimer.unref();
       }
       try {
-        return await this.clientFor(currentSession.provider).stream({
+        const response = await this.clientFor(currentSession.provider).stream({
           model: currentSession.model,
           instructions: this.instructionsFor(currentSession),
           input: currentInput,
@@ -753,7 +949,74 @@ export class ConversationEngine {
           },
           onEvent: clearFirstEventTimer,
         });
+        if (reasoningId && options.modelInfo.supportsReasoning) this.emitVisualizer({
+          type: "model.reasoning.end",
+          sessionId: currentSession.id,
+          ...(metrics.turnId ? { turnId: metrics.turnId } : {}),
+          entityId: reasoningId,
+          parentId: modelCallId!,
+          ...(metrics.visualizerAgentId ? { agentId: metrics.visualizerAgentId } : {}),
+          model: currentSession.model,
+          provider: currentSession.provider,
+          reasoningEffort: currentSession.reasoningEffort,
+          ...(responseReasoningTokens(response) !== undefined
+            ? { reasoningTokens: responseReasoningTokens(response)! }
+            : {}),
+          status: "complete",
+          duration: Math.max(0, Date.now() - modelStartedAt),
+        });
+        if (modelCallId) this.emitVisualizer({
+          type: "model.response",
+          sessionId: currentSession.id,
+          ...(metrics.turnId ? { turnId: metrics.turnId } : {}),
+          entityId: modelCallId,
+          ...(metrics.turnId ? { parentId: metrics.turnId } : {}),
+          ...(metrics.visualizerAgentId ? { agentId: metrics.visualizerAgentId } : {}),
+          model: currentSession.model,
+          provider: currentSession.provider,
+          reasoningEffort: currentSession.reasoningEffort,
+          ...(response.usage ? {
+            inputTokens: response.usage.input_tokens,
+            outputTokens: response.usage.output_tokens,
+            contextTokens: response.usage.input_tokens,
+          } : {}),
+          ...(responseReasoningTokens(response) !== undefined
+            ? { reasoningTokens: responseReasoningTokens(response)! }
+            : {}),
+          contextWindow: options.modelInfo.contextWindow,
+          status: response.status === "failed" || response.status === "incomplete" ? "failed" : "complete",
+          duration: Math.max(0, Date.now() - modelStartedAt),
+          summary: response.status ?? "completed",
+        });
+        return response;
       } catch (error) {
+        if (reasoningId && options.modelInfo.supportsReasoning) this.emitVisualizer({
+          type: "model.reasoning.end",
+          sessionId: currentSession.id,
+          ...(metrics.turnId ? { turnId: metrics.turnId } : {}),
+          entityId: reasoningId,
+          parentId: modelCallId!,
+          ...(metrics.visualizerAgentId ? { agentId: metrics.visualizerAgentId } : {}),
+          model: currentSession.model,
+          provider: currentSession.provider,
+          reasoningEffort: currentSession.reasoningEffort,
+          status: "failed",
+          duration: Math.max(0, Date.now() - modelStartedAt),
+        });
+        if (modelCallId) this.emitVisualizer({
+          type: "model.response",
+          sessionId: currentSession.id,
+          ...(metrics.turnId ? { turnId: metrics.turnId } : {}),
+          entityId: modelCallId,
+          ...(metrics.turnId ? { parentId: metrics.turnId } : {}),
+          ...(metrics.visualizerAgentId ? { agentId: metrics.visualizerAgentId } : {}),
+          model: currentSession.model,
+          provider: currentSession.provider,
+          reasoningEffort: currentSession.reasoningEffort,
+          status: "failed",
+          duration: Math.max(0, Date.now() - modelStartedAt),
+          summary: boundedNotice(errorMessage(error), configuredCredentialValues(this.config)),
+        });
         if (anchorTimedOut) {
           throw Object.assign(new Error("Previous response produced no stream event within 30 seconds"), {
             code: "previous_response_first_event_timeout",
@@ -830,6 +1093,17 @@ export class ConversationEngine {
             if (!retryBudgetCanRetry(retryBudget)) throw retryBudgetError(retryBudget);
             retryBudget.retries += 1;
             metrics.providerRetries += 1;
+            this.emitVisualizer({
+              type: "retry",
+              sessionId: currentSession.id,
+              ...(metrics.turnId ? { turnId: metrics.turnId } : {}),
+              ...(metrics.currentModelCallId ? { parentId: metrics.currentModelCallId } : {}),
+              ...(metrics.visualizerAgentId ? { agentId: metrics.visualizerAgentId } : {}),
+              model: currentSession.model,
+              provider: currentSession.provider,
+              status: "complete",
+              summary: `provider retry ${retryBudget.attempts}`,
+            });
             await this.waitForRetry(options.callbacks, options.signal, retryBudget.attempts, retryBudget);
             continue;
           }
@@ -868,6 +1142,44 @@ export class ConversationEngine {
     return outputs;
   }
 
+  private startToolVisualization(
+    sessionId: string,
+    call: ResponseFunctionToolCall,
+    args: unknown,
+    metrics: TurnMetricsState,
+  ): void {
+    const entityId = `tool:${call.call_id}`;
+    const files = toolFiles(call.name, args);
+    this.visualizerToolStarts.set(`${sessionId}:${call.call_id}`, {
+      startedAt: Date.now(),
+      ...(metrics.turnId ? { turnId: metrics.turnId } : {}),
+      ...(metrics.currentModelCallId ? { parentId: metrics.currentModelCallId } : {}),
+      ...(metrics.visualizerAgentId ? { agentId: metrics.visualizerAgentId } : {}),
+    });
+    this.emitVisualizer({
+      type: "tool.request",
+      sessionId,
+      ...(metrics.turnId ? { turnId: metrics.turnId } : {}),
+      entityId,
+      ...(metrics.currentModelCallId ? { parentId: metrics.currentModelCallId } : {}),
+      ...(metrics.visualizerAgentId ? { agentId: metrics.visualizerAgentId } : {}),
+      tool: call.name,
+      status: "waiting",
+      ...(files.length > 0 ? { files } : {}),
+      summary: this.toolSummary(call.name, args),
+    });
+    this.emitVisualizer({
+      type: "tool.start",
+      sessionId,
+      ...(metrics.turnId ? { turnId: metrics.turnId } : {}),
+      entityId,
+      ...(metrics.currentModelCallId ? { parentId: metrics.currentModelCallId } : {}),
+      ...(metrics.visualizerAgentId ? { agentId: metrics.visualizerAgentId } : {}),
+      tool: call.name,
+      status: "active",
+    });
+  }
+
   private async executeCall(
     sessionId: string,
     call: ResponseFunctionToolCall,
@@ -888,6 +1200,7 @@ export class ConversationEngine {
         return toolOutputItem(call.call_id, this.boundReplayOutput(sessionId, call.name, output, modelOutputBytes));
       }
       const output = `Tool argument error: ${errorMessage(error)}`;
+      this.startToolVisualization(sessionId, call, storedArgs, metrics);
       return this.persistToolOutput(
         sessionId, call, executionToken, "failed", output, output, undefined, true, options,
       );
@@ -953,6 +1266,7 @@ export class ConversationEngine {
 
     const tool = this.tools.get(call.name);
     const summary = this.toolSummary(call.name, storedArgs);
+    this.startToolVisualization(sessionId, call, storedArgs, metrics);
     options.callbacks?.onToolStart?.({ callId: call.call_id, name: call.name, summary });
 
     if (call.name === "run_agents" && !this.requireSession(sessionId).agentsEnabled) {
@@ -1084,6 +1398,37 @@ export class ConversationEngine {
     this.store.finishToolCallWithEvent(
       sessionId, call.call_id, executionToken, state, output, error, kind, payload,
     );
+    const visualizerKey = `${sessionId}:${call.call_id}`;
+    const visualizer = this.visualizerToolStarts.get(visualizerKey);
+    this.visualizerToolStarts.delete(visualizerKey);
+    const codeChanges = !failed && state === "completed"
+      ? toolCodeChanges(call.name, this.store.getToolCall(sessionId, call.call_id)?.arguments)
+      : [];
+    const visualizerLink = {
+      ...(visualizer?.turnId ? { turnId: visualizer.turnId } : {}),
+      ...(visualizer?.parentId ? { parentId: visualizer.parentId } : {}),
+      ...(visualizer?.agentId ? { agentId: visualizer.agentId } : {}),
+    };
+    this.emitVisualizer({
+      type: "tool.output",
+      sessionId,
+      ...visualizerLink,
+      entityId: `tool:${call.call_id}`,
+      tool: call.name,
+      status: failed ? "failed" : "active",
+      summary: `${Buffer.byteLength(output).toLocaleString()} bytes${result?.truncated ? " (truncated)" : ""}`,
+    });
+    this.emitVisualizer({
+      type: failed ? "tool.error" : "tool.end",
+      sessionId,
+      ...visualizerLink,
+      entityId: `tool:${call.call_id}`,
+      tool: call.name,
+      status: failed ? "failed" : "complete",
+      ...(visualizer ? { duration: Math.max(0, Date.now() - visualizer.startedAt) } : {}),
+      summary: state,
+      ...(codeChanges.length > 0 ? { codeChanges } : {}),
+    });
     options.callbacks?.onToolFinish?.({
       callId: call.call_id,
       name: call.name,
@@ -1108,6 +1453,21 @@ export class ConversationEngine {
       output,
     };
     this.store.markToolCallUnknownWithEvent(sessionId, call.call_id, executionToken, payload);
+    const visualizerKey = `${sessionId}:${call.call_id}`;
+    const visualizer = this.visualizerToolStarts.get(visualizerKey);
+    this.visualizerToolStarts.delete(visualizerKey);
+    this.emitVisualizer({
+      type: "tool.error",
+      sessionId,
+      ...(visualizer?.turnId ? { turnId: visualizer.turnId } : {}),
+      entityId: `tool:${call.call_id}`,
+      ...(visualizer?.parentId ? { parentId: visualizer.parentId } : {}),
+      ...(visualizer?.agentId ? { agentId: visualizer.agentId } : {}),
+      tool: call.name,
+      status: "failed",
+      ...(visualizer ? { duration: Math.max(0, Date.now() - visualizer.startedAt) } : {}),
+      summary: "outcome unknown",
+    });
     options.callbacks?.onToolFinish?.({
       callId: call.call_id,
       name: call.name,

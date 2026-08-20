@@ -62,6 +62,13 @@ import {
   findModelChoice,
   SelectorPresentationQueue,
 } from "./setting-picker.js";
+import { VisualizerStore } from "../visualizer/state.js";
+import {
+  VisualizerPane,
+  VISUALIZER_VIEWS,
+  visualizerSplitLayout,
+  type VisualizerView,
+} from "./visualizer.js";
 
 export { SubmissionQueue } from "./submission-queue.js";
 export { detectActiveSelectorCommand, expandActiveSelectorCommand, findModelChoice } from "./setting-picker.js";
@@ -98,6 +105,28 @@ export class RepeatedPressConfirmation {
   }
 }
 
+export interface VisualizerCommandState {
+  enabled: boolean;
+  view: VisualizerView;
+}
+
+export function resolveVisualizerCommand(
+  argument: string,
+  current: VisualizerCommandState,
+): VisualizerCommandState {
+  const value = argument.trim().toLowerCase();
+  if (!value) return { ...current, enabled: !current.enabled };
+  if (["on", "true"].includes(value)) return { ...current, enabled: true };
+  if (["off", "false", "0"].includes(value)) return { ...current, enabled: false };
+  const selected = VISUALIZER_VIEWS.find((candidate) => candidate.view === value || String(candidate.number) === value);
+  if (!selected) {
+    throw new Error(
+      "/visualizer accepts on, off, 1-8, graph, timeline, trace, context, files, calls, code, or thinking",
+    );
+  }
+  return { enabled: true, view: selected.view };
+}
+
 export function defaultGatewayBaseURL(provider: GatewayProvider): string {
   if (provider === "lm-studio") return "http://127.0.0.1:1234/v1";
   if (provider === "openrouter") return "https://openrouter.ai/api/v1";
@@ -126,6 +155,36 @@ export interface TerminalMouseEvent extends ScreenPoint {
   shift: boolean;
   alt: boolean;
   ctrl: boolean;
+}
+
+/** Route a screen-space left click to a visible visualizer tab. */
+export function handleVisualizerTabMouse(
+  event: TerminalMouseEvent,
+  screenWidth: number,
+  enabled: boolean,
+  pane: VisualizerPane,
+): boolean {
+  if (event.action !== "press" || event.button !== 0) return false;
+  const split = visualizerSplitLayout(screenWidth, enabled);
+  if (!split.visible) return false;
+  const paneColumn = event.column - split.leftWidth - split.separatorWidth;
+  return pane.handleTabClick(paneColumn, event.row, split.rightWidth);
+}
+
+/** Route wheel movement over the visible visualizer without scrolling the transcript. */
+export function handleVisualizerWheelMouse(
+  event: TerminalMouseEvent,
+  screenWidth: number,
+  enabled: boolean,
+  pane: VisualizerPane,
+): boolean {
+  if (event.action !== "wheel_up" && event.action !== "wheel_down") return false;
+  const split = visualizerSplitLayout(screenWidth, enabled);
+  if (!split.visible) return false;
+  const paneStart = split.leftWidth + split.separatorWidth;
+  if (event.column < paneStart || event.column >= screenWidth || event.row < 0) return false;
+  pane.scrollLines(event.action === "wheel_up" ? 3 : -3);
+  return true;
 }
 
 type Style = (text: string) => string;
@@ -1040,6 +1099,9 @@ export class FullHeightRoot extends Container {
   private readonly maxEntries: number;
   private readonly onEvict: ((component: Component) => void) | undefined;
   private startupVisible: boolean;
+  private readonly visualizerPane: VisualizerPane | undefined;
+  private readonly visualizerEnabled: (() => boolean) | undefined;
+  private composingVisualizer = false;
 
   constructor(
     private readonly terminal: AlternateScreenTerminal,
@@ -1051,6 +1113,8 @@ export class FullHeightRoot extends Container {
       maxEntries?: number;
       onEvict?: (component: Component) => void;
       startupVisible?: boolean;
+      visualizer?: VisualizerPane;
+      visualizerEnabled?: () => boolean;
     } = {},
   ) {
     super();
@@ -1059,6 +1123,8 @@ export class FullHeightRoot extends Container {
       : Number.POSITIVE_INFINITY;
     this.onEvict = options.onEvict;
     this.startupVisible = options.startupVisible ?? false;
+    this.visualizerPane = options.visualizer;
+    this.visualizerEnabled = options.visualizerEnabled;
     this.addChild(editor);
   }
 
@@ -1196,6 +1262,7 @@ export class FullHeightRoot extends Container {
 
   private renderSelection(frame: string[]): string[] {
     this.lastFrame = frame;
+    if (this.composingVisualizer) return frame;
     if (!this.selectionAnchor || !this.selectionFocus) return frame;
     const [start, end] = orderedSelection(this.selectionAnchor, this.selectionFocus);
     return frame.map((line, row) => {
@@ -1218,6 +1285,7 @@ export class FullHeightRoot extends Container {
   override invalidate(): void {
     this.editor.invalidate();
     this.taskPlanPanel.invalidate();
+    this.visualizerPane?.invalidate();
     for (const entry of this.entries) entry.invalidate();
     this.invalidateTranscript();
   }
@@ -1225,6 +1293,26 @@ export class FullHeightRoot extends Container {
   override render(width: number): string[] {
     const height = Math.max(1, this.terminal.rows);
     const safeWidth = Math.max(1, width);
+    if (!this.composingVisualizer && this.visualizerPane) {
+      const split = visualizerSplitLayout(safeWidth, this.visualizerEnabled?.() ?? false);
+      if (split.visible) {
+        this.composingVisualizer = true;
+        let left: string[];
+        try {
+          left = this.render(split.leftWidth);
+        } finally {
+          this.composingVisualizer = false;
+        }
+        const right = this.visualizerPane.render(split.rightWidth, height);
+        const frame = Array.from({ length: height }, (_, row) => {
+          const leftLine = pad(left[row] ?? "", split.leftWidth);
+          const rightLine = pad(right[row] ?? "", split.rightWidth);
+          return `${leftLine} ${rightLine}`;
+        });
+        this.selectableRows = frame.length;
+        return this.renderSelection(frame);
+      }
+    }
     if (safeWidth < MIN_COLUMNS || height < MIN_ROWS) {
       this.selectableRows = 0;
       const lines = Array.from<string>({ length: height }).fill("");
@@ -1947,6 +2035,7 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
   let selectionDragging = false;
   let contextInputTokens: number | null = null;
   let contextWindow = 0;
+  let visualizerEnabled = session.visualizerEnabled;
   let unavailableModelKey: string | null = null;
   let nextModelAvailabilityCheckAt = 0;
   let resolveStopped: (() => void) | null = null;
@@ -1966,9 +2055,14 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
   );
   const editor = new TurnEditor(tui, editorTheme, { paddingX: 1, autocompleteMaxVisible: 7 });
   const taskPlanPanel = new TaskPlanPanel();
+  const visualizerStore = new VisualizerStore();
+  const visualizerPane = new VisualizerPane(visualizerStore);
+  visualizerPane.setSession(session.id);
   const root = new FullHeightRoot(terminal, editor, taskPlanPanel, activityText, metadataText, {
     maxEntries: TRANSCRIPT_ENTRY_LIMIT,
     startupVisible: startupState.shouldShow(session.id, app.sessions.eventCount(session.id)),
+    visualizer: visualizerPane,
+    visualizerEnabled: () => visualizerEnabled,
     onEvict(component) {
       if (component instanceof ToolCard && toolCards.get(component.callId) === component) {
         toolCards.delete(component.callId);
@@ -1986,6 +2080,10 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
   const requestRender = (): void => {
     if (!stopping) tui.requestRender();
   };
+  const unsubscribeVisualizer = app.visualizerEvents.subscribe((event) => {
+    visualizerStore.dispatch(event);
+    requestRender();
+  });
   const requestTranscriptRender = (component?: Component): void => {
     if (component) root.refreshEntry(component);
     else root.invalidateTranscript();
@@ -2372,6 +2470,9 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
     contextWindow = 0;
     unavailableModelKey = null;
     nextModelAvailabilityCheckAt = 0;
+    visualizerStore.clear();
+    visualizerPane.setSession(session.id);
+    visualizerEnabled = session.visualizerEnabled;
     loadSessionEvents();
     trackTask(refreshContextWindow());
   };
@@ -3046,6 +3147,24 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
       await runCompact();
       return;
     }
+    if (command === "visualizer") {
+      const next = resolveVisualizerCommand(argument, {
+        enabled: visualizerEnabled,
+        view: visualizerPane.view,
+      });
+      session = app.sessions.updateSettings(session.id, { visualizerEnabled: next.enabled });
+      visualizerEnabled = session.visualizerEnabled;
+      visualizerPane.setView(next.view);
+      root.invalidate();
+      addNotice(
+        "visualizer",
+        next.enabled
+          ? `${VISUALIZER_VIEWS.find((candidate) => candidate.view === next.view)?.label ?? next.view} view enabled. Click a tab to switch views; Alt+V toggles the pane. Narrow terminals collapse it automatically.`
+          : "Visualizer disabled. Use /visualizer on or Alt+V to restore it.",
+        cyan,
+      );
+      return;
+    }
     if (command === "permissions") {
       const modes: ApprovalMode[] = ["review", "code", "unrestricted"];
       let mode: ApprovalMode;
@@ -3212,6 +3331,14 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
     { name: "new", description: "Start a new session" },
     { name: "fork", description: "Fork current session into an independent copy" },
     { name: "compact", description: "Compact conversation context" },
+    {
+      name: "visualizer",
+      description: "Toggle the live execution visualizer or select a view",
+      argumentHint: "[on|off|1-8|view]",
+      getArgumentCompletions: (prefix) => [
+        "on", "off", "graph", "timeline", "trace", "context", "files", "calls", "code", "thinking",
+      ].filter((value) => value.startsWith(prefix.toLowerCase())).map((value) => ({ value, label: value })),
+    },
     { name: "session", description: "Manage current session" },
     {
       name: "sessions",
@@ -3376,6 +3503,7 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
       if (latestSession && latestSession.updatedAt > session.updatedAt && !activeOperation) {
         const modelChanged = latestSession.provider !== session.provider || latestSession.model !== session.model;
         session = latestSession;
+        visualizerEnabled = session.visualizerEnabled;
         if (modelChanged) {
           contextWindow = 0;
           trackTask(refreshContextWindow());
@@ -3480,6 +3608,19 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
         requestRender();
         return { consume: true };
       }
+      if (handleVisualizerTabMouse(mouse, terminal.columns, visualizerEnabled, visualizerPane)) {
+        root.clearSelection();
+        selectionDragging = false;
+        root.invalidate();
+        requestRender();
+        return { consume: true };
+      }
+      if (handleVisualizerWheelMouse(mouse, terminal.columns, visualizerEnabled, visualizerPane)) {
+        root.clearSelection();
+        selectionDragging = false;
+        requestRender();
+        return { consume: true };
+      }
       if (mouse.action === "wheel_up" || mouse.action === "wheel_down") {
         root.clearSelection();
         selectionDragging = false;
@@ -3509,6 +3650,13 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
       return { consume: true };
     }
     if (activeModal) return undefined;
+    if (matchesKey(data, Key.alt("v"))) {
+      session = app.sessions.updateSettings(session.id, { visualizerEnabled: !visualizerEnabled });
+      visualizerEnabled = session.visualizerEnabled;
+      root.invalidate();
+      requestRender();
+      return { consume: true };
+    }
     if (matchesKey(data, Key.ctrl("pageUp")) || matchesKey(data, Key.pageUp)) {
       root.scrollPage(-1);
       requestRender();
@@ -3542,11 +3690,13 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
     activityTimer = setInterval(() => {
       if (!activeOperation || stopping) return;
       activityFrame += 1;
+      visualizerPane.setFrame(activityFrame);
       requestRender();
     }, ACTIVITY_RENDER_MS);
     await stopped;
   } finally {
     stopping = true;
+    unsubscribeVisualizer();
     process.removeListener("SIGINT", onSignal);
     process.removeListener("SIGTERM", onSignal);
     if (pollTimer) clearInterval(pollTimer);

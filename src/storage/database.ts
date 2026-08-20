@@ -461,6 +461,11 @@ ON scheduler_inbox(acknowledged_at)
 WHERE acknowledged_at IS NOT NULL;
 `;
 
+const SESSION_VISUALIZER_SCHEMA = `
+ALTER TABLE sessions ADD COLUMN visualizer_enabled INTEGER NOT NULL DEFAULT 0
+CHECK (visualizer_enabled IN (0, 1));
+`;
+
 function migrateBashApprovalScopes(db: GlassDatabase): void {
   const rows = db.prepare(`
     SELECT session_id, signature, approved_at
@@ -621,6 +626,11 @@ export function openDatabase(path: string, platform: NodeJS.Platform = process.p
     if (!sessionProviderOpenCodeMigration) {
       db.exec(SESSION_PROVIDER_OPENCODE_SCHEMA);
       db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (18, ?)").run(Date.now());
+    }
+    const sessionVisualizerMigration = db.prepare("SELECT 1 FROM schema_migrations WHERE version = 19").get();
+    if (!sessionVisualizerMigration) {
+      db.exec(SESSION_VISUALIZER_SCHEMA);
+      db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (19, ?)").run(Date.now());
     }
   });
   const sessionsRebuildMigrationPending = !db.prepare(

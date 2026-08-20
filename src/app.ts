@@ -19,6 +19,7 @@ import {
   type RetryDelay,
 } from "./retry.js";
 import { runMaintenance as executeMaintenance, type MaintenanceMode, type MaintenanceReport } from "./maintenance.js";
+import { VisualizerEventBus } from "./visualizer/events.js";
 
 const MODEL_CATALOG_TIMEOUT_MS = 10_000;
 const INITIAL_SESSION_CATALOG_TIMEOUT_MS = 1_500;
@@ -53,6 +54,7 @@ export class LookingGlassApp {
   client!: CodexLbClient;
   clients!: Map<GatewayProvider, CodexLbClient>;
   readonly scheduler: SchedulerStore;
+  readonly visualizerEvents = new VisualizerEventBus();
   maintenanceReport: MaintenanceReport | null = null;
   maintenanceError: Error | null = null;
   tools!: ToolRegistry;
@@ -135,6 +137,7 @@ export class LookingGlassApp {
         abortableRetryDelay,
         retryBudget,
       ),
+      this.visualizerEvents,
     );
     const tools = createCoreToolRegistry(this.scheduler, agents);
     const engine = new ConversationEngine(
@@ -145,6 +148,8 @@ export class LookingGlassApp {
       (provider) => this.clientForProvider(provider),
       tools,
       instructions.text,
+      abortableRetryDelay,
+      this.visualizerEvents,
     );
     this.clients = clients;
     this.client = client;
