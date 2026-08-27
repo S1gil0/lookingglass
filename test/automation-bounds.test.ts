@@ -213,12 +213,14 @@ test("agent timeout fails one child while siblings continue", async (t) => {
     supportsResponseContinuity: () => true,
     async stream(request: { input: unknown; signal?: AbortSignal }): Promise<Response> {
       const slow = JSON.stringify(request.input).includes("SLOW");
-      await new Promise<void>((resolve, reject) => {
-        const timer = setTimeout(resolve, slow ? 500 : 2);
-        request.signal?.addEventListener("abort", () => {
-          clearTimeout(timer);
-          reject(request.signal?.reason);
-        }, { once: true });
+      if (!slow) return response("done");
+      await new Promise<void>((_resolve, reject) => {
+        const abort = (): void => reject(request.signal?.reason ?? new Error("aborted"));
+        if (request.signal?.aborted) {
+          abort();
+          return;
+        }
+        request.signal?.addEventListener("abort", abort, { once: true });
       });
       return response("done");
     },
