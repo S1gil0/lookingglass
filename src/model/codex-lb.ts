@@ -298,11 +298,13 @@ export function isStaleResponseError(value: unknown, requestWasAnchored: boolean
     "malformed_response",
     "malformed_response_event",
   ].includes(detail.code ?? "")) return true;
-  if (
-    detail.code === "invalid_request_error" &&
-    detail.param === "previous_response_id" &&
-    /previous response.*not found/i.test(detail.message ?? "")
-  ) return true;
+  const invalidRequest = detail.code === "invalid_request_error"
+    || detail.type === "invalid_request_error"
+    || status === 400;
+  const rejectedPreviousResponse = detail.param === "previous_response_id"
+    || /invalid\s+[`'"]?previous_response_id[`'"]?/i.test(detail.message ?? directMessage)
+    || /previous response.*not found/i.test(detail.message ?? directMessage);
+  if (requestWasAnchored && invalidRequest && rejectedPreviousResponse) return true;
   return requestWasAnchored && (
     detail.code === "stream_incomplete"
     || /previous response owner account is unavailable/i.test(detail.message ?? "")

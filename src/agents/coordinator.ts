@@ -21,14 +21,17 @@ interface AgentTaskResult {
   code?: string;
 }
 
-const LEAF_INSTRUCTIONS = `You are a leaf coding agent delegated one self-contained task by a parent model.
-You have fresh conversation context and do not have the parent transcript. Treat the delegated task envelope as the complete handoff. Complete only that task. Inspect the workspace and use available tools as needed. Do not create agents, schedules, or ask the operator questions. Return a concise technical result to the parent, including findings or changes, validation, blockers, and any assumptions. Other agents may share the workspace, so avoid unrelated files and coordinate only through the task boundaries.`;
+const LEAF_MAX_TOOL_ROUNDS = 64;
+
+const LEAF_INSTRUCTIONS = `You are a leaf coding agent delegated one narrow, self-contained task by a parent model.
+You have fresh conversation context and do not have the parent transcript. Treat the delegated task envelope as the complete handoff. Complete only that task, then stop; do not broaden it into adjacent investigation, implementation, or review work. If the task proves broader than one bounded turn, finish the explicitly requested core where safe and report the remaining split points. Inspect the workspace and use available tools as needed. Do not create agents, schedules, or ask the operator questions. Return a concise technical result to the parent, including findings or changes, validation, blockers, and any assumptions. Other agents may share the workspace, so avoid unrelated files and coordinate only through the task boundaries.`;
 
 function taskPrompt(task: AgentTaskInput): string {
   return [
     "Delegated leaf-agent task",
     `Task ID: ${task.id}`,
     "Context contract: You do not have the parent conversation. Everything relevant must be present below or discovered from the workspace.",
+    "Scope contract: Deliver one narrow outcome in this bounded turn. Do not take on adjacent phases or unrelated cleanup.",
     "",
     task.prompt,
     "",
@@ -99,8 +102,10 @@ export class AgentCoordinator implements AgentBatchRunner {
 
   private createEngine(): ConversationEngine {
     const sharedInstructions = typeof this.instructions === "function" ? this.instructions() : this.instructions;
+    const leafConfig = structuredClone(this.config);
+    leafConfig.tools.maxToolRounds = Math.min(leafConfig.tools.maxToolRounds, LEAF_MAX_TOOL_ROUNDS);
     return new ConversationEngine(
-      this.config,
+      leafConfig,
       this.workspace,
       this.sessions,
       this.artifacts,

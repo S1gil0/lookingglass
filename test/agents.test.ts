@@ -153,7 +153,9 @@ test("agent coordinator runs isolated tasks concurrently with configured model m
   assert.ok(requests.every((request) => request.reasoningEffort === "high"));
   assert.ok(requests.every((request) => !JSON.stringify(request.input).includes("PARENT_TRANSCRIPT_MUST_NOT_LEAK")));
   assert.ok(requests.every((request) => request.instructions.includes("fresh conversation context")));
+  assert.ok(requests.every((request) => request.instructions.includes("one narrow, self-contained task")));
   assert.ok(requests.every((request) => JSON.stringify(request.input).includes("Context contract")));
+  assert.ok(requests.every((request) => JSON.stringify(request.input).includes("Scope contract")));
   assert.ok(result.output.indexOf("## slow") < result.output.indexOf("## fast"));
   assert.ok(result.output.indexOf("## fast") < result.output.indexOf("## third"));
   assert.match(result.output, /codex-lb:worker-model \| reasoning high/);
@@ -342,6 +344,78 @@ test("agent coordinator forwards child tool callbacks as agent progress actions"
   assert.ok(progress.some((message) => /agent "callbacks" \[tool progress_tool finished\]: result sample/.test(message)));
 });
 
+test("agent coordinator bounds leaf tool rounds independently of the main-session limit", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "looking-glass-agents-round-limit-"));
+  const artifactDir = join(root, "artifacts");
+  mkdirSync(artifactDir);
+  const db = openDatabase(join(root, "state.db"));
+  t.after(() => {
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+  const sessions = new SessionStore(db);
+  const artifacts = new ArtifactStore(db, artifactDir);
+  const parent = sessions.create({
+    workspace: root,
+    provider: "codex-lb",
+    model: "coordinator-model",
+    reasoningEffort: "medium",
+    agentProvider: "codex-lb",
+    agentModel: "worker-model",
+    agentReasoningEffort: "high",
+    verbosity: "low",
+    fast: false,
+    approvalMode: "unrestricted",
+  });
+  let requests = 0;
+  const client = {
+    supportsResponseContinuity: () => true,
+    async stream() {
+      requests += 1;
+      return toolCallResponse(`loop-${requests}`, "loop_tool", {});
+    },
+  } as unknown as CodexLbClient;
+  const loopTool: GlassTool<Record<string, never>> = {
+    name: "loop_tool",
+    description: "Continue a synthetic leaf loop.",
+    risk: "read",
+    parameters: { type: "object", properties: {}, additionalProperties: false },
+    summarize: () => "loop",
+    execute: async () => ({ output: "continue" }),
+  };
+  const config = structuredClone(DEFAULT_CONFIG);
+  const coordinator = new AgentCoordinator(
+    config,
+    root,
+    sessions,
+    artifacts,
+    () => client,
+    createWorkerToolRegistry().register(loopTool),
+    "main instructions",
+    async () => agentModel,
+  );
+  const result = await coordinator.run({
+    tasks: [{ id: "bounded", prompt: "Keep using the loop tool." }],
+    concurrency: 1,
+  }, {
+    workspace: root,
+    sessionId: parent.id,
+    config,
+    approvalMode: "unrestricted",
+    artifacts,
+    sessions,
+    signal: new AbortController().signal,
+    approve: async () => "deny",
+    ask: async () => "",
+  });
+
+  assert.equal(requests, 64);
+  assert.equal(config.tools.maxToolRounds, DEFAULT_CONFIG.tools.maxToolRounds);
+  assert.match(result.output, /## bounded \[failed\]/);
+  assert.match(result.output, /agent_tool_round_limit/);
+  assert.match(result.output, /split broad work into smaller independent tasks/);
+});
+
 test("agent coordinator propagates read-only context to code-mode child turns", async (t) => {
   const root = mkdtempSync(join(tmpdir(), "looking-glass-agents-readonly-"));
   const artifactDir = join(root, "artifacts");
@@ -471,7 +545,9 @@ test("main registry exposes agents while leaf registry prevents recursive delega
       return { output: "done" };
     },
   };
-  assert.ok(createCoreToolRegistry(undefined, runner).get("run_agents"));
+  const agentTool = createCoreToolRegistry(undefined, runner).get("run_agents");
+  assert.ok(agentTool);
+  assert.match(agentTool.description, /one narrow outcome that fits a bounded agent turn/);
   assert.equal(createWorkerToolRegistry().get("run_agents"), null);
   assert.equal(createWorkerToolRegistry().get("ask_user"), null);
   assert.equal(createWorkerToolRegistry().get("schedule_create"), null);

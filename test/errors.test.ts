@@ -183,6 +183,18 @@ test("classifies transient provider failures and preserves safe retry metadata",
     ["temporary model unavailable", providerHttpError(404, {
       error: { code: "model_unavailable", message: "model temporarily unavailable" },
     }, context), true],
+    ["terminal-less response stream", providerError({
+      code: "stream_incomplete", message: "response stream ended without a terminal event",
+    }, context), true],
+    ["upstream-truncated response stream", providerError({
+      code: "upstream_stream_truncated",
+      type: "server_error",
+      message: "Responses stream ended before a terminal event",
+    }, context), true],
+    ["response first-event timeout", providerError({
+      code: "response_first_event_timeout",
+      message: "Provider produced no stream event within 30 seconds",
+    }, context), true],
     ["unsupported endpoint", providerHttpError(404, {
       error: { code: "no_compatible_endpoint", message: "no compatible endpoint" },
     }, context), false],

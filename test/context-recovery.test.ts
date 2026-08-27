@@ -81,6 +81,21 @@ function response(id: string, text: string): Response {
   } as unknown as Response;
 }
 
+function rejectWhenAborted(signal: AbortSignal): Promise<never> {
+  return new Promise((_, reject) => {
+    const hold = setTimeout(() => reject(new Error("test abort wait exceeded")), 5_000);
+    const onAbort = (): void => {
+      clearTimeout(hold);
+      reject(signal.reason ?? new Error("aborted"));
+    };
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 function portableCheckpoint(id: string, text: string, inputTokens = 100) {
   return {
     id,
@@ -926,6 +941,212 @@ test("transient model failures retry one logical round with bounded backoff and 
   assert.equal(sessions.events(session.id).filter((event) => event.kind === "error").length, 0);
 });
 
+test("unanchored codex requests retry when no first stream event arrives", async (t) => {
+  const { root, sessions, session, artifacts } = fixture(t);
+  const delays: number[] = [];
+  const affinityKeys: string[] = [];
+  let requests = 0;
+  const client = {
+    async stream(request: ResponseRequest) {
+      requests += 1;
+      affinityKeys.push(request.promptCacheKey);
+      if (requests === 1) return rejectWhenAborted(request.signal!);
+      return response("first-event-retry", "FIRST_EVENT_RETRY");
+    },
+  } as unknown as CodexLbClient;
+  const engine = new ConversationEngine(
+    structuredClone(DEFAULT_CONFIG), root, sessions, artifacts, client, new ToolRegistry(), "instructions",
+    async (milliseconds: number) => { delays.push(milliseconds); },
+    undefined,
+    10,
+    10,
+  );
+
+  const result = await engine.turn(session.id, "retry silent request", {
+    signal: new AbortController().signal,
+    interaction: { approve: async () => "once", ask: async () => "" },
+    modelInfo,
+  });
+
+  assert.equal(result.text, "FIRST_EVENT_RETRY");
+  assert.equal(requests, 2);
+  assert.notEqual(affinityKeys[1], affinityKeys[0]);
+  assert.deepEqual(delays, [1_000]);
+  assert.equal(result.metrics?.providerRetries, 1);
+  assert.equal(sessions.events(session.id).filter((event) => event.kind === "error").length, 0);
+});
+
+test("unanchored replay allows longer gateway prefill than anchored continuity", async (t) => {
+  const { root, sessions, session, artifacts } = fixture(t);
+  let requests = 0;
+  const client = {
+    async stream(request: ResponseRequest) {
+      requests += 1;
+      return new Promise<Response>((resolve, reject) => {
+        const timer = setTimeout(() => resolve(response("slow-prefill", "SLOW_PREFILL")), 25);
+        const abort = (): void => {
+          clearTimeout(timer);
+          reject(request.signal?.reason ?? new Error("aborted"));
+        };
+        if (request.signal?.aborted) abort();
+        else request.signal?.addEventListener("abort", abort, { once: true });
+      });
+    },
+  } as unknown as CodexLbClient;
+  const engine = new ConversationEngine(
+    structuredClone(DEFAULT_CONFIG), root, sessions, artifacts, client, new ToolRegistry(), "instructions",
+    async () => undefined,
+    undefined,
+    5,
+    50,
+  );
+
+  const result = await engine.turn(session.id, "allow full replay prefill", {
+    signal: new AbortController().signal,
+    interaction: { approve: async () => "once", ask: async () => "" },
+    modelInfo,
+  });
+
+  assert.equal(result.text, "SLOW_PREFILL");
+  assert.equal(requests, 1);
+  assert.equal(result.metrics?.providerRetries, 0);
+});
+
+test("anchored first-event timeouts recover through stale continuity before backoff", async (t) => {
+  const { root, sessions, session, artifacts } = fixture(t);
+  sessions.setLastResponseId(session.id, "silent-anchor");
+  const previousIds: Array<string | undefined> = [];
+  const delays: number[] = [];
+  const client = {
+    async stream(request: ResponseRequest) {
+      previousIds.push(request.previousResponseId);
+      if (previousIds.length === 1) return rejectWhenAborted(request.signal!);
+      return response("anchor-timeout-recovery", "ANCHOR_TIMEOUT_RECOVERY");
+    },
+  } as unknown as CodexLbClient;
+  const engine = new ConversationEngine(
+    structuredClone(DEFAULT_CONFIG), root, sessions, artifacts, client, new ToolRegistry(), "instructions",
+    async (milliseconds: number) => { delays.push(milliseconds); },
+    undefined,
+    10,
+  );
+
+  const result = await engine.turn(session.id, "recover silent anchor", {
+    signal: new AbortController().signal,
+    interaction: { approve: async () => "once", ask: async () => "" },
+    modelInfo,
+  });
+
+  assert.equal(result.text, "ANCHOR_TIMEOUT_RECOVERY");
+  assert.deepEqual(previousIds, ["silent-anchor", undefined]);
+  assert.deepEqual(delays, []);
+});
+
+test("a visible delta disarms the unanchored first-event watchdog", async (t) => {
+  const { root, sessions, session, artifacts } = fixture(t);
+  let requests = 0;
+  const client = {
+    async stream(
+      _request: ResponseRequest,
+      callbacks?: { onTextDelta?: (delta: string) => void },
+    ) {
+      requests += 1;
+      callbacks?.onTextDelta?.("visible");
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      return response("visible-after-watchdog", "VISIBLE_AFTER_WATCHDOG");
+    },
+  } as unknown as CodexLbClient;
+  const engine = new ConversationEngine(
+    structuredClone(DEFAULT_CONFIG), root, sessions, artifacts, client, new ToolRegistry(), "instructions",
+    async () => undefined,
+    undefined,
+    10,
+  );
+
+  const result = await engine.turn(session.id, "allow visible response", {
+    signal: new AbortController().signal,
+    interaction: { approve: async () => "once", ask: async () => "" },
+    modelInfo,
+  });
+
+  assert.equal(result.text, "VISIBLE_AFTER_WATCHDOG");
+  assert.equal(requests, 1);
+  assert.equal(result.metrics?.providerRetries, 0);
+});
+
+test("caller cancellation during the first-event wait does not retry", async (t) => {
+  const { root, sessions, session, artifacts } = fixture(t);
+  const controller = new AbortController();
+  const delays: number[] = [];
+  let requests = 0;
+  const client = {
+    async stream(request: ResponseRequest) {
+      requests += 1;
+      return rejectWhenAborted(request.signal!);
+    },
+  } as unknown as CodexLbClient;
+  const engine = new ConversationEngine(
+    structuredClone(DEFAULT_CONFIG), root, sessions, artifacts, client, new ToolRegistry(), "instructions",
+    async (milliseconds: number) => { delays.push(milliseconds); },
+    undefined,
+    1_000,
+  );
+
+  const turn = engine.turn(session.id, "cancel silent request", {
+    signal: controller.signal,
+    interaction: { approve: async () => "once", ask: async () => "" },
+    modelInfo,
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  controller.abort();
+
+  await assert.rejects(turn);
+  assert.equal(requests, 1);
+  assert.deepEqual(delays, []);
+});
+
+test("terminal-less completion streams retry before visible output", async (t) => {
+  const { root, sessions, session, artifacts } = fixture(t);
+  const delays: number[] = [];
+  const affinityKeys: string[] = [];
+  let requests = 0;
+  const client = {
+    async stream(request: ResponseRequest) {
+      requests += 1;
+      affinityKeys.push(request.promptCacheKey);
+      if (requests === 1) {
+        throw Object.assign(new Error("response stream ended without a terminal event"), {
+          code: "stream_incomplete",
+        });
+      }
+      if (requests === 2) {
+        throw Object.assign(new Error("Responses stream ended before a terminal event"), {
+          code: "upstream_stream_truncated",
+          type: "server_error",
+        });
+      }
+      return response("stream-retry-success", "STREAM_RETRY_SUCCESS");
+    },
+  } as unknown as CodexLbClient;
+  const engine = new ConversationEngine(
+    structuredClone(DEFAULT_CONFIG), root, sessions, artifacts, client, new ToolRegistry(), "instructions",
+    async (milliseconds: number) => { delays.push(milliseconds); },
+  );
+
+  const result = await engine.turn(session.id, "retry truncated streams", {
+    signal: new AbortController().signal,
+    interaction: { approve: async () => "once", ask: async () => "" },
+    modelInfo,
+  });
+
+  assert.equal(result.text, "STREAM_RETRY_SUCCESS");
+  assert.equal(requests, 3);
+  assert.equal(new Set(affinityKeys).size, 3);
+  assert.deepEqual(delays, [1_000, 2_000]);
+  assert.equal(result.metrics?.providerRetries, 2);
+  assert.equal(sessions.events(session.id).filter((event) => event.kind === "error").length, 0);
+});
+
 test("abort during transient backoff does not issue another provider request", async (t) => {
   const { root, sessions, session, artifacts } = fixture(t);
   const controller = new AbortController();
@@ -1327,8 +1548,61 @@ test("stale anchored turns rotate affinity and retry once from local replay", as
   assert.equal(sessions.get(session.id)?.lastResponseId, "recovered");
 });
 
+test("invalid previous_response_id retries once from durable local replay", async (t) => {
+  const { root, sessions, session, artifacts } = fixture(t);
+  sessions.appendEvent<StoredUserPayload>(session.id, "user", { item: user("prior fact") });
+  sessions.appendEvent<StoredResponsePayload>(session.id, "response", {
+    response: { id: "prior_response", status: "completed", output: response("prior_response", "remembered").output },
+  });
+  sessions.setLastResponseId(session.id, "expired_response");
+  const requests: ResponseRequest[] = [];
+  const client = {
+    async stream(request: ResponseRequest) {
+      requests.push(request);
+      if (requests.length === 1) {
+        throw Object.assign(new Error(
+          "codex-lb stream failed with HTTP 400: Invalid `previous_response_id`. "
+            + "(code=invalid_request_error, type=invalid_request_error)",
+        ), {
+          code: "invalid_request_error",
+          type: "invalid_request_error",
+          status: 400,
+          retryable: false,
+        });
+      }
+      return response("recovered", "RECOVERED_FROM_INVALID_ANCHOR");
+    },
+  } as unknown as CodexLbClient;
+  const engine = new ConversationEngine(
+    structuredClone(DEFAULT_CONFIG), root, sessions, artifacts, client, new ToolRegistry(), "instructions",
+  );
+
+  const result = await engine.turn(session.id, "new fact", {
+    signal: new AbortController().signal,
+    interaction: { approve: async () => "once", ask: async () => "" },
+    modelInfo,
+  });
+
+  assert.equal(result.text, "RECOVERED_FROM_INVALID_ANCHOR");
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0]?.previousResponseId, "expired_response");
+  assert.equal(requests[1]?.previousResponseId, undefined);
+  assert.match(JSON.stringify(requests[1]?.input), /prior fact/);
+  assert.match(JSON.stringify(requests[1]?.input), /new fact/);
+});
+
 test("recognizes codex-lb anchored continuity failures", () => {
   assert.equal(isStaleResponseError({ code: "previous_response_owner_unavailable" }, true), true);
+  const invalidAnchor = Object.assign(new Error(
+    "codex-lb stream failed with HTTP 400: Invalid `previous_response_id`. "
+      + "(code=invalid_request_error, type=invalid_request_error)",
+  ), { code: "invalid_request_error", type: "invalid_request_error", status: 400 });
+  assert.equal(isStaleResponseError(invalidAnchor, true), true);
+  assert.equal(isStaleResponseError(invalidAnchor, false), false);
+  assert.equal(isStaleResponseError(Object.assign(
+    new Error("codex-lb stream failed with HTTP 400: Invalid model."),
+    { code: "invalid_request_error", type: "invalid_request_error", status: 400 },
+  ), true), false);
   assert.equal(isStaleResponseError(new Error("rsp.output is not iterable"), true), true);
   assert.equal(isStaleResponseError(Object.assign(new Error("gateway"), { status: 502 }), true), true);
   assert.equal(isStaleResponseError(new Error("rsp.output is not iterable"), false), false);

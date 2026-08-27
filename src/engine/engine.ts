@@ -39,6 +39,10 @@ import { toolCodeChanges, toolFiles } from "../visualizer/events.js";
 
 const OPERATION_LEASE_MS = 30_000;
 const OPERATION_HEARTBEAT_MS = Math.max(1, Math.floor(OPERATION_LEASE_MS / 3));
+const ANCHORED_FIRST_EVENT_TIMEOUT_MS = 30_000;
+// Full local replay requires gateway admission and model prefill before the first
+// event, so it needs substantially more time than a small continuity request.
+const UNANCHORED_FIRST_EVENT_TIMEOUT_MS = 3 * 60_000;
 
 export type SessionOperationLeaseLossPhase =
   | "reserved operation assertion"
@@ -227,6 +231,13 @@ function errorCode(error: unknown): string | undefined {
   return typeof value === "string" && /^[A-Za-z][A-Za-z0-9_.:-]{0,63}$/u.test(value) ? value : undefined;
 }
 
+function shouldRotateUnanchoredAffinity(error: unknown): boolean {
+  const code = errorCode(error)?.toLowerCase();
+  return code === "response_first_event_timeout"
+    || code === "stream_incomplete"
+    || code === "upstream_stream_truncated";
+}
+
 function errorField(error: unknown, field: string): string | undefined {
   if (!error || typeof error !== "object" || !(field in error)) return undefined;
   const value = (error as Record<string, unknown>)[field];
@@ -314,6 +325,8 @@ export class ConversationEngine {
     private readonly instructions: string,
     private readonly delay: RetryDelay = abortableRetryDelay,
     private readonly visualizerEvents?: VisualizerEventBus,
+    private readonly anchoredFirstEventTimeoutMs = ANCHORED_FIRST_EVENT_TIMEOUT_MS,
+    private readonly unanchoredFirstEventTimeoutMs = UNANCHORED_FIRST_EVENT_TIMEOUT_MS,
   ) {}
 
   private emitVisualizer(event: VisualizerEventInput): void {
@@ -660,6 +673,14 @@ export class ConversationEngine {
           previousResponseId = undefined;
         }
       }
+      if (session.kind === "agent") {
+        throw Object.assign(
+          new Error(
+            `Leaf task stopped after ${this.config.tools.maxToolRounds} tool rounds; split broad work into smaller independent tasks.`,
+          ),
+          { code: "agent_tool_round_limit" },
+        );
+      }
       throw new Error(`Stopped after ${this.config.tools.maxToolRounds} tool rounds`);
     } catch (error) {
       if (!(error instanceof SessionOperationLeaseError)
@@ -879,7 +900,7 @@ export class ConversationEngine {
     let visibleText = false;
 
     const streamAttempt = async (): Promise<Response> => {
-      const anchorAbort = new AbortController();
+      const firstEventAbort = new AbortController();
       const modelCallId = this.visualizerEvents?.nextId("model");
       const modelStartedAt = Date.now();
       const reasoningId = modelCallId ? `reasoning:${modelCallId}` : undefined;
@@ -912,17 +933,20 @@ export class ConversationEngine {
           status: "active",
         });
       }
-      let anchorTimedOut = false;
+      let firstEventTimedOut = false;
       let firstEventTimer: NodeJS.Timeout | undefined;
+      const firstEventTimeoutMs = currentPreviousResponseId
+        ? this.anchoredFirstEventTimeoutMs
+        : this.unanchoredFirstEventTimeoutMs;
       const clearFirstEventTimer = (): void => {
         if (firstEventTimer) clearTimeout(firstEventTimer);
         firstEventTimer = undefined;
       };
-      if (currentPreviousResponseId) {
+      if (currentSession.provider === "codex-lb") {
         firstEventTimer = setTimeout(() => {
-          anchorTimedOut = true;
-          anchorAbort.abort();
-        }, 30_000);
+          firstEventTimedOut = true;
+          firstEventAbort.abort();
+        }, firstEventTimeoutMs);
         firstEventTimer.unref();
       }
       try {
@@ -938,12 +962,13 @@ export class ConversationEngine {
           verbosity: currentSession.verbosity,
           fast: currentSession.fast,
           ...(currentPreviousResponseId ? { previousResponseId: currentPreviousResponseId } : {}),
-          signal: currentPreviousResponseId
-            ? AbortSignal.any([budgetSignal.signal, anchorAbort.signal])
+          signal: currentSession.provider === "codex-lb"
+            ? AbortSignal.any([budgetSignal.signal, firstEventAbort.signal])
             : budgetSignal.signal,
         }, {
           ...options.callbacks,
           onTextDelta: (delta) => {
+            clearFirstEventTimer();
             if (delta.length > 0) visibleText = true;
             options.callbacks?.onTextDelta?.(delta);
           },
@@ -1017,9 +1042,15 @@ export class ConversationEngine {
           duration: Math.max(0, Date.now() - modelStartedAt),
           summary: boundedNotice(errorMessage(error), configuredCredentialValues(this.config)),
         });
-        if (anchorTimedOut) {
-          throw Object.assign(new Error("Previous response produced no stream event within 30 seconds"), {
-            code: "previous_response_first_event_timeout",
+        if (firstEventTimedOut) {
+          const anchored = currentPreviousResponseId !== undefined;
+          const waitSeconds = Math.ceil(firstEventTimeoutMs / 1_000);
+          throw Object.assign(new Error(
+            anchored
+              ? `Previous response produced no stream event within ${waitSeconds} seconds`
+              : `Provider produced no stream event within ${waitSeconds} seconds`,
+          ), {
+            code: anchored ? "previous_response_first_event_timeout" : "response_first_event_timeout",
           });
         }
         throw error;
@@ -1091,6 +1122,13 @@ export class ConversationEngine {
           }
           if (!visibleText && !options.signal.aborted && isTransientProviderError(error)) {
             if (!retryBudgetCanRetry(retryBudget)) throw retryBudgetError(retryBudget);
+            if (currentPreviousResponseId === undefined && shouldRotateUnanchoredAffinity(error)) {
+              const recoverySession = this.store.resetContinuityFenced(session.id, executionToken);
+              if (!recoverySession) {
+                throw this.operationLeaseError(session.id, executionToken, "continuity recovery");
+              }
+              currentSession = recoverySession;
+            }
             retryBudget.retries += 1;
             metrics.providerRetries += 1;
             this.emitVisualizer({

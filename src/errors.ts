@@ -328,10 +328,10 @@ function hasUnsupportedClue(detail: DetailFields, clues: CauseClues): boolean {
 function hasTemporaryAvailabilityClue(detail: DetailFields, clues: CauseClues): boolean {
   const text = clueText(detail, clues);
   const codes = clueCodes(detail, clues);
-  if (codes.some((code) => /(?:OVERLOAD|OVERLOADED|TEMPORAR(?:Y|ILY)_UNAVAILABLE|(?:SERVICE|MODEL|PROVIDER|UPSTREAM|GATEWAY)_(?:UNAVAILABLE|NOT_AVAILABLE)|NO_(?:AVAILABLE_PROVIDER|PROVIDER_AVAILABLE)(?:S)?|CAPACITY(?:_EXCEEDED)?|RATE_LIMIT(?:ED)?|TOO_MANY_REQUESTS|MODEL_NOT_READY)/.test(code))) {
+  if (codes.some((code) => /(?:OVERLOAD|OVERLOADED|TEMPORAR(?:Y|ILY)_UNAVAILABLE|(?:SERVICE|MODEL|PROVIDER|UPSTREAM|GATEWAY)_(?:UNAVAILABLE|NOT_AVAILABLE)|NO_(?:AVAILABLE_PROVIDER|PROVIDER_AVAILABLE)(?:S)?|CAPACITY(?:_EXCEEDED)?|RATE_LIMIT(?:ED)?|TOO_MANY_REQUESTS|MODEL_NOT_READY|STREAM_INCOMPLETE|UPSTREAM_STREAM_TRUNCATED|RESPONSE_FIRST_EVENT_TIMEOUT)/.test(code))) {
     return true;
   }
-  return has(text, /\boverloaded\b|\bno available provider(?:s)?\b|\b(?:service|upstream|gateway) (?:is )?unavailable\b|\b(?:model|provider) (?:is )?(?:temporarily|currently|momentarily) unavailable\b|\btemporarily unavailable\b|\b(?:try again|retry) later\b|\bcapacity (?:is )?(?:full|exceeded|unavailable)\b/i);
+  return has(text, /\boverloaded\b|\bno available provider(?:s)?\b|\b(?:service|upstream|gateway) (?:is )?unavailable\b|\b(?:model|provider) (?:is )?(?:temporarily|currently|momentarily) unavailable\b|\btemporarily unavailable\b|\b(?:try again|retry) later\b|\bcapacity (?:is )?(?:full|exceeded|unavailable)\b|\b(?:response|completion) stream ended (?:before|without) (?:a )?(?:terminal event|\[DONE\])\b/i);
 }
 
 function hasNetworkClue(detail: DetailFields, clues: CauseClues): boolean {
