@@ -284,9 +284,10 @@ test("codex-lb falls back to bounded semantic Responses checkpoints only for inp
     assert.match(fallbackInputs, new RegExp(`result ${index}`));
   }
   const maxTokens = responseBodies[0]?.max_output_tokens;
-  assert.equal(typeof maxTokens, "number");
-  assert.ok((maxTokens as number) > 0 && (maxTokens as number) <= 8_192);
-  assert.ok(responseBodies.reduce((sum, body) => sum + Number(body.max_output_tokens ?? 0), 0) <= 8_192);
+  const expectedMaxTokens = Math.max(1_024, Math.floor(8_192 / responseBodies.length));
+  assert.equal(maxTokens, expectedMaxTokens);
+  assert.ok(responseBodies.every((body) => body.max_output_tokens === expectedMaxTokens));
+  assert.equal(responseBodies.reduce((sum, body) => sum + Number(body.max_output_tokens ?? 0), 0), responseBodies.length * expectedMaxTokens);
   for (const body of responseBodies) {
     assert.equal(body.service_tier, "priority");
     assert.equal(body.tools && Array.isArray(body.tools) && (body.tools as unknown[]).length, 0);
@@ -586,6 +587,21 @@ test("codex-lb semantic fallback bounds oversized parts, preserves usage, and re
     output_tokens: totalParts * 5_000,
     total_tokens: totalParts * 5_101,
   });
+  assert.deepEqual(compacted.compaction_details, {
+    total_parts: totalParts,
+    semantic_parts: totalParts,
+    local_parts: 0,
+    attempts: totalParts,
+    protocol_failures: 0,
+    transient_failures: 0,
+    quality: {
+      truncated_parts: totalParts,
+      incomplete_parts: 0,
+      max_output_tokens_per_part: Math.max(1_024, Math.floor(8_192 / totalParts)),
+      checkpoint_character_budget: 32_768,
+      checkpoint_characters: outputText.length,
+    },
+  });
   assert.equal(compacted.id, "compact_semantic_fallback");
   for (const body of responseBodies) {
     assert.deepEqual(body.text, { verbosity: "low" });
@@ -595,9 +611,201 @@ test("codex-lb semantic fallback bounds oversized parts, preserves usage, and re
   }
 });
 
+test("codex-lb semantic fallback allocates deterministic budgets across 32 parts", async (t) => {
+  const responseBodies: Record<string, unknown>[] = [];
+  t.mock.method(globalThis, "fetch", async (url: string, init?: RequestInit): Promise<Response> => {
+    if (url.endsWith("/responses/compact")) {
+      return Response.json({ error: { code: "responses_compact_input_too_large", message: "too large" } }, { status: 400 });
+    }
+    const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    responseBodies.push(body);
+    const part = Number(/transcript part (\d+) of (\d+)/u.exec(String(body.instructions))?.[1] ?? 0);
+    return Response.json({
+      id: `fallback_${part}`,
+      status: "completed",
+      output: [{
+        id: `fallback_message_${part}`,
+        type: "message",
+        role: "assistant",
+        status: "completed",
+        content: [{ type: "output_text", text: `HEAD_${part} ${"😀".repeat(4_000)} TAIL_${part}` }],
+      }],
+    });
+  });
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.gateway.provider = "codex-lb";
+  const transcriptLength = 32_768 * 32;
+  const inputText = "x".repeat(transcriptLength - "USER: ".length);
+  const compacted = await new CodexLbClient(config).compact({
+    model: request.model,
+    instructions: "Keep context",
+    input: [{ role: "user", content: [{ type: "input_text", text: inputText }] }] as ResponseInputItem[],
+    promptCacheKey: request.promptCacheKey,
+    fast: true,
+  });
+
+  assert.equal(responseBodies.length, 32);
+  const requestedParts = responseBodies
+    .map((body) => Number(/transcript part (\d+) of (\d+)/u.exec(String(body.instructions))?.[1] ?? 0))
+    .sort((left, right) => left - right);
+  assert.deepEqual(requestedParts, Array.from({ length: 32 }, (_, index) => index + 1));
+  assert.deepEqual(new Set(responseBodies.map((body) => body.max_output_tokens)), new Set([1_024]));
+  assert.equal(responseBodies.reduce((sum, body) => sum + Number(body.max_output_tokens ?? 0), 0), 32_768);
+
+  const outputText = String(((compacted.output as Array<Record<string, unknown>>)[0]?.content as Array<Record<string, unknown>>)[0]?.text);
+  assert.ok(outputText.length <= 65_536);
+  assert.doesNotMatch(outputText, /[\uD800-\uDFFF]/u);
+  assert.deepEqual(
+    [...outputText.matchAll(/TAIL_(\d+)/gu)].map((match) => Number(match[1])),
+    Array.from({ length: 32 }, (_, index) => index + 1),
+  );
+  assert.match(outputText, /HEAD_1 /u);
+  assert.match(outputText, /HEAD_32 /u);
+  assert.deepEqual(compacted.compaction_details, {
+    total_parts: 32,
+    semantic_parts: 32,
+    local_parts: 0,
+    attempts: 32,
+    protocol_failures: 0,
+    transient_failures: 0,
+    quality: {
+      truncated_parts: 32,
+      incomplete_parts: 0,
+      max_output_tokens_per_part: 1_024,
+      checkpoint_character_budget: 65_536,
+      checkpoint_characters: outputText.length,
+    },
+  });
+});
+
+test("codex-lb semantic fallback keeps the single-part budgets unchanged", async (t) => {
+  const responseBodies: Record<string, unknown>[] = [];
+  t.mock.method(globalThis, "fetch", async (url: string, init?: RequestInit): Promise<Response> => {
+    if (url.endsWith("/responses/compact")) {
+      return Response.json({ error: { code: "responses_compact_input_too_large", message: "too large" } }, { status: 400 });
+    }
+    const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    responseBodies.push(body);
+    return Response.json({
+      id: "fallback_single",
+      status: "completed",
+      output: [{
+        id: "fallback_single_message",
+        type: "message",
+        role: "assistant",
+        status: "completed",
+        content: [{ type: "output_text", text: "single durable summary" }],
+      }],
+    });
+  });
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.gateway.provider = "codex-lb";
+  const compacted = await new CodexLbClient(config).compact({
+    model: request.model,
+    instructions: request.instructions,
+    input: request.input,
+    promptCacheKey: request.promptCacheKey,
+    fast: false,
+  });
+
+  assert.equal(responseBodies.length, 1);
+  assert.equal(responseBodies[0]?.max_output_tokens, 8_192);
+  const outputText = String(((compacted.output as Array<Record<string, unknown>>)[0]?.content as Array<Record<string, unknown>>)[0]?.text);
+  assert.deepEqual(compacted.compaction_details, {
+    total_parts: 1,
+    semantic_parts: 1,
+    local_parts: 0,
+    attempts: 1,
+    protocol_failures: 0,
+    transient_failures: 0,
+    quality: {
+      truncated_parts: 0,
+      incomplete_parts: 0,
+      max_output_tokens_per_part: 8_192,
+      checkpoint_character_budget: 32_768,
+      checkpoint_characters: outputText.length,
+    },
+  });
+});
+
+test("codex-lb semantic fallback reports a nonempty incomplete response", async (t) => {
+  t.mock.method(globalThis, "fetch", async (url: string): Promise<Response> => {
+    if (url.endsWith("/responses/compact")) {
+      return Response.json({ error: { code: "responses_compact_input_too_large", message: "too large" } }, { status: 400 });
+    }
+    return Response.json({
+      id: "fallback_incomplete",
+      status: "incomplete",
+      output: [{
+        id: "fallback_incomplete_message",
+        type: "message",
+        role: "assistant",
+        status: "completed",
+        content: [{ type: "output_text", text: "accepted incomplete summary" }],
+      }],
+    });
+  });
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.gateway.provider = "codex-lb";
+  const compacted = await new CodexLbClient(config).compact({
+    model: request.model,
+    instructions: request.instructions,
+    input: request.input,
+    promptCacheKey: request.promptCacheKey,
+    fast: false,
+  });
+
+  const outputText = String(((compacted.output as Array<Record<string, unknown>>)[0]?.content as Array<Record<string, unknown>>)[0]?.text);
+  assert.match(outputText, /accepted incomplete summary/u);
+  assert.deepEqual(compacted.compaction_details, {
+    total_parts: 1,
+    semantic_parts: 1,
+    local_parts: 0,
+    attempts: 1,
+    protocol_failures: 0,
+    transient_failures: 0,
+    quality: {
+      truncated_parts: 0,
+      incomplete_parts: 1,
+      max_output_tokens_per_part: 8_192,
+      checkpoint_character_budget: 32_768,
+      checkpoint_characters: outputText.length,
+    },
+  });
+});
+
+test("codex-lb rejects more than 32 semantic transcript parts before semantic calls", async (t) => {
+  let compactRequests = 0;
+  let semanticRequests = 0;
+  t.mock.method(globalThis, "fetch", async (url: string): Promise<Response> => {
+    if (url.endsWith("/responses/compact")) {
+      compactRequests += 1;
+      return Response.json({ error: { code: "responses_compact_input_too_large", message: "too large" } }, { status: 400 });
+    }
+    semanticRequests += 1;
+    throw new Error("semantic fallback must not run for oversized input");
+  });
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.gateway.provider = "codex-lb";
+  const inputText = "x".repeat(32_768 * 32 + 1 - "USER: ".length);
+  await assert.rejects(() => new CodexLbClient(config).compact({
+    model: request.model,
+    instructions: request.instructions,
+    input: [{ role: "user", content: [{ type: "input_text", text: inputText }] }] as ResponseInputItem[],
+    promptCacheKey: request.promptCacheKey,
+    fast: false,
+  }), (error: unknown) => {
+    assert.equal((error as { code?: string }).code, "compaction_input_too_large");
+    return true;
+  });
+  assert.equal(compactRequests, 1);
+  assert.equal(semanticRequests, 0);
+});
+
 test("codex-lb retries an empty semantic part without affinity and combines its usage", async (t) => {
   const responseBodies: Record<string, unknown>[] = [];
   const attempts = new Map<number, number>();
+  const firstPartAttemptTimes: number[] = [];
   const statuses: string[] = [];
   let inFlight = 0;
   let maxInFlight = 0;
@@ -619,6 +827,7 @@ test("codex-lb retries an empty semantic part without affinity and combines its 
       const partNumber = Number(part?.[1] ?? 0);
       const attempt = (attempts.get(partNumber) ?? 0) + 1;
       attempts.set(partNumber, attempt);
+      if (partNumber === 1) firstPartAttemptTimes.push(performance.now());
       inFlight += 1;
       maxInFlight = Math.max(maxInFlight, inFlight);
       setTimeout(() => {
@@ -668,11 +877,27 @@ test("codex-lb retries an empty semantic part without affinity and combines its 
   assert.ok(totalParts > 1);
   assert.equal(responseBodies.length, totalParts + 1);
   assert.equal(attempts.get(1), 2);
+  assert.ok(firstPartAttemptTimes[1]! - firstPartAttemptTimes[0]! >= 450, "retry must back off");
+  const outputText = String(((compacted.output as Array<Record<string, unknown>>)[0]?.content as Array<Record<string, unknown>>)[0]?.text);
+  assert.deepEqual(compacted.compaction_details, {
+    total_parts: totalParts,
+    semantic_parts: totalParts,
+    local_parts: 0,
+    attempts: totalParts + 1,
+    protocol_failures: 1,
+    transient_failures: 0,
+    quality: {
+      truncated_parts: 0,
+      incomplete_parts: 0,
+      max_output_tokens_per_part: Math.max(1_024, Math.floor(8_192 / totalParts)),
+      checkpoint_character_budget: 32_768,
+      checkpoint_characters: outputText.length,
+    },
+  });
   assert.ok(maxInFlight <= 4);
   for (const body of responseBodies) assert.equal("prompt_cache_key" in body, false);
   assert.deepEqual(statuses, Array.from({ length: totalParts }, (_, index) => `Compacting context (${index + 1}/${totalParts} parts)`));
   assert.equal(new Set(statuses).size, totalParts);
-  const outputText = String(((compacted.output as Array<Record<string, unknown>>)[0]?.content as Array<Record<string, unknown>>)[0]?.text);
   assert.ok(outputText.length <= 32_768);
   assert.match(outputText, /summary 1/u);
   assert.deepEqual(compacted.usage, {
@@ -680,6 +905,36 @@ test("codex-lb retries an empty semantic part without affinity and combines its 
     output_tokens: totalParts * 3 + 5,
     total_tokens: totalParts * 13 + 80,
   });
+});
+
+test("codex-lb cancels semantic retry backoff without another request or checkpoint", async (t) => {
+  const controller = new AbortController();
+  const reason = new Error("caller cancelled");
+  let attempts = 0;
+  t.mock.method(globalThis, "fetch", async (url: string) => {
+    if (String(url).endsWith("/responses/compact")) {
+      return Response.json({ error: { code: "responses_compact_input_too_large", message: "too large" } }, { status: 400 });
+    }
+    attempts += 1;
+    return Response.json({ id: "empty", output: [] });
+  });
+  const config = structuredClone(DEFAULT_CONFIG);
+  const pending = new CodexLbClient(config).compact({
+    model: request.model,
+    instructions: "Keep context",
+    input: request.input,
+    promptCacheKey: request.promptCacheKey,
+    fast: false,
+    signal: controller.signal,
+  });
+  const rejected = assert.rejects(pending, (error: unknown) => error === reason);
+  // Drain the mocked fetch/body microtasks; the worker must now be waiting on
+  // its retry delay rather than immediately burning through all three attempts.
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(attempts, 1);
+  controller.abort(reason);
+  await rejected;
+  assert.equal(attempts, 1);
 });
 
 test("codex-lb exhausts empty semantic response retries with no checkpoint", async (t) => {
@@ -795,6 +1050,21 @@ test("codex-lb preserves completed semantic parts with a bounded local excerpt a
   assert.match(outputText, /DURABLE_TAIL_FACT/u);
   assert.ok(statuses.some((status) => status.includes("bounded local fallback")));
   assert.deepEqual(compacted.usage, { input_tokens: 32, output_tokens: 9, total_tokens: 41 });
+  assert.deepEqual(compacted.compaction_details, {
+    total_parts: 2,
+    semantic_parts: 1,
+    local_parts: 1,
+    attempts: 4,
+    protocol_failures: 3,
+    transient_failures: 0,
+    quality: {
+      truncated_parts: 0,
+      incomplete_parts: 0,
+      max_output_tokens_per_part: 4_096,
+      checkpoint_character_budget: 32_768,
+      checkpoint_characters: outputText.length,
+    },
+  });
   assert.equal(compacted.id, "compact_semantic_fallback");
 });
 
@@ -849,6 +1119,22 @@ test("codex-lb retries a timed-out semantic part without re-requesting completed
   assert.equal(responseBodies.length, 3);
   assert.equal(attempts.get(1), 1);
   assert.equal(attempts.get(2), 2);
+  const outputText = String(((compacted.output as Array<Record<string, unknown>>)[0]?.content as Array<Record<string, unknown>>)[0]?.text);
+  assert.deepEqual(compacted.compaction_details, {
+    total_parts: 2,
+    semantic_parts: 2,
+    local_parts: 0,
+    attempts: 3,
+    protocol_failures: 0,
+    transient_failures: 1,
+    quality: {
+      truncated_parts: 0,
+      incomplete_parts: 0,
+      max_output_tokens_per_part: 4_096,
+      checkpoint_character_budget: 32_768,
+      checkpoint_characters: outputText.length,
+    },
+  });
   assert.equal(compacted.id, "compact_semantic_fallback");
 });
 

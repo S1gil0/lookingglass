@@ -21,7 +21,7 @@ interface AgentTaskResult {
   code?: string;
 }
 
-const LEAF_MAX_TOOL_ROUNDS = 64;
+const LEAF_MAX_TOOL_ROUNDS = 128;
 
 const LEAF_INSTRUCTIONS = `You are a leaf coding agent delegated one narrow, self-contained task by a parent model.
 You have fresh conversation context and do not have the parent transcript. Treat the delegated task envelope as the complete handoff. Complete only that task, then stop; do not broaden it into adjacent investigation, implementation, or review work. If the task proves broader than one bounded turn, finish the explicitly requested core where safe and report the remaining split points. Inspect the workspace and use available tools as needed. Do not create agents, schedules, or ask the operator questions. Return a concise technical result to the parent, including findings or changes, validation, blockers, and any assumptions. Other agents may share the workspace, so avoid unrelated files and coordinate only through the task boundaries.`;

@@ -409,7 +409,7 @@ test("agent coordinator bounds leaf tool rounds independently of the main-sessio
     ask: async () => "",
   });
 
-  assert.equal(requests, 64);
+  assert.equal(requests, 128);
   assert.equal(config.tools.maxToolRounds, DEFAULT_CONFIG.tools.maxToolRounds);
   assert.match(result.output, /## bounded \[failed\]/);
   assert.match(result.output, /agent_tool_round_limit/);
