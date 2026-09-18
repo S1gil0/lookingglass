@@ -533,6 +533,30 @@ test("apply_patch classifies execute-time preflight failures before mutation", a
   assert.equal(readFileSync(path, "utf8"), "changed while approval was pending\n");
 });
 
+test("context-only patches retain approval policy and revalidate assertions after approval", async (t) => {
+  const { context, workspace } = fixture(t);
+  writeFileSync(join(workspace, "assert.txt"), "original\n");
+  writeFileSync(join(workspace, "edit.txt"), "before\n");
+  const registry = new ToolRegistry().register(applyPatchTool);
+  const args = registry.parseArguments("apply_patch", JSON.stringify({
+    patch: "*** Begin Patch\n*** Update File: edit.txt\n@@\n-before\n+after\n*** Update File: assert.txt\n@@\n original\n*** End Patch",
+  }));
+  context.config.tools.approval = "review";
+  context.approve = async () => "deny";
+  await assert.rejects(registry.execute("apply_patch", args, context), /denied/);
+  assert.equal(readFileSync(join(workspace, "edit.txt"), "utf8"), "before\n");
+  context.approve = async () => {
+    writeFileSync(join(workspace, "assert.txt"), "changed externally\n");
+    return "once";
+  };
+  await assert.rejects(registry.execute("apply_patch", args, context), (error: unknown) => {
+    assert.ok(error instanceof ToolPreflightError);
+    assert.match(error.message, /did not match exactly/);
+    return true;
+  });
+  assert.equal(readFileSync(join(workspace, "edit.txt"), "utf8"), "before\n");
+});
+
 test("Bash keeps executable approval scope while PowerShell stays exact-command scoped", (t) => {
   const { context, workspace } = fixture(t);
   mkdirSync(join(workspace, "subdir"));

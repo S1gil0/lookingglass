@@ -1048,6 +1048,29 @@ export class SessionStore {
     return rows.map(eventFromRow);
   }
 
+  /** Aggregate-only preflight for explicit checkpoint repair, including out-of-line tool outputs. */
+  sourceHistoryStats(sessionId: string, afterSequence: number, throughSequence: number): {
+    events: number; characters: number; missingToolOutputs: number;
+  } {
+    return this.db.prepare(`
+      SELECT COUNT(*) AS events,
+        COALESCE(SUM(length(e.payload_json) + COALESCE(length(t.output_text), 0)), 0) AS characters,
+        COALESCE(SUM(CASE WHEN e.kind IN ('tool_result', 'tool_denied')
+          AND json_extract(e.payload_json, '$.item') IS NULL
+          AND json_extract(e.payload_json, '$.output') IS NULL
+          AND t.output_text IS NULL THEN 1 ELSE 0 END), 0) AS missingToolOutputs
+      FROM session_events e
+      LEFT JOIN tool_calls t ON t.session_id = e.session_id
+        AND t.call_id = json_extract(e.payload_json, '$.callId')
+        AND e.kind IN ('tool_result', 'tool_denied')
+        AND json_extract(e.payload_json, '$.item') IS NULL
+        AND json_extract(e.payload_json, '$.output') IS NULL
+      WHERE e.session_id = ? AND e.sequence > ? AND e.sequence <= ?
+    `).get(sessionId, afterSequence, throughSequence) as {
+      events: number; characters: number; missingToolOutputs: number;
+    };
+  }
+
   recentEvents(sessionId: string, limit: number): SessionEvent[] {
     const boundedLimit = Number.isFinite(limit) ? Math.max(0, Math.floor(limit)) : 0;
     if (boundedLimit === 0) return [];
@@ -1070,15 +1093,15 @@ export class SessionStore {
     return row.count;
   }
 
-  latestResponseUsage(sessionId: string): { sequence: number; inputTokens: number } | null {
+  latestResponseUsage(sessionId: string): { sequence: number; inputTokens: number; createdAt: number } | null {
     const row = this.db.prepare(`
-      SELECT sequence, json_extract(payload_json, '$.response.usage.input_tokens') AS input_tokens
+      SELECT sequence, created_at, json_extract(payload_json, '$.response.usage.input_tokens') AS input_tokens
       FROM session_events
       WHERE session_id = ? AND kind = 'response'
         AND json_type(payload_json, '$.response.usage.input_tokens') IN ('integer', 'real')
       ORDER BY sequence DESC LIMIT 1
-    `).get(sessionId) as { sequence: number; input_tokens: number } | undefined;
-    return row ? { sequence: row.sequence, inputTokens: row.input_tokens } : null;
+    `).get(sessionId) as { sequence: number; input_tokens: number; created_at: number } | undefined;
+    return row ? { sequence: row.sequence, inputTokens: row.input_tokens, createdAt: row.created_at } : null;
   }
 
   semanticEventCount(sessionId: string, afterSequence = 0): number {
@@ -1187,6 +1210,7 @@ export class SessionStore {
     compact: Record<string, unknown>,
     inputTokens: number | null,
     replaceExisting = false,
+    preserveCheckpointId?: number,
   ): ContextCheckpoint | null {
     const save = this.db.transaction(() => {
       const createdAt = Date.now();
@@ -1202,8 +1226,8 @@ export class SessionStore {
         RETURNING id
       `).get(sessionId, throughSequence, JSON.stringify(compact), inputTokens, createdAt) as { id: number };
       if (replaceExisting) {
-        this.db.prepare("DELETE FROM context_checkpoints WHERE session_id = ? AND id <> ?")
-          .run(sessionId, result.id);
+        this.db.prepare("DELETE FROM context_checkpoints WHERE session_id = ? AND id <> ? AND id <> ?")
+          .run(sessionId, result.id, preserveCheckpointId ?? -1);
       }
       this.db.prepare("UPDATE sessions SET last_response_id = NULL, updated_at = ? WHERE id = ?")
         .run(createdAt, sessionId);
@@ -1212,29 +1236,37 @@ export class SessionStore {
     return save.immediate();
   }
 
-  latestCheckpoint(sessionId: string): ContextCheckpoint | null {
-    const row = this.db.prepare(`
+  latestCheckpoint(
+    sessionId: string,
+    options: { throughSequence?: number; portableOnly?: boolean; accept?: (compact: Record<string, unknown>) => boolean } = {},
+  ): ContextCheckpoint | null {
+    const rows = this.db.prepare(`
       SELECT * FROM context_checkpoints
-      WHERE session_id = ?
+      WHERE session_id = ? AND through_sequence <= ?
       ORDER BY through_sequence DESC
-      LIMIT 1
-    `).get(sessionId) as {
+      ${options.portableOnly || options.accept ? "" : "LIMIT 1"}
+    `).iterate(sessionId, options.throughSequence ?? Number.MAX_SAFE_INTEGER) as Iterable<{
       id: number;
       session_id: string;
       through_sequence: number;
       compact_json: string;
       input_tokens: number | null;
       created_at: number;
-    } | undefined;
-    if (!row) return null;
-    return {
-      id: row.id,
-      sessionId: row.session_id,
-      throughSequence: row.through_sequence,
-      compact: JSON.parse(row.compact_json) as Record<string, unknown>,
-      inputTokens: row.input_tokens,
-      createdAt: row.created_at,
-    };
+    }>;
+    for (const row of rows) {
+      const compact = JSON.parse(row.compact_json) as Record<string, unknown>;
+      if (options.portableOnly && !isPortableCheckpoint(compact)) continue;
+      if (options.accept && !options.accept(compact)) continue;
+      return {
+        id: row.id,
+        sessionId: row.session_id,
+        throughSequence: row.through_sequence,
+        compact,
+        inputTokens: row.input_tokens,
+        createdAt: row.created_at,
+      };
+    }
+    return null;
   }
 
   beginToolCall(

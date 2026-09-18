@@ -148,7 +148,8 @@ test("eventless interactive sessions stay out of history and can be discarded", 
   });
   assert.deepEqual(sessions.listWithMessages(root).map((item) => item.id), [used.id]);
   assert.equal(sessions.deleteIfEmpty(used.id), false);
-  assert.deepEqual(sessions.latestResponseUsage(used.id), { sequence: 2, inputTokens: 42 });
+  assert.deepEqual(sessions.latestResponseUsage(used.id), { sequence: 2, inputTokens: 42,
+    createdAt: sessions.events(used.id)[1]!.createdAt });
   assert.equal(sessions.semanticEventCount(used.id), 2);
 });
 
@@ -368,11 +369,7 @@ test("high-usage tool rounds compact before the next model request", async (t) =
     },
     async compact() {
       compactions += 1;
-      return {
-        id: "compact_1",
-        output: [{ type: "compaction_summary", encrypted_content: "bounded checkpoint" }],
-        usage: { input_tokens: 1_000 },
-      };
+      return portableCheckpoint("compact_1", "bounded checkpoint", 1_000);
     },
   } as unknown as CodexLbClient;
   const model = { ...modelInfo, contextWindow: 100_000, maxOutputTokens: null };
@@ -606,11 +603,7 @@ test("provider context overflow compacts and retries exactly once", async (t) =>
     },
     async compact() {
       compactions += 1;
-      return {
-        id: "compact_overflow",
-        output: [{ type: "compaction_summary", encrypted_content: "overflow checkpoint" }],
-        usage: { input_tokens: 1_000 },
-      };
+      return portableCheckpoint("compact_overflow", "overflow checkpoint", 1_000);
     },
   } as unknown as CodexLbClient;
   const engine = new ConversationEngine(
@@ -628,7 +621,7 @@ test("provider context overflow compacts and retries exactly once", async (t) =>
   assert.equal(result.metrics?.compactions, 1);
 });
 
-test("codex compaction rebuilds full history when a native checkpoint endpoint is unavailable", async (t) => {
+test("leaf compaction rebuilds history before summarizing a native checkpoint", async (t) => {
   const { root, sessions, session, artifacts, db } = fixture(t);
   sessions.appendEvent<StoredUserPayload>(session.id, "user", { item: user("history behind checkpoint") });
   sessions.appendEvent<StoredResponsePayload>(session.id, "response", {
@@ -643,7 +636,6 @@ test("codex compaction rebuilds full history when a native checkpoint endpoint i
     supportsResponseContinuity: () => true,
     async compact(request: { input: ResponseInputItem[] }) {
       compactInputs.push(request.input);
-      if (compactInputs.length === 1) throw Object.assign(new Error("Not Found"), { status: 404 });
       return portableCheckpoint("compact_rebuilt", "rebuilt full-history checkpoint");
     },
   } as unknown as CodexLbClient;
@@ -656,10 +648,9 @@ test("codex compaction rebuilds full history when a native checkpoint endpoint i
     automated: false,
   });
 
-  assert.equal(compactInputs.length, 2);
-  assert.match(JSON.stringify(compactInputs[0]), /OPAQUE_NATIVE_STATE/);
-  assert.match(JSON.stringify(compactInputs[1]), /history behind checkpoint/);
-  assert.doesNotMatch(JSON.stringify(compactInputs[1]), /OPAQUE_NATIVE_STATE/);
+  assert.equal(compactInputs.length, 1);
+  assert.match(JSON.stringify(compactInputs[0]), /history behind checkpoint/);
+  assert.doesNotMatch(JSON.stringify(compactInputs[0]), /OPAQUE_NATIVE_STATE/);
   assert.equal(sessions.latestCheckpoint(session.id)?.throughSequence, 2);
   assert.match(JSON.stringify(sessions.latestCheckpoint(session.id)?.compact), /rebuilt full-history checkpoint/);
   assert.equal((db.prepare(
@@ -744,11 +735,7 @@ test("oversized unanchored codex rejections compact and retry exactly once", asy
     },
     async compact() {
       compactions += 1;
-      return {
-        id: "compact_rejected",
-        output: [{ type: "compaction_summary", encrypted_content: "rejected-input checkpoint" }],
-        usage: { input_tokens: 1_000 },
-      };
+      return portableCheckpoint("compact_rejected", "rejected-input checkpoint", 1_000);
     },
   } as unknown as CodexLbClient;
   const engine = new ConversationEngine(
@@ -769,7 +756,7 @@ test("oversized unanchored codex rejections compact and retry exactly once", asy
   assert.match(JSON.stringify(requests[1]?.input), /rejected-input checkpoint/);
 });
 
-test("rejected portable codex replays compact to native context and retry once", async (t) => {
+test("rejected portable codex replays compact to a smaller portable checkpoint and retry once", async (t) => {
   const { root, sessions, session, artifacts } = fixture(t);
   sessions.saveCheckpoint(session.id, 0, {
     output: [{
@@ -795,11 +782,7 @@ test("rejected portable codex replays compact to native context and retry once",
     },
     async compact() {
       compactions += 1;
-      return {
-        id: "compact_portable",
-        output: [{ type: "compaction_summary", encrypted_content: "native checkpoint" }],
-        usage: { input_tokens: 100 },
-      };
+      return portableCheckpoint("compact_portable", "smaller portable checkpoint");
     },
   } as unknown as CodexLbClient;
   const engine = new ConversationEngine(
@@ -814,7 +797,7 @@ test("rejected portable codex replays compact to native context and retry once",
   assert.equal(requests.length, 2);
   assert.equal(compactions, 1);
   assert.equal(result.compacted, true);
-  assert.match(JSON.stringify(requests[1]?.input), /native checkpoint/);
+  assert.match(JSON.stringify(requests[1]?.input), /smaller portable checkpoint/);
 });
 
 test("normal-sized codex input rejections remain provider failures", async (t) => {
@@ -1282,7 +1265,7 @@ test("essential compaction retries transient failures while terminal maintenance
     async compact() {
       compactions += 1;
       if (compactions === 1) throw Object.assign(new Error("compactor unavailable"), { status: 503 });
-      return { id: "checkpoint", output: [], usage: { input_tokens: 10 } };
+      return portableCheckpoint("checkpoint", "durable checkpoint", 10);
     },
   } as unknown as CodexLbClient;
   const engine = new ConversationEngine(
@@ -1355,7 +1338,7 @@ test("completed answers survive terminal maintenance compaction failure", async 
   });
   assert.equal(result.text, "ANSWER_SURVIVES");
   assert.equal(result.compacted, false);
-  assert.ok(statuses.some((status) => /compaction deferred.*compactor unavailable/i.test(status)));
+  assert.ok(statuses.some((status) => /compaction deferred.*semantic: generic/i.test(status)));
   assert.ok(sessions.events(session.id).some((event) => event.kind === "error"
     && (event.payload as { code?: string }).code === "compaction_deferred"));
 });
@@ -1741,10 +1724,11 @@ test("failed stateless checkpoint conversion leaves history and checkpoint uncha
     signal: new AbortController().signal,
     interaction: { approve: async () => "once", ask: async () => "" },
     modelInfo,
-  }), /conversion unavailable/);
+  }), /semantic: generic \(HTTP 400\)/);
 
   assert.equal(streams, 0);
-  assert.deepEqual(sessions.events(session.id), beforeEvents);
+  assert.deepEqual(sessions.events(session.id).filter((event) => event.kind !== "note"), beforeEvents);
+  assert.ok(sessions.events(session.id).some((event) => (event.payload as { code?: string }).code === "compaction_failed"));
   assert.deepEqual(sessions.latestCheckpoint(session.id)?.compact, native);
 });
 
@@ -1772,7 +1756,7 @@ test("stateless migration refuses an unconvertible native-only checkpoint", asyn
     return true;
   });
   assert.equal(providerCalls, 0);
-  assert.equal(sessions.events(session.id).length, 0);
+  assert.equal(sessions.events(session.id).filter((event) => event.kind !== "note").length, 0);
   assert.deepEqual(sessions.latestCheckpoint(session.id)?.compact, native);
 });
 

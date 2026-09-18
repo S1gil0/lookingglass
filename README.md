@@ -487,6 +487,20 @@ Use `/fork` to create and switch to an independent copy of the active session. T
 
 Looking Glass stores session events and tool state in SQLite. Depending on the provider, it also stores local replay material or response continuity identifiers. Context compaction creates durable checkpoints instead of deleting the session's identity.
 
+Compaction keeps a bounded recent suffix of complete exchanges unchanged and summarizes older history using the session's configured **leaf model and provider** (`/agentmodel`), even with `/agents off`. It generates portable text directly rather than calling native/encrypted compaction, sizes summary parts against the leaf model's context and output limits, and never silently switches to the main model on failure. Legacy opaque checkpoints are reconstructed from durable semantic history, reusing the newest portable checkpoint when available.
+
+Summary parts share the existing bounded checkpoint allowance (32–64k characters, depending on part count). Space unused by shorter summaries is redistributed deterministically before longer summaries are trimmed. This does not increase output-token limits, request counts, or the replay-size limit. Genuine overflow and incomplete model output still produce quality warnings.
+
+Remote compaction is limited to two top-level attempts and three minutes in total (automated retry limits may shorten this); semantic parts retain their own bounded retries. Completed semantic parts survive the operation deadline; unfinished parts become bounded local excerpts. An outage with no completed semantic parts stops after at most twelve semantic requests instead of retrying every part. If essential compaction still fails because of an outage, empty summaries, or oversized history, the turn can continue with a clearly labeled, bounded local recovery checkpoint. This is an extractive fallback, not a semantic summary: older details may be omitted from model context, while source session events remain stored locally under the normal retention policy. Manual compaction reconciles interrupted tools with durable results or explicit unknown outcomes, without rerunning them. Cancellation, lease loss, authentication errors, active tool execution, and native checkpoints without recoverable source history are not bypassed. Optional end-of-turn maintenance can still defer compaction rather than degrade a completed answer.
+
+Checkpoint metadata records the summarizer, elapsed time, attempts, and bounded failure classifications (stage, known error code, HTTP status, part, and attempt). Diagnostics exclude raw provider error text and conversation content. Local excerpts, shortened summaries, and incomplete summaries produced by the current compaction still warn rather than show an unqualified success notice; hard failures retain the previous checkpoint and record a diagnostic note.
+
+Ordinary compaction retains inherited degradation as checkpoint provenance, but historical omissions alone no longer repeat warnings or label a successful compaction degraded. This applies to existing sessions without deleting history or old diagnostic notes: successfully summarizing an earlier lossy checkpoint does not restore its omitted details. Use **`/compact repair`** to explicitly attempt a source rebuild with the leaf model. Repair skips checkpoints marked degraded, reuses the newest usable portable checkpoint not marked degraded when available, and otherwise starts from retained original events. Normal compaction now retains one older usable checkpoint while degraded descendants exist, so future repairs need not replay the whole session. Historical tool calls are never executed again; durable results or explicit unknown outcomes are retained.
+
+Repair keeps the existing two-attempt/three-minute remote budget and 32-part limit. Its source preflight is capped at 8,388,608 characters of stored payloads and referenced tool outputs; leaf transcript limits may be tighter. Missing source events/results, oversized history, provider failure, cancellation, or a repair containing local excerpts, trimmed summaries, or incomplete output leave the previous checkpoint and response continuity intact. A diagnostic note may be added, and interrupted-tool reconciliation can record known results or uncertainty. Repair is opt-in because it can cost more than summarizing the current checkpoint. Very old sessions whose earlier usable checkpoints were already discarded may be too large to repair in one bounded operation; neither repair nor ordinary semantic summarization guarantees preservation of every detail.
+
+The `ctx:` meter refreshes as soon as a checkpoint is saved, including during a tool loop. It shows a replay estimate marked with `~` until fresh provider usage is available, ignoring pre-compaction usage from retained responses. The denominator remains the main conversation model's context window, not the summarizer's.
+
 The workspace is part of the session's operating context. Files are not copied into the database: the session continues to work against the same workspace on disk. If you schedule a prompt for a session, the scheduler opens that session in its workspace and sends the next model turn with the session's durable history.
 
 This means a scheduled session can naturally follow a task such as:
@@ -516,10 +530,10 @@ Enter slash commands inside `glass`:
 | `/model [ID]` | Select a primary model; without an ID, open the model picker |
 | `/reasoning [effort]` | Select primary model reasoning effort |
 | `/agents [on\|off]` | Enable or disable delegation for this session |
-| `/agentmodel [ID]` | Select the model used by leaf agents |
+| `/agentmodel [ID]` | Select the model used by leaf agents and compaction |
 | `/agentreasoning [effort]` | Select leaf-agent reasoning effort |
 | `/fast [on\|off]` | Toggle fast service when supported |
-| `/compact` | Compact the current conversation context |
+| `/compact [repair]` | Compact context, or explicitly rebuild from retained source history |
 | `/permissions [review\|code\|unrestricted]` | Change durable approval mode |
 | `/schedule ...` | Schedule an AI turn in this session |
 | `/cron [session]` | Browse, run, pause, resume, resolve, or delete schedules |
@@ -782,6 +796,8 @@ platform-aware: it disables startup profiles and runs noninteractive Bash on
 Linux and macOS, or Windows PowerShell (`powershell.exe`) on Windows. It bounds
 captured output, stores oversized results as artifacts, and terminates process
 groups on cancellation or timeout.
+
+Patches validate all operations before writing. Context-only hunks are accepted as exact, unique assertions, and unchanged files are reported without being rewritten. Stale or ambiguous matches, conflicting paths, workspace escapes, and malformed patches still fail preflight; approval rules are unchanged.
 
 ## Approval Modes
 

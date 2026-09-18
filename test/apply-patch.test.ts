@@ -88,6 +88,85 @@ test("deletes an existing file", async (t) => {
   assert.equal(output, "Deleted obsolete.txt");
 });
 
+test("context-only hunks can accompany edits in one fully preflighted patch", async (t) => {
+  const root = workspace(t);
+  writeFileSync(join(root, "first.txt"), "header\nbefore\ntail\n");
+  writeFileSync(join(root, "second.txt"), "stable\n");
+  const output = await apply(root, [
+    "*** Begin Patch", "*** Update File: first.txt", "@@", " header",
+    "@@", "-before", "+after", "@@", " tail",
+    "*** Update File: second.txt", "@@", " stable",
+    "*** Add File: third.txt", "+new", "*** End Patch",
+  ]);
+  assert.equal(readFileSync(join(root, "first.txt"), "utf8"), "header\nafter\ntail\n");
+  assert.equal(readFileSync(join(root, "second.txt"), "utf8"), "stable\n");
+  assert.equal(readFileSync(join(root, "third.txt"), "utf8"), "new");
+  assert.equal(output, "Updated first.txt\nUnchanged second.txt\nAdded third.txt");
+});
+
+for (const platform of ["linux", "win32"] as const) {
+  test(`verified no-ops preserve bytes and file identity on ${platform}`, (t) => {
+    const root = workspace(t);
+    const path = join(root, "same.txt");
+    // Includes mixed endings to ensure assertions never normalize file contents.
+    const content = "header\r\nstable\ntail\r\n";
+    writeFileSync(path, content);
+    const before = statSync(path, { bigint: true });
+    for (const hunk of [[" header"], ["-header", "+header"], ["-header", "+changed", "@@", "-changed", "+header"]]) {
+      const output = applyOnPlatform(root, [
+        "*** Begin Patch", "*** Update File: same.txt", "@@", ...hunk, "*** End Patch",
+      ], platform);
+      const after = statSync(path, { bigint: true });
+      assert.equal(output, "Unchanged same.txt");
+      assert.equal(readFileSync(path, "utf8"), content);
+      assert.equal(after.ino, before.ino);
+      assert.equal(after.mtimeNs, before.mtimeNs);
+      assert.equal(after.ctimeNs, before.ctimeNs);
+      assert.equal(after.mode, before.mode);
+      assert.deepEqual(readdirSync(root), ["same.txt"]);
+    }
+  });
+}
+
+for (const context of ["missing", "duplicate"]) {
+  test(`a ${context} context-only assertion rejects every operation without writes`, async (t) => {
+    const root = workspace(t);
+    writeFileSync(join(root, "early.txt"), "before\n");
+    writeFileSync(join(root, "assert.txt"), "duplicate\nother\nduplicate\n");
+    await assert.rejects(apply(root, [
+      "*** Begin Patch", "*** Update File: early.txt", "@@", "-before", "+after",
+      "*** Add File: nested/new.txt", "+new",
+      "*** Update File: assert.txt", "@@", ` ${context}`, "*** End Patch",
+    ]), context === "missing" ? /did not match exactly/ : /matched 2 locations/);
+    assert.equal(readFileSync(join(root, "early.txt"), "utf8"), "before\n");
+    assert.equal(readFileSync(join(root, "assert.txt"), "utf8"), "duplicate\nother\nduplicate\n");
+    assert.equal(existsSync(join(root, "nested")), false);
+  });
+}
+
+test("a context-only hunk can validate a move without changing its contents", async (t) => {
+  const root = workspace(t);
+  writeFileSync(join(root, "old.txt"), "header\r\nstable\n");
+  const output = await apply(root, [
+    "*** Begin Patch", "*** Update File: old.txt", "*** Move to: moved/new.txt",
+    "@@", " header", "*** End Patch",
+  ]);
+  assert.equal(readFileSync(join(root, "moved/new.txt"), "utf8"), "header\r\nstable\n");
+  assert.equal(existsSync(join(root, "old.txt")), false);
+  assert.equal(output, "Updated and moved old.txt -> moved/new.txt");
+});
+
+test("empty hunks and context-free insertions still fail before mutation", async (t) => {
+  const root = workspace(t);
+  writeFileSync(join(root, "source.txt"), "before\n");
+  for (const hunk of [[], ["+unanchored"]]) {
+    await assert.rejects(apply(root, [
+      "*** Begin Patch", "*** Update File: source.txt", "@@", ...hunk, "*** End Patch",
+    ]), /Empty hunk|no context or removed lines/);
+  }
+  assert.equal(readFileSync(join(root, "source.txt"), "utf8"), "before\n");
+});
+
 test("updates and moves a file while preserving its mode", async (t) => {
   const root = workspace(t);
   const source = join(root, "old.txt");

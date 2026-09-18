@@ -5,7 +5,8 @@ import type {
 } from "openai/resources/responses/responses";
 import { randomUUID } from "node:crypto";
 import type { CodexLbClient } from "../model/codex-lb.js";
-import { isStaleResponseError, requiresPortableCodexReplay } from "../model/codex-lb.js";
+import { hasUsableCompactionOutput, isRecoverableCompactionError, isStaleResponseError, requiresPortableCodexReplay } from "../model/codex-lb.js";
+import { CompactionDiagnostics, compactionFailure } from "../model/compaction-diagnostics.js";
 import type { ArtifactStore } from "../storage/artifact-store.js";
 import { isPortableCheckpoint, type OperationLeaseState, type SessionStore } from "../storage/session-store.js";
 import type { GatewayProvider, GlassConfig, ModelInfo, SessionRecord } from "../types.js";
@@ -15,6 +16,15 @@ import type { ToolRegistry } from "../tools/registry.js";
 import { ToolDeniedError, ToolPreflightError, toolApprovalSignature } from "../tools/registry.js";
 import { formatTaskPlanInstructions } from "../task-plan.js";
 import { projectContext } from "./context.js";
+import {
+  awaitCompaction,
+  COMPACTION_MAX_ATTEMPTS,
+  COMPACTION_MAX_ELAPSED_MS,
+  COMPACTION_RECENT_CHARACTERS,
+  COMPACTION_REPAIR_MAX_SOURCE_CHARACTERS,
+  compactionQuality,
+  localRecoveryCheckpoint,
+} from "./compaction.js";
 import { configuredCredentialValues, redactSensitiveText, redactSensitiveValue } from "../security.js";
 import { isTransientProviderError } from "../errors.js";
 import {
@@ -123,6 +133,8 @@ export interface EngineCallbacks {
   onReasoningSummary?(summary: string): void;
   onStatus?(status: string): void;
   onWarning?(message: string): void;
+  /** Fired after a checkpoint is durable, including mid-turn and degraded recovery. */
+  onContextCompacted?(): void;
   onToolStart?(notice: ToolExecutionNotice): void;
   onToolProgress?(notice: ToolExecutionNotice): void;
   onToolFinish?(notice: ToolExecutionNotice): void;
@@ -148,6 +160,18 @@ export interface TurnResult {
   toolCalls: number;
   compacted: boolean;
   metrics?: TurnMetrics;
+}
+
+export interface CompactionResult {
+  /** Quality loss in this operation, excluding omissions inherited from earlier checkpoints. */
+  degraded: boolean;
+  /** Historical omissions remain recorded even when this operation succeeds cleanly. */
+  inheritedDegradation: boolean;
+}
+
+export interface CompactionOptions extends Pick<TurnOptions, "signal" | "callbacks" | "automated"> {
+  /** Opt-in source replay; never replace the current checkpoint with degraded repair output. */
+  repair?: boolean;
 }
 
 export interface TurnMetrics {
@@ -327,6 +351,7 @@ export class ConversationEngine {
     private readonly visualizerEvents?: VisualizerEventBus,
     private readonly anchoredFirstEventTimeoutMs = ANCHORED_FIRST_EVENT_TIMEOUT_MS,
     private readonly unanchoredFirstEventTimeoutMs = UNANCHORED_FIRST_EVENT_TIMEOUT_MS,
+    private readonly compactionModelFor?: (id: string, provider: GatewayProvider, signal: AbortSignal) => Promise<ModelInfo>,
   ) {}
 
   private emitVisualizer(event: VisualizerEventInput): void {
@@ -512,14 +537,7 @@ export class ConversationEngine {
     executionToken: string,
     metrics: TurnMetricsState,
   ): Promise<TurnResult> {
-    try {
-      this.store.reconcileToolCallEvents(sessionId, executionToken);
-    } catch (error) {
-      if (isStoreLeaseLoss(error)) {
-        throw this.operationLeaseError(sessionId, executionToken, "tool reconciliation");
-      }
-      throw this.operationLeaseUnavailableError("tool reconciliation");
-    }
+    this.reconcileToolCalls(sessionId, executionToken);
     if (this.store.hasUnanchoredContext(sessionId) && this.store.get(sessionId)?.lastResponseId) {
       if (!this.store.resetContinuityFenced(sessionId, executionToken)) {
         throw this.operationLeaseError(sessionId, executionToken, "continuity recovery");
@@ -699,29 +717,114 @@ export class ConversationEngine {
     }
   }
 
-  async compactNow(sessionId: string, options: Pick<TurnOptions, "signal" | "callbacks" | "automated">): Promise<void> {
+  async compactNow(sessionId: string, options: CompactionOptions): Promise<CompactionResult | undefined> {
     return this.withOperationLease(sessionId, "compact", options.signal, async (signal, executionToken) => {
+      // Restore durable results (or explicit uncertainty), never execute tools again.
+      this.reconcileToolCalls(sessionId, executionToken);
       return this.compactLocked(sessionId, { ...options, signal }, executionToken);
     });
   }
 
+  private reconcileToolCalls(sessionId: string, executionToken: string): void {
+    try {
+      this.store.reconcileToolCallEvents(sessionId, executionToken);
+    } catch (error) {
+      if (isStoreLeaseLoss(error)) {
+        throw this.operationLeaseError(sessionId, executionToken, "tool reconciliation");
+      }
+      throw this.operationLeaseUnavailableError("tool reconciliation");
+    }
+  }
+
   private async compactLocked(
     sessionId: string,
-    options: Pick<TurnOptions, "signal" | "callbacks" | "automated">,
+    options: CompactionOptions & Partial<Pick<TurnOptions, "modelInfo">>,
     executionToken: string,
     metrics?: TurnMetricsState,
     essential = true,
-  ): Promise<void> {
+  ): Promise<CompactionResult | undefined> {
+    const diagnostics = new CompactionDiagnostics();
+    try {
+      return await this.compactWithDiagnostics(sessionId, options, executionToken, diagnostics, metrics, essential);
+    } catch (error) {
+      if (options.signal.aborted || isStoreLeaseLoss(error)
+        || ["session_operation_lease_lost", "session_operation_lease_unavailable"].includes(errorCode(error) ?? "")) throw error;
+      diagnostics.record(error);
+      const session = this.requireSession(sessionId);
+      const message = redactSensitiveText(
+        `${options.repair ? "Checkpoint repair" : "Compaction"} with ${session.agentProvider}:${session.agentModel} failed (${diagnostics.summary()}). `
+        + "No new checkpoint saved; no fallback to the main model was attempted.",
+        configuredCredentialValues(this.config),
+      );
+      const savedDiagnostics = redactSensitiveValue({
+        provider: session.agentProvider, model: session.agentModel, ...diagnostics.snapshot(),
+      }, configuredCredentialValues(this.config));
+      if (!this.store.appendEventFenced(sessionId, executionToken, "note", {
+        code: "compaction_failed", message, diagnostics: savedDiagnostics,
+      })) throw this.operationLeaseError(sessionId, executionToken, "saving compacted context");
+      const failure = compactionFailure(error, diagnostics.stage);
+      throw Object.assign(new Error(message), {
+        code: failure.code ?? "compaction_failed", kind: failure.kind,
+        ...(failure.status !== undefined ? { status: failure.status } : {}),
+      });
+    }
+  }
+
+  private async compactWithDiagnostics(
+    sessionId: string,
+    options: CompactionOptions & Partial<Pick<TurnOptions, "modelInfo">>,
+    executionToken: string,
+    diagnostics: CompactionDiagnostics,
+    metrics?: TurnMetricsState,
+    essential = true,
+  ): Promise<CompactionResult | undefined> {
     const session = this.requireSession(sessionId);
-    const client = this.clientFor(session.provider);
+    // Summarization is independent of delegation. Never retry on the main model.
+    const provider = session.agentProvider;
+    const model = session.agentModel;
+    const client = this.clientFor(provider);
     const checkpoint = this.store.latestCheckpoint(sessionId);
-    const portableRequired = client.supportsResponseContinuity?.() === false;
-    let context = portableRequired && checkpoint && !isPortableCheckpoint(checkpoint.compact)
-      ? projectContext(this.store, sessionId, { ignoreCheckpoint: true })
-      : projectContext(this.store, sessionId);
-    let reconstructedFullHistory = portableRequired && checkpoint !== null && !isPortableCheckpoint(checkpoint.compact);
+    const sourceSequence = this.store.latestSequence(sessionId);
+    const sourceCheckpoint = this.store.latestCheckpoint(sessionId, {
+      portableOnly: true,
+      ...(options.repair ? { accept: (compact: Record<string, unknown>) => hasUsableCompactionOutput(compact)
+        && !compactionQuality(compact).degraded } : {}),
+    });
+    if (options.repair) {
+      const afterSequence = sourceCheckpoint?.throughSequence ?? 0;
+      const source = this.store.sourceHistoryStats(sessionId, afterSequence, sourceSequence);
+      if ((checkpoint && (checkpoint.throughSequence > sourceSequence
+          || (checkpoint.throughSequence === 0 && sourceCheckpoint?.id !== checkpoint.id)))
+        || source.events !== sourceSequence - afterSequence || source.missingToolOutputs > 0) {
+        throw Object.assign(new Error("Repair requires complete retained history after its source checkpoint"), {
+          code: "compaction_repair_source_unavailable",
+        });
+      }
+      if (source.characters + JSON.stringify(sourceCheckpoint?.compact.output ?? []).length > COMPACTION_REPAIR_MAX_SOURCE_CHARACTERS) {
+        throw Object.assign(new Error("Source history exceeds the bounded repair limit"), {
+          code: "compaction_input_too_large",
+        });
+      }
+    }
+    const requireNativeSource = (): void => {
+      if (checkpoint && !isPortableCheckpoint(checkpoint.compact)
+        && projectContext(this.store, sessionId, {
+          portableCheckpointOnly: true, throughSequence: checkpoint.throughSequence,
+        }).input.length === 0) {
+        throw Object.assign(new Error("Native checkpoint has no durable semantic history for recovery"), {
+          code: "checkpoint_conversion_unavailable",
+        });
+      }
+    };
+    if (!options.repair) requireNativeSource();
+    const recentCharacters = options.modelInfo
+      ? Math.min(COMPACTION_RECENT_CHARACTERS, Math.floor(this.usableContextTokens(options.modelInfo) * 0.8))
+      : COMPACTION_RECENT_CHARACTERS;
+    const context = projectContext(this.store, sessionId, {
+      checkpoint: sourceCheckpoint, throughSequence: sourceSequence, retainRecentCharacters: recentCharacters,
+    });
     if (context.input.length === 0) {
-      if (portableRequired && checkpoint && !isPortableCheckpoint(checkpoint.compact)) {
+      if (checkpoint && !isPortableCheckpoint(checkpoint.compact)) {
         throw Object.assign(new Error("Native checkpoint cannot be converted because no semantic history is available"), {
           code: "checkpoint_conversion_unavailable",
         });
@@ -737,20 +840,25 @@ export class ConversationEngine {
       entityId: compactionId,
       ...(metrics?.turnId ? { parentId: metrics.turnId } : {}),
       ...(metrics?.visualizerAgentId ? { agentId: metrics.visualizerAgentId } : {}),
-      model: session.model,
-      provider: session.provider,
+      model,
+      provider,
       contextTokens: Math.ceil(JSON.stringify(context.input).length / 4),
       status: "active",
       summary: "compacting context",
     });
-    const retryBudget = createRetryBudget(options.automated
-      ? {
-          maxAttempts: this.config.automation.providerRetryMaxAttempts,
-          maxElapsedMs: this.config.automation.providerRetryMaxElapsedMs,
-        }
-      : undefined);
+    // Compaction is an optimization, not an indefinitely retried dependency of
+    // interactive turns. Automated limits can tighten, never extend, this bound.
+    const retryBudget = createRetryBudget({
+      maxAttempts: Math.min(COMPACTION_MAX_ATTEMPTS,
+        options.automated ? this.config.automation.providerRetryMaxAttempts : Number.POSITIVE_INFINITY),
+      maxElapsedMs: Math.min(COMPACTION_MAX_ELAPSED_MS,
+        options.automated ? this.config.automation.providerRetryMaxElapsedMs : Number.POSITIVE_INFINITY),
+    });
     const budgetSignal = composeRetryBudgetSignal(options.signal, retryBudget);
     let compact: Awaited<ReturnType<CodexLbClient["compact"]>>;
+    let partialCompact: Record<string, unknown> | undefined;
+    let remoteActive = true;
+    let compactionModel: ModelInfo | undefined;
     try {
       while (true) {
         options.signal.throwIfAborted();
@@ -759,48 +867,56 @@ export class ConversationEngine {
           throw retryBudgetError(retryBudget);
         }
         const attempt = markRetryAttempt(retryBudget);
-        options.callbacks?.onStatus?.("Compacting context");
+        diagnostics.attempts = attempt;
+        options.callbacks?.onStatus?.(`${options.repair ? "Repairing context from retained source" : "Compacting context"} with ${provider}:${model}`);
         try {
-          compact = await client.compact({
-            model: session.model,
+          diagnostics.stage = "model";
+          compactionModel ??= this.compactionModelFor
+            ? await awaitCompaction(this.compactionModelFor(model, provider, budgetSignal.signal), budgetSignal.signal)
+            : (provider === session.provider && model === options.modelInfo?.id ? options.modelInfo : undefined);
+          diagnostics.stage = "semantic";
+          compact = await awaitCompaction(client.compact({
+            model,
             instructions: this.instructionsFor(session),
             input: context.input,
             promptCacheKey: session.promptCacheKey,
-            fast: session.fast,
+            fast: false,
+            semanticOnly: true,
+            ...(compactionModel ? { modelInfo: compactionModel } : {}),
             signal: budgetSignal.signal,
-            ...(options.callbacks?.onStatus ? { onStatus: options.callbacks.onStatus } : {}),
-          });
+            onPartialCheckpoint: (partial) => {
+              if (remoteActive && !budgetSignal.signal.aborted
+                && isPortableCheckpoint(partial) && hasUsableCompactionOutput(partial)) {
+                partialCompact = structuredClone(partial);
+              }
+            },
+            onStatus: (status) => {
+              if (remoteActive && !budgetSignal.signal.aborted) options.callbacks?.onStatus?.(status);
+            },
+            onFailure: (failure) => {
+              if (remoteActive && !budgetSignal.signal.aborted) diagnostics.record(failure, failure.stage, failure);
+            },
+          }), budgetSignal.signal);
           budgetSignal.signal.throwIfAborted();
           if (retryBudgetExpired(retryBudget)) throw retryBudgetError(retryBudget);
+          if (!hasUsableCompactionOutput(compact)) {
+            throw Object.assign(new Error("Compaction returned no usable checkpoint"), {
+              code: "malformed_response", kind: "protocol",
+            });
+          }
+          if (!isPortableCheckpoint(compact)) {
+            throw Object.assign(new Error("Leaf compaction did not return a portable text checkpoint"), {
+              code: "nonportable_compaction",
+            });
+          }
           break;
         } catch (error) {
           if (options.signal.aborted) throw options.signal.reason ?? error;
           if (budgetSignal.signal.aborted) throw retryBudgetError(retryBudget);
           if (isStoreLeaseLoss(error) || errorCode(error) === "session_operation_lease_lost") throw error;
-          const status = error && typeof error === "object" && typeof (error as { status?: unknown }).status === "number"
-            ? (error as { status: number }).status
-            : null;
-          const needsNativeHistoryFallback = session.provider === "codex-lb"
-            && !reconstructedFullHistory
-            && context.input.some((item) => item.type === "compaction")
-            && (status === 404 || errorCode(error) === "responses_compact_input_too_large");
-          if (needsNativeHistoryFallback) {
-            context = projectContext(this.store, sessionId, { ignoreCheckpoint: true });
-            if (context.input.length === 0) throw error;
-            reconstructedFullHistory = true;
-            if (metrics) metrics.providerRetries += 1;
-            this.emitVisualizer({
-              type: "retry",
-              sessionId,
-              ...(metrics?.turnId ? { turnId: metrics.turnId } : {}),
-              ...(compactionId ? { parentId: compactionId } : {}),
-              ...(metrics?.visualizerAgentId ? { agentId: metrics.visualizerAgentId } : {}),
-              status: "complete",
-              summary: "recovering native checkpoint from full history",
-            });
-            options.callbacks?.onStatus?.("Recovering native checkpoint from full history");
-            continue;
-          }
+          diagnostics.record(error, diagnostics.stage, { attempt });
+          // Keep completed parts instead of redoing the entire operation.
+          if (partialCompact && isRecoverableCompactionError(error)) throw error;
           if (!isTransientProviderError(error)) throw error;
           if (!essential) throw error;
           if (!retryBudgetCanRetry(retryBudget)) throw retryBudgetError(retryBudget);
@@ -818,14 +934,48 @@ export class ConversationEngine {
           await this.waitForRetry(options.callbacks, options.signal, attempt, retryBudget);
         }
       }
+    } catch (error) {
+      options.signal.throwIfAborted();
+      // Do not hide authorization, lease, invalid request, or application errors.
+      // Exhausted/oversized semantic work gets a clearly labeled local checkpoint.
+      if (options.repair || !essential || !(isRecoverableCompactionError(error)
+        || errorCode(error) === "automated_provider_retry_exhausted")) throw error;
+      diagnostics.record(error);
+      compact = partialCompact ?? localRecoveryCheckpoint(context.input, recentCharacters);
     } finally {
+      remoteActive = false;
       budgetSignal.dispose();
     }
-    if (portableRequired && !isPortableCheckpoint(compact)) {
+    options.signal.throwIfAborted();
+    diagnostics.stage = "checkpoint";
+    if (!isPortableCheckpoint(compact)) {
       throw Object.assign(new Error("Stateless provider compaction did not return a portable text checkpoint"), {
         code: "nonportable_compaction",
       });
     }
+    const details = compact.compaction_details as Record<string, unknown> | undefined;
+    const inheritedDegradation = sourceCheckpoint && compactionQuality(sourceCheckpoint.compact).degraded;
+    compact = redactSensitiveValue({ ...compact, compaction_details: {
+      ...details,
+      ...(inheritedDegradation ? { quality: {
+        ...(details?.quality as Record<string, unknown> | undefined), inherited_degradation: true,
+      } } : {}),
+      ...(options.repair ? { source_repair: true } : {}),
+      source_checkpoint_sequence: sourceCheckpoint?.throughSequence ?? 0,
+      provider, model, source_sequence: sourceSequence, diagnostics: diagnostics.snapshot(),
+    } }, configuredCredentialValues(this.config));
+    const quality = compactionQuality(compact);
+    if (options.repair && quality.degraded) {
+      throw Object.assign(new Error("Repair did not produce a complete semantic checkpoint"), {
+        code: "compaction_repair_incomplete",
+      });
+    }
+    // Keep one older non-degraded portable anchor while degraded descendants
+    // exist. Repair then only needs events since that anchor, not the whole session.
+    const repairAnchor = quality.degraded ? this.store.latestCheckpoint(sessionId, {
+      portableOnly: true, throughSequence: context.latestSequence - 1,
+      accept: (candidate) => hasUsableCompactionOutput(candidate) && !compactionQuality(candidate).degraded,
+    }) : null;
     const usage = compact.usage;
     const inputTokens = usage && typeof usage === "object" && !Array.isArray(usage)
       && typeof (usage as Record<string, unknown>).input_tokens === "number"
@@ -833,11 +983,36 @@ export class ConversationEngine {
       : null;
     if (!this.store.saveCheckpointAndResetContinuityFenced(
       sessionId, executionToken, context.latestSequence, compact, inputTokens,
-      portableRequired || reconstructedFullHistory,
+      true, repairAnchor?.id,
     )) {
       throw this.operationLeaseError(sessionId, executionToken, "saving compacted context");
     }
     if (metrics) metrics.compactions += 1;
+    // Report this operation's quality, not inherited-only omissions. The durable
+    // provenance and repair safeguards above continue to use aggregate quality.
+    const { currentDegradation: degraded, localRecovery, localParts, totalParts, truncatedParts, incompleteParts } = quality;
+    if (degraded) {
+      const recovery = localRecovery
+        ? "Remote summarization failed; using a degraded local recovery checkpoint, not a semantic summary."
+        : localParts > 0 ? `Context checkpoint includes local excerpts (${localParts}/${totalParts} parts).`
+          : truncatedParts || incompleteParts ? "Context checkpoint contains shortened or incomplete summaries."
+            : "Context compaction produced a degraded checkpoint.";
+      const message = redactSensitiveText(
+        `${recovery} Summarizer: ${provider}:${model}. `
+        + (localRecovery || localParts > 0 ? `Reason: ${diagnostics.summary()}. ` : "")
+        + (truncatedParts || incompleteParts ? `Quality: ${truncatedParts} trimmed, ${incompleteParts} incomplete parts. ` : "")
+        + (quality.inheritedDegradation ? "Earlier checkpoint omissions have not been repaired. " : "")
+        + "Older details may be omitted; source history is retained under the normal retention policy. "
+        + "Use /compact repair to attempt a bounded source rebuild.", configuredCredentialValues(this.config),
+      );
+      if (!this.store.appendEventFenced(sessionId, executionToken, "note", {
+        code: "compaction_degraded", message, throughSequence: context.latestSequence,
+        diagnostics: (compact.compaction_details as Record<string, unknown>).diagnostics,
+      })) throw this.operationLeaseError(sessionId, executionToken, "saving compacted context");
+      try { options.callbacks?.onWarning?.(message); } catch { /* Observer only. */ }
+    }
+    const contextTokens = Math.ceil(JSON.stringify(projectContext(this.store, sessionId).input).length / 4);
+    try { options.callbacks?.onContextCompacted?.(); } catch { /* Observer only. */ }
     if (compactionId) this.emitVisualizer({
       type: "context.compact",
       sessionId,
@@ -845,14 +1020,18 @@ export class ConversationEngine {
       entityId: compactionId,
       ...(metrics?.turnId ? { parentId: metrics.turnId } : {}),
       ...(metrics?.visualizerAgentId ? { agentId: metrics.visualizerAgentId } : {}),
-      model: session.model,
-      provider: session.provider,
+      model,
+      provider,
       ...(inputTokens !== null ? { inputTokens } : {}),
+      contextTokens,
+      ...(options.modelInfo ? { contextWindow: options.modelInfo.contextWindow } : {}),
       duration: Math.max(0, Date.now() - compactionStartedAt),
       status: "complete",
-      summary: "context compacted",
+      summary: degraded ? "context compacted (degraded checkpoint)" : "context compacted",
     });
-    options.callbacks?.onStatus?.("Context compacted");
+    try { options.callbacks?.onStatus?.(degraded ? "Context compacted (degraded checkpoint)" : "Context compacted"); }
+    catch { /* A committed checkpoint cannot be undone by an observer. */ }
+    return { degraded, inheritedDegradation: quality.inheritedDegradation };
   }
 
   private async waitForRetry(

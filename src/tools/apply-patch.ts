@@ -70,6 +70,7 @@ interface PreparedUpdate {
   content: string;
   mode: number;
   moved: boolean;
+  unchanged: boolean;
 }
 
 interface PreparedDelete {
@@ -186,7 +187,6 @@ function parsePatch(patch: string): Operation[] {
         if (header === undefined) throw new Error(`Missing hunk header for ${path}`);
         const anchor = parseHunkHeader(header);
         const hunkLines: HunkLine[] = [];
-        let hasChange = false;
         index += 1;
 
         while (index < lines.length && !lines[index]?.startsWith("@@") && !lines[index]?.startsWith("***")) {
@@ -199,10 +199,8 @@ function parsePatch(patch: string): Operation[] {
             hunkLines.push({ kind: "context", text: hunkLine.slice(1) });
           } else if (marker === "+") {
             hunkLines.push({ kind: "add", text: hunkLine.slice(1) });
-            hasChange = true;
           } else if (marker === "-") {
             hunkLines.push({ kind: "remove", text: hunkLine.slice(1) });
-            hasChange = true;
           } else {
             throw new Error(`Hunk lines must start with space, +, or -: ${path}`);
           }
@@ -210,7 +208,8 @@ function parsePatch(patch: string): Operation[] {
         }
 
         if (hunkLines.length === 0) throw new Error(`Empty hunk for ${path}`);
-        if (!hasChange) throw new Error(`Hunk contains no changes: ${path}`);
+        // Context-only hunks are exact assertions, not syntax errors. Validate
+        // them with the same uniqueness checks as edits during preflight.
         hunks.push({ anchor, lines: hunkLines });
       }
 
@@ -347,7 +346,8 @@ function applyHunks(content: string, hunks: Hunk[], requestedPath: string): stri
     lines.splice(matches[0] as number, oldLines.length, ...newLines);
   }
 
-  return lines.join(lineEnding);
+  // A verified no-op must not normalize mixed line endings or rewrite the file.
+  return lines.join("\n") === normalized ? content : lines.join(lineEnding);
 }
 
 function preflight(
@@ -386,7 +386,8 @@ function preflight(
     if (operation.kind === "update") {
       const sourcePath = resolveWorkspacePath(workspace, operation.path);
       const mode = assertRegularFile(sourcePath, operation.path);
-      const content = applyHunks(readFileSync(sourcePath, "utf8"), operation.hunks, operation.path);
+      const original = readFileSync(sourcePath, "utf8");
+      const content = applyHunks(original, operation.hunks, operation.path);
       registerPath(sourcePath, operation.path);
 
       let targetPath = sourcePath;
@@ -410,6 +411,7 @@ function preflight(
         content,
         mode,
         moved,
+        unchanged: !moved && content === original,
       });
       continue;
     }
@@ -549,6 +551,7 @@ function commit(
       if (!samePath(currentSource, operation.sourcePath, platform)) {
         throw new Error(`Update source changed during patch application: ${operation.sourceRequestedPath}`);
       }
+      if (operation.unchanged) continue;
       if (operation.moved) {
         ensureParentDirectories(workspace, operation.targetPath);
         resolveWorkspacePath(workspace, operation.targetRequestedPath, true);
@@ -574,6 +577,7 @@ function changedFileSummary(prepared: PreparedOperation[]): string {
     if (operation.kind === "add") return `Added ${operation.requestedPath}`;
     if (operation.kind === "delete") return `Deleted ${operation.requestedPath}`;
     if (operation.moved) return `Updated and moved ${operation.sourceRequestedPath} -> ${operation.targetRequestedPath}`;
+    if (operation.unchanged) return `Unchanged ${operation.sourceRequestedPath}`;
     return `Updated ${operation.sourceRequestedPath}`;
   }).join("\n");
 }
@@ -603,7 +607,7 @@ function preflightPatch(patch: string, workspace: string, platform: NodeJS.Platf
 
 export const applyPatchTool: GlassTool<ApplyPatchArgs> = {
   name: "apply_patch",
-  description: "Apply an atomic workspace patch. `patch` is the only argument: use exactly `*** Begin Patch` through `*** End Patch` (no Markdown fences or unified diff). Operations are `*** Add File: path`, `*** Update File: path` (optionally followed by `*** Move to: path`), and `*** Delete File: path`. Paths are workspace-relative. Add-file lines start `+`; update hunks start `@@`, with context/removal/addition lines starting with one literal space, `-`, or `+`. Match exact current text and include unique context. Example: `*** Begin Patch\n*** Add File: note.txt\n+text\n*** End Patch`.",
+  description: "Apply an atomic workspace patch. `patch` is the only argument: use exactly `*** Begin Patch` through `*** End Patch` (no Markdown fences or unified diff). Operations are `*** Add File: path`, `*** Update File: path` (optionally followed by `*** Move to: path`), and `*** Delete File: path`. Paths are workspace-relative. Add-file lines start `+`; update hunks start `@@`, with context/removal/addition lines starting with one literal space, `-`, or `+`. Match exact current text and include unique context. Context-only hunks are validated without changing files; ambiguous matches are rejected. Example: `*** Begin Patch\n*** Add File: note.txt\n+text\n*** End Patch`.",
   risk: "write",
   classifyRisk: (args, context) => classifyPatchRisk(args, context.workspace),
   parameters: {

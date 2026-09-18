@@ -211,6 +211,8 @@ test("codex-lb falls back to bounded semantic Responses checkpoints only for inp
         response.writeHead(400, { "content-type": "application/json" });
         response.end(JSON.stringify({ error: {
           code: compactCode,
+          type: "invalid_request_error",
+          param: "input",
           message: compactCode === "responses_compact_input_too_large"
             ? "input cannot be trimmed without removing required state anchors"
             : "other compact failure",

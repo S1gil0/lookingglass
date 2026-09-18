@@ -150,6 +150,9 @@ export class LookingGlassApp {
       instructions.text,
       abortableRetryDelay,
       this.visualizerEvents,
+      undefined,
+      undefined,
+      (id, provider, signal) => this.catalogModel(id, provider, signal),
     );
     this.clients = clients;
     this.client = client;

@@ -35,7 +35,7 @@ import type {
   EngineInteraction,
   TurnMetrics,
 } from "../engine/engine.js";
-import { projectContext } from "../engine/context.js";
+import { contextUsage } from "../engine/context.js";
 import type { InboxRecord, SchedulerJob } from "../scheduler/types.js";
 import { initialDue } from "../scheduler/schedule.js";
 import type { ApprovalDecision, ApprovalRequest, QuestionRequest } from "../tools/types.js";
@@ -286,21 +286,28 @@ export function formatTokenCount(inputTokens: number | null | undefined): string
   return `${compact}k`;
 }
 
+export function compactionRepairRequested(argument: string): boolean {
+  const mode = argument.trim().toLowerCase();
+  if (mode && mode !== "repair") throw new Error("/compact accepts only the optional repair argument");
+  return mode === "repair";
+}
+
 export function contextUsageLabel(
   inputTokens: number | null | undefined,
   contextWindow: number | null | undefined,
+  estimated = false,
 ): string {
   const tokenCount = formatTokenCount(inputTokens);
   const suffix = tokenCount ? `/${tokenCount}` : "";
   if (typeof contextWindow !== "number" || !Number.isFinite(contextWindow) || contextWindow <= 0) {
-    return `ctx:?${suffix}`;
+    return `ctx:?${tokenCount && estimated ? `/~${tokenCount}` : suffix}`;
   }
   if (!tokenCount) return "ctx:?";
   const usableInputTokens = typeof inputTokens === "number" && Number.isFinite(inputTokens)
     ? Math.max(0, inputTokens)
     : 0;
   const percent = Math.max(0, Math.min(999, Math.round((usableInputTokens / contextWindow) * 100)));
-  return `ctx:${percent}%${suffix}`;
+  return `ctx:${estimated ? "~" : ""}${percent}%${suffix}`;
 }
 
 function metricCount(value: number): number {
@@ -2034,6 +2041,7 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
   let activityFrame = 0;
   let selectionDragging = false;
   let contextInputTokens: number | null = null;
+  let contextEstimated = false;
   let contextWindow = 0;
   let visualizerEnabled = session.visualizerEnabled;
   let unavailableModelKey: string | null = null;
@@ -2049,7 +2057,7 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
   const metadataText = (width: number, startup = false): string => sessionMetadataLine(
     session,
     session.approvalMode,
-    contextUsageLabel(contextInputTokens, contextWindow),
+    contextUsageLabel(contextInputTokens, contextWindow, contextEstimated),
     width,
     startup,
   );
@@ -2124,17 +2132,10 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
   };
 
   const refreshContextUsage = (): void => {
-    const latestUsage = app.sessions.latestResponseUsage(session.id);
-    const checkpoint = app.sessions.latestCheckpoint(session.id);
-    if (latestUsage && (!checkpoint || latestUsage.sequence > checkpoint.throughSequence)) {
-      const projectedTokens = app.hasProvider(session.provider)
-        && app.clientForProvider(session.provider).supportsResponseContinuity?.() === false
-        ? Math.ceil(JSON.stringify(projectContext(app.sessions, session.id).input).length / 4)
-        : 0;
-      contextInputTokens = Math.max(latestUsage.inputTokens, projectedTokens);
-      return;
-    }
-    contextInputTokens = Math.ceil(JSON.stringify(projectContext(app.sessions, session.id).input).length / 4);
+    const usage = contextUsage(app.sessions, session.id, app.hasProvider(session.provider)
+      && app.clientForProvider(session.provider).supportsResponseContinuity?.() === false);
+    contextInputTokens = usage.inputTokens;
+    contextEstimated = usage.estimated;
   };
 
   const add = (component: Component): void => {
@@ -2313,12 +2314,17 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
       if (event.kind === "error" && isRecord(event.payload) && typeof event.payload.message === "string") {
         root.addEntry(new Notice("error", event.payload.message, red));
       }
+      if (event.kind === "note" && isRecord(event.payload) && typeof event.payload.message === "string"
+        && ["compaction_failed", "compaction_degraded"].includes(String(event.payload.code))) {
+        root.addEntry(new Notice("compaction warning", event.payload.message, yellow));
+      }
     }
     refreshContextUsage();
     requestRender();
   };
 
   const callbacks = (): EngineCallbacks => {
+    const callbackSessionId = session.id;
     let currentAssistant: StreamingAssistant | null = null;
     let turnCompleteShown = false;
     return {
@@ -2348,6 +2354,12 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
       },
       onWarning(message) {
         addNotice("warning", message, yellow);
+      },
+      onContextCompacted() {
+        if (session.id !== callbackSessionId) return;
+        refreshSession();
+        refreshContextUsage();
+        requestRender();
       },
       onTurnComplete(metrics) {
         if (turnCompleteShown) return;
@@ -2446,12 +2458,13 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
     }
   };
 
-  const runCompact = async (): Promise<void> => {
-    const controller = beginOperation("Compacting context", "compact");
+  const runCompact = async (repair = false): Promise<void> => {
+    const controller = beginOperation(repair ? "Repairing context from retained source" : "Compacting context", "compact");
     try {
-      await app.engine.compactNow(session.id, { signal: controller.signal, callbacks: callbacks() });
+      const compact = await app.engine.compactNow(session.id, { signal: controller.signal, callbacks: callbacks(), repair });
       refreshContextUsage();
-      if (!controller.signal.aborted) addNotice("compact", "Conversation context compacted.", green);
+      if (!controller.signal.aborted && compact && !compact.degraded) addNotice("compact",
+        repair ? "Conversation checkpoint rebuilt from retained source." : "Conversation context compacted.", green);
     } catch (error) {
       if (controller.signal.aborted) addNotice("cancelled", "Compaction cancelled.", yellow);
       else addNotice("error", errorMessage(error), red);
@@ -3144,7 +3157,7 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
       return;
     }
     if (command === "compact") {
-      await runCompact();
+      await runCompact(compactionRepairRequested(argument));
       return;
     }
     if (command === "visualizer") {
@@ -3330,7 +3343,7 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
   const slashCommands: SlashCommand[] = [
     { name: "new", description: "Start a new session" },
     { name: "fork", description: "Fork current session into an independent copy" },
-    { name: "compact", description: "Compact conversation context" },
+    { name: "compact", description: "Compact context; add repair to rebuild from retained source" },
     {
       name: "visualizer",
       description: "Toggle the live execution visualizer or select a view",

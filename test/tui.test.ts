@@ -9,6 +9,7 @@ import {
   ToolCard,
   UserMessage,
   activityLine,
+  compactionRepairRequested,
   contextUsageLabel,
   defaultGatewayBaseURL,
   formatTokenCount,
@@ -46,6 +47,13 @@ import { prepareQueuedValue, SubmissionQueue, type PreparedSubmission } from "..
 import { findModelChoice, SelectorPresentationQueue } from "../src/ui/setting-picker.js";
 import type { InboxRecord, SchedulerJob } from "../src/scheduler/types.js";
 import type { TaskPlanSnapshot } from "../src/task-plan.js";
+
+test("source checkpoint repair is an explicit compact argument", () => {
+  assert.equal(compactionRepairRequested(""), false);
+  assert.equal(compactionRepairRequested(" REPAIR "), true);
+  assert.throws(() => compactionRepairRequested("repait"), /optional repair argument/);
+  assert.throws(() => compactionRepairRequested("repair force"), /optional repair argument/);
+});
 
 function selectorMouseEvent(
   action: TerminalMouseEvent["action"],
@@ -644,6 +652,8 @@ test("renders activity separately from ordered session metadata", () => {
   assert.equal(contextUsageLabel(null, 15_500), "ctx:?");
   assert.equal(contextUsageLabel(null, 0), "ctx:?");
   assert.equal(contextUsageLabel(1_200, 0), "ctx:?/1.2k");
+  assert.equal(contextUsageLabel(1_200, 3_000, true), "ctx:~40%/1.2k");
+  assert.equal(contextUsageLabel(1_200, 0, true), "ctx:?/~1.2k");
   assert.equal(activityLine(true, "Thinking", 1, 12), "Thinking.. | scroll:+12");
   assert.equal(activityLine(false, "ignored", 0, 0), "Ready");
 });

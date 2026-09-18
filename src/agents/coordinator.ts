@@ -114,6 +114,11 @@ export class AgentCoordinator implements AgentBatchRunner {
       `${sharedInstructions}\n\n${LEAF_INSTRUCTIONS}`,
       undefined,
       this.visualizerEvents,
+      undefined,
+      undefined,
+      (id, provider, signal) => this.modelFor(id, provider, signal, {
+        maxAttempts: 1, maxElapsedMs: this.config.automation.providerRetryMaxElapsedMs,
+      }),
     );
   }
 
@@ -214,6 +219,7 @@ export class AgentCoordinator implements AgentBatchRunner {
           },
           callbacks: {
             onStatus: (status) => reportAgentAction(context, identity, task.id, status),
+            onWarning: (warning) => reportAgentAction(context, identity, task.id, "warning", warning),
             onToolStart: (notice) => reportAgentAction(
               context,
               identity,
