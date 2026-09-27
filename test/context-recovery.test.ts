@@ -8,7 +8,7 @@ import { DEFAULT_CONFIG } from "../src/config.js";
 import { projectContext } from "../src/engine/context.js";
 import { ConversationEngine } from "../src/engine/engine.js";
 import type { StoredResponsePayload, StoredUserPayload } from "../src/engine/types.js";
-import { isStaleResponseError, type CodexLbClient, type ResponseRequest } from "../src/model/codex-lb.js";
+import { CodexLbClient, isStaleResponseError, type ResponseRequest } from "../src/model/codex-lb.js";
 import { ArtifactStore } from "../src/storage/artifact-store.js";
 import { SchedulerStore } from "../src/scheduler/store.js";
 import { openDatabase } from "../src/storage/database.js";
@@ -1574,7 +1574,150 @@ test("invalid previous_response_id retries once from durable local replay", asyn
   assert.match(JSON.stringify(requests[1]?.input), /new fact/);
 });
 
+const bridgeMissingResponse = {
+  code: "bridge_previous_response_not_found",
+  type: "server_error",
+  message: "Upstream websocket closed before response.completed",
+};
+
+function sseResponse(events: Record<string, unknown>[]): globalThis.Response {
+  return new globalThis.Response(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""), {
+    headers: { "content-type": "text/event-stream" },
+  });
+}
+
+for (const eventType of ["error", "response.failed"] as const) {
+  test(`idle bridge ${eventType} recovers through SSE with durable history and without rerunning tools`, async (t) => {
+    const { root, sessions, session, artifacts } = fixture(t);
+    const checkpoint = sessions.saveCheckpoint(session.id, 0, portableCheckpoint("checkpoint", "SAVED_REQUIREMENT"), 10);
+    let executions = 0;
+    const tool: GlassTool<Record<string, never>> = {
+      name: "write_test", description: "test write", risk: "write",
+      parameters: { type: "object", properties: {}, additionalProperties: false },
+      summarize: () => "write test",
+      async execute() { executions += 1; return { output: "EXACT_TOOL_RESULT" }; },
+    };
+    const config = structuredClone(DEFAULT_CONFIG);
+    const client = new CodexLbClient(config);
+    t.after(() => client.close());
+    t.mock.method(client, "compact", async () => assert.fail("stale response recovery must not compact"));
+    const bodies: Array<Record<string, unknown>> = [];
+    t.mock.method(globalThis, "fetch", async (_url: unknown, init?: RequestInit) => {
+      bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      if (bodies.length === 3) {
+        // HTTP 200 with a provider error, not an HTTP 502 or generic transient failure.
+        return sseResponse([eventType === "error"
+          ? { type: eventType, error: bridgeMissingResponse }
+          : { type: eventType, response: { id: "resp_failed", status: "failed", error: bridgeMissingResponse } }]);
+      }
+      const completed = bodies.length === 1 ? { ...response("resp_tool", ""), output: [{
+        type: "function_call", id: "fc_idle", call_id: "call_idle", name: tool.name, arguments: "{}", status: "completed",
+      }] } : bodies.length === 2 ? response("resp_before_idle", "TOOL_DONE")
+        : bodies.length === 4 ? response("resp_recovered", "RECOVERED_AFTER_IDLE")
+          : response("resp_followup", "CONTINUED");
+      assert.ok(bodies.length <= 5, "unexpected extra request");
+      return sseResponse([{ type: "response.completed", response: completed }]);
+    });
+    const engine = new ConversationEngine(config, root, sessions, artifacts, client, new ToolRegistry().register(tool),
+      "instructions", async () => assert.fail("stale recovery should not use transient backoff"));
+    const options = { signal: new AbortController().signal, modelInfo,
+      interaction: { approve: async () => "once" as const, ask: async () => "" } };
+    await engine.turn(session.id, "perform write", options);
+    assert.equal(executions, 1);
+    const originalKey = sessions.get(session.id)!.promptCacheKey;
+    const completedCall = sessions.getToolCall(session.id, "call_idle");
+    const eventsBeforeIdle = sessions.events(session.id);
+    const statuses: string[] = [];
+    const outcomes: string[] = [];
+
+    const result = await engine.turn(session.id, "continue after idle", { ...options, callbacks: {
+      onStatus: (status) => statuses.push(status), onTurnComplete: (metrics) => outcomes.push(metrics.responseStatus),
+    } });
+    assert.equal(result.text, "RECOVERED_AFTER_IDLE");
+    assert.equal(result.toolCalls, 0);
+    assert.equal(result.compacted, false);
+    assert.equal(result.metrics?.modelRounds, 1);
+    assert.deepEqual(outcomes, ["completed"]);
+    assert.equal(statuses.filter((status) => status === "Recovering conversation context").length, 1);
+    assert.equal(bodies.length, 4);
+    assert.equal(bodies[2]?.previous_response_id, "resp_before_idle");
+    assert.deepEqual(bodies[2]?.input, [user("continue after idle")]);
+    assert.equal(bodies[2]?.prompt_cache_key, originalKey);
+    assert.equal("previous_response_id" in bodies[3]!, false);
+    assert.notEqual(bodies[3]?.prompt_cache_key, originalKey);
+    const replay = JSON.stringify(bodies[3]?.input);
+    assert.match(replay, /SAVED_REQUIREMENT/);
+    assert.match(replay, /perform write/);
+    assert.match(replay, /call_idle/);
+    assert.match(replay, /EXACT_TOOL_RESULT/);
+    assert.match(replay, /TOOL_DONE/);
+    assert.equal(replay.split("continue after idle").length - 1, 1);
+    assert.equal(sessions.get(session.id)?.lastResponseId, "resp_recovered");
+    assert.deepEqual(sessions.latestCheckpoint(session.id), checkpoint);
+    assert.deepEqual(sessions.events(session.id).slice(0, eventsBeforeIdle.length), eventsBeforeIdle);
+    assert.equal(sessions.events(session.id).filter((event) => event.kind === "user").length, 2);
+    assert.equal(sessions.events(session.id).filter((event) => event.kind === "error").length, 0);
+
+    const followup = await engine.turn(session.id, "follow up", options);
+    assert.equal(followup.text, "CONTINUED");
+    assert.equal(bodies.length, 5);
+    assert.equal(bodies[4]?.previous_response_id, "resp_recovered");
+    assert.deepEqual(bodies[4]?.input, [user("follow up")]);
+    assert.equal(bodies[4]?.prompt_cache_key, bodies[3]?.prompt_cache_key);
+    assert.equal(executions, 1);
+    assert.deepEqual(sessions.getToolCall(session.id, "call_idle"), completedCall);
+  });
+}
+
+for (const guard of ["unanchored", "repeated", "visible", "cancelled", "retry-budget"] as const) {
+  test(`idle bridge recovery respects the ${guard} guard`, async (t) => {
+    const { root, sessions, session, artifacts } = fixture(t);
+    if (guard !== "unanchored") sessions.setLastResponseId(session.id, "expired_response");
+    const controller = new AbortController();
+    const cancelled = new Error("caller cancelled");
+    const config = structuredClone(DEFAULT_CONFIG);
+    config.automation.providerRetryMaxAttempts = 1;
+    const client = new CodexLbClient(config);
+    t.after(() => client.close());
+    t.mock.method(client, "compact", async () => assert.fail("must not compact"));
+    const bodies: Array<Record<string, unknown>> = [];
+    t.mock.method(globalThis, "fetch", async (_url: unknown, init?: RequestInit) => {
+      bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      assert.ok(bodies.length <= 2, "recovery must not loop");
+      if (guard === "cancelled") controller.abort(cancelled);
+      return sseResponse([
+        ...(guard === "visible" ? [{ type: "response.output_text.delta", delta: "already visible" }] : []),
+        { type: "error", error: bridgeMissingResponse },
+      ]);
+    });
+    const statuses: string[] = [];
+    const deltas: string[] = [];
+    const engine = new ConversationEngine(config, root, sessions, artifacts, client, new ToolRegistry(), "instructions",
+      async () => assert.fail("must not retry the same bridge failure with backoff"));
+    await assert.rejects(engine.turn(session.id, "continue", {
+      signal: controller.signal, modelInfo, automated: guard === "retry-budget",
+      interaction: { approve: async () => "once", ask: async () => "" },
+      callbacks: { onTextDelta: (delta) => deltas.push(delta), onStatus: (status) => statuses.push(status) },
+    }), (error: unknown) => {
+      if (guard === "cancelled") assert.equal(error, cancelled);
+      else assert.equal((error as { code?: string }).code,
+        guard === "retry-budget" ? "automated_provider_retry_exhausted" : bridgeMissingResponse.code);
+      return true;
+    });
+    assert.equal(bodies.length, guard === "repeated" ? 2 : 1);
+    if (guard === "repeated") assert.equal("previous_response_id" in bodies[1]!, false);
+    assert.equal(statuses.filter((status) => status === "Recovering conversation context").length,
+      guard === "repeated" || guard === "retry-budget" ? 1 : 0);
+    assert.deepEqual(deltas, guard === "visible" ? ["already visible"] : []);
+    assert.equal(sessions.events(session.id).filter((event) => event.kind === "user").length, 1);
+    assert.equal(sessions.events(session.id).filter((event) => event.kind === "response").length, 0);
+  });
+}
+
 test("recognizes codex-lb anchored continuity failures", () => {
+  assert.equal(isStaleResponseError(bridgeMissingResponse, true), true);
+  assert.equal(isStaleResponseError({ error: bridgeMissingResponse }, true), true);
+  assert.equal(isStaleResponseError({ ...bridgeMissingResponse, code: "bridge_websocket_closed" }, true), false);
   assert.equal(isStaleResponseError({ code: "previous_response_owner_unavailable" }, true), true);
   const invalidAnchor = Object.assign(new Error(
     "codex-lb stream failed with HTTP 400: Invalid `previous_response_id`. "

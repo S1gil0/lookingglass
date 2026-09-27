@@ -302,6 +302,7 @@ export function isStaleResponseError(value: unknown, requestWasAnchored: boolean
     : undefined;
   if ([
     "previous_response_not_found",
+    "bridge_previous_response_not_found",
     "codex_previous_response_stale",
     "previous_response_owner_unavailable",
     "turn_state_owner_unavailable",
