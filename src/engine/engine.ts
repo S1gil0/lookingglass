@@ -5,7 +5,7 @@ import type {
 } from "openai/resources/responses/responses";
 import { randomUUID } from "node:crypto";
 import type { CodexLbClient } from "../model/codex-lb.js";
-import { hasUsableCompactionOutput, isRecoverableCompactionError, isStaleResponseError, requiresPortableCodexReplay } from "../model/codex-lb.js";
+import { fitsSemanticCompaction, hasUsableCompactionOutput, isRecoverableCompactionError, isStaleResponseError, requiresPortableCodexReplay } from "../model/codex-lb.js";
 import { CompactionDiagnostics, compactionFailure } from "../model/compaction-diagnostics.js";
 import type { ArtifactStore } from "../storage/artifact-store.js";
 import { isPortableCheckpoint, type OperationLeaseState, type SessionStore } from "../storage/session-store.js";
@@ -15,7 +15,7 @@ import type { ApprovalDecision, ApprovalRequest, QuestionRequest, ToolContext, T
 import type { ToolRegistry } from "../tools/registry.js";
 import { ToolDeniedError, ToolPreflightError, toolApprovalSignature } from "../tools/registry.js";
 import { formatTaskPlanInstructions } from "../task-plan.js";
-import { projectContext } from "./context.js";
+import { estimateContextTokens, projectContext } from "./context.js";
 import {
   awaitCompaction,
   COMPACTION_MAX_ATTEMPTS,
@@ -167,11 +167,18 @@ export interface CompactionResult {
   degraded: boolean;
   /** Historical omissions remain recorded even when this operation succeeds cleanly. */
   inheritedDegradation: boolean;
+  /** A healthy repair prefix is durable, but the source rebuild is not complete. */
+  repairPending?: boolean;
 }
 
 export interface CompactionOptions extends Pick<TurnOptions, "signal" | "callbacks" | "automated"> {
   /** Opt-in source replay; never replace the current checkpoint with degraded repair output. */
   repair?: boolean;
+}
+
+interface CompactionExecutionOptions extends CompactionOptions, Partial<Pick<TurnOptions, "modelInfo">> {
+  /** Recovery cannot outlive the model request that needs its checkpoint. */
+  enclosingRetryBudget?: ReturnType<typeof createRetryBudget>;
 }
 
 export interface TurnMetrics {
@@ -663,12 +670,12 @@ export class ConversationEngine {
             } catch (error) {
               if (options.signal.aborted) throw error;
               const message = `Context compaction deferred: ${errorMessage(error)}`;
-              options.callbacks?.onWarning?.(message);
               this.store.appendEventFenced(sessionId, executionToken, "error", {
                 message,
                 code: "compaction_deferred",
                 recoverable: true,
               } satisfies StoredErrorPayload);
+              try { options.callbacks?.onWarning?.(message); } catch { /* Observer only. */ }
             }
           }
           options.callbacks?.onStatus?.("Ready");
@@ -738,7 +745,7 @@ export class ConversationEngine {
 
   private async compactLocked(
     sessionId: string,
-    options: CompactionOptions & Partial<Pick<TurnOptions, "modelInfo">>,
+    options: CompactionExecutionOptions,
     executionToken: string,
     metrics?: TurnMetricsState,
     essential = true,
@@ -772,12 +779,19 @@ export class ConversationEngine {
 
   private async compactWithDiagnostics(
     sessionId: string,
-    options: CompactionOptions & Partial<Pick<TurnOptions, "modelInfo">>,
+    options: CompactionExecutionOptions,
     executionToken: string,
     diagnostics: CompactionDiagnostics,
     metrics?: TurnMetricsState,
     essential = true,
   ): Promise<CompactionResult | undefined> {
+    const assertCallerActive = (): void => {
+      options.signal.throwIfAborted();
+      if (options.enclosingRetryBudget && retryBudgetExpired(options.enclosingRetryBudget)) {
+        throw retryBudgetError(options.enclosingRetryBudget);
+      }
+    };
+    assertCallerActive();
     const session = this.requireSession(sessionId);
     // Summarization is independent of delegation. Never retry on the main model.
     const provider = session.agentProvider;
@@ -785,6 +799,7 @@ export class ConversationEngine {
     const client = this.clientFor(provider);
     const checkpoint = this.store.latestCheckpoint(sessionId);
     const sourceSequence = this.store.latestSequence(sessionId);
+    let repairSourceThrough = sourceSequence;
     const sourceCheckpoint = this.store.latestCheckpoint(sessionId, {
       portableOnly: true,
       ...(options.repair ? { accept: (compact: Record<string, unknown>) => hasUsableCompactionOutput(compact)
@@ -800,18 +815,37 @@ export class ConversationEngine {
           code: "compaction_repair_source_unavailable",
         });
       }
-      if (source.characters + JSON.stringify(sourceCheckpoint?.compact.output ?? []).length > COMPACTION_REPAIR_MAX_SOURCE_CHARACTERS) {
-        throw Object.assign(new Error("Source history exceeds the bounded repair limit"), {
-          code: "compaction_input_too_large",
-        });
+      const anchorCharacters = JSON.stringify(sourceCheckpoint?.compact.output ?? []).length;
+      if (source.characters + anchorCharacters > COMPACTION_REPAIR_MAX_SOURCE_CHARACTERS) {
+        // Size only aggregates until a bounded range is known. Do not load the
+        // whole backlog just to discard it, or reject all progress on old sessions.
+        let low = afterSequence;
+        let high = sourceSequence;
+        while (low < high) {
+          const middle = Math.ceil((low + high) / 2);
+          if (this.store.sourceHistoryStats(sessionId, afterSequence, middle).characters + anchorCharacters
+            <= COMPACTION_REPAIR_MAX_SOURCE_CHARACTERS) low = middle;
+          else high = middle - 1;
+        }
+        if (low === afterSequence) {
+          throw Object.assign(new Error("Source event or checkpoint exceeds the bounded repair limit"), {
+            code: "compaction_input_too_large",
+          });
+        }
+        repairSourceThrough = low;
       }
     }
     const requireNativeSource = (): void => {
-      if (checkpoint && !isPortableCheckpoint(checkpoint.compact)
-        && projectContext(this.store, sessionId, {
-          portableCheckpointOnly: true, throughSequence: checkpoint.throughSequence,
-        }).input.length === 0) {
-        throw Object.assign(new Error("Native checkpoint has no durable semantic history for recovery"), {
+      if (!checkpoint || isPortableCheckpoint(checkpoint.compact)) return;
+      const afterSequence = sourceCheckpoint?.throughSequence ?? 0;
+      const source = this.store.sourceHistoryStats(sessionId, afterSequence, checkpoint.throughSequence);
+      // An anchor covers its pruned prefix, but every event/result after it must
+      // still be present. Newer input cannot stand in for missing native state.
+      if (checkpoint.throughSequence === 0 || checkpoint.throughSequence > sourceSequence
+        || source.events !== checkpoint.throughSequence - afterSequence || source.missingToolOutputs > 0
+        || (!sourceCheckpoint && this.store.semanticEventCount(sessionId, afterSequence)
+          === this.store.semanticEventCount(sessionId, checkpoint.throughSequence))) {
+        throw Object.assign(new Error("Native checkpoint requires complete retained semantic history after its source checkpoint"), {
           code: "checkpoint_conversion_unavailable",
         });
       }
@@ -820,9 +854,18 @@ export class ConversationEngine {
     const recentCharacters = options.modelInfo
       ? Math.min(COMPACTION_RECENT_CHARACTERS, Math.floor(this.usableContextTokens(options.modelInfo) * 0.8))
       : COMPACTION_RECENT_CHARACTERS;
-    const context = projectContext(this.store, sessionId, {
-      checkpoint: sourceCheckpoint, throughSequence: sourceSequence, retainRecentCharacters: recentCharacters,
+    const compactionInstructions = this.instructionsFor(session);
+    const repairFits = (input: ResponseInputItem[], modelInfo?: ModelInfo): boolean => fitsSemanticCompaction({
+      input, instructions: compactionInstructions, ...(modelInfo ? { modelInfo } : {}),
     });
+    const projectSource = (modelInfo?: ModelInfo) => projectContext(this.store, sessionId, {
+      checkpoint: sourceCheckpoint, throughSequence: options.repair ? repairSourceThrough : sourceSequence,
+      retainRecentCharacters: recentCharacters,
+      ...(options.repair ? { repairBatch: {
+        fits: (input: ResponseInputItem[]) => repairFits(input, modelInfo), hasMoreSource: repairSourceThrough < sourceSequence,
+      } } : {}),
+    });
+    let context = projectSource();
     if (context.input.length === 0) {
       if (checkpoint && !isPortableCheckpoint(checkpoint.compact)) {
         throw Object.assign(new Error("Native checkpoint cannot be converted because no semantic history is available"), {
@@ -857,11 +900,12 @@ export class ConversationEngine {
     const budgetSignal = composeRetryBudgetSignal(options.signal, retryBudget);
     let compact: Awaited<ReturnType<CodexLbClient["compact"]>>;
     let partialCompact: Record<string, unknown> | undefined;
+    let nonrecoverableFailure: ReturnType<typeof compactionFailure> | undefined;
     let remoteActive = true;
     let compactionModel: ModelInfo | undefined;
     try {
       while (true) {
-        options.signal.throwIfAborted();
+        assertCallerActive();
         if (budgetSignal.signal.aborted) throw retryBudgetError(retryBudget);
         if (!retryBudgetCanRetry(retryBudget)) {
           throw retryBudgetError(retryBudget);
@@ -874,10 +918,20 @@ export class ConversationEngine {
           compactionModel ??= this.compactionModelFor
             ? await awaitCompaction(this.compactionModelFor(model, provider, budgetSignal.signal), budgetSignal.signal)
             : (provider === session.provider && model === options.modelInfo?.id ? options.modelInfo : undefined);
+          assertCallerActive();
+          budgetSignal.signal.throwIfAborted();
+          if (retryBudgetExpired(retryBudget)) throw retryBudgetError(retryBudget);
+          if (options.repair && compactionModel && !repairFits(context.input, compactionModel)) {
+            diagnostics.stage = "prepare";
+            context = projectSource(compactionModel);
+            assertCallerActive();
+            budgetSignal.signal.throwIfAborted();
+            if (retryBudgetExpired(retryBudget)) throw retryBudgetError(retryBudget);
+          }
           diagnostics.stage = "semantic";
           compact = await awaitCompaction(client.compact({
             model,
-            instructions: this.instructionsFor(session),
+            instructions: compactionInstructions,
             input: context.input,
             promptCacheKey: session.promptCacheKey,
             fast: false,
@@ -894,9 +948,16 @@ export class ConversationEngine {
               if (remoteActive && !budgetSignal.signal.aborted) options.callbacks?.onStatus?.(status);
             },
             onFailure: (failure) => {
-              if (remoteActive && !budgetSignal.signal.aborted) diagnostics.record(failure, failure.stage, failure);
+              if (remoteActive && !budgetSignal.signal.aborted) {
+                diagnostics.record(failure, failure.stage, failure);
+                if (failure.stage === "semantic" && !isRecoverableCompactionError(failure)) {
+                  nonrecoverableFailure ??= compactionFailure(failure, failure.stage, failure);
+                }
+              }
             },
           }), budgetSignal.signal);
+          assertCallerActive();
+          if (nonrecoverableFailure) throw nonrecoverableFailure;
           budgetSignal.signal.throwIfAborted();
           if (retryBudgetExpired(retryBudget)) throw retryBudgetError(retryBudget);
           if (!hasUsableCompactionOutput(compact)) {
@@ -911,7 +972,8 @@ export class ConversationEngine {
           }
           break;
         } catch (error) {
-          if (options.signal.aborted) throw options.signal.reason ?? error;
+          assertCallerActive();
+          if (nonrecoverableFailure) throw nonrecoverableFailure;
           if (budgetSignal.signal.aborted) throw retryBudgetError(retryBudget);
           if (isStoreLeaseLoss(error) || errorCode(error) === "session_operation_lease_lost") throw error;
           diagnostics.record(error, diagnostics.stage, { attempt });
@@ -935,7 +997,8 @@ export class ConversationEngine {
         }
       }
     } catch (error) {
-      options.signal.throwIfAborted();
+      assertCallerActive();
+      if (nonrecoverableFailure) throw nonrecoverableFailure;
       // Do not hide authorization, lease, invalid request, or application errors.
       // Exhausted/oversized semantic work gets a clearly labeled local checkpoint.
       if (options.repair || !essential || !(isRecoverableCompactionError(error)
@@ -946,7 +1009,7 @@ export class ConversationEngine {
       remoteActive = false;
       budgetSignal.dispose();
     }
-    options.signal.throwIfAborted();
+    assertCallerActive();
     diagnostics.stage = "checkpoint";
     if (!isPortableCheckpoint(compact)) {
       throw Object.assign(new Error("Stateless provider compaction did not return a portable text checkpoint"), {
@@ -955,19 +1018,33 @@ export class ConversationEngine {
     }
     const details = compact.compaction_details as Record<string, unknown> | undefined;
     const inheritedDegradation = sourceCheckpoint && compactionQuality(sourceCheckpoint.compact).degraded;
+    const repairPending = options.repair === true && context.repairPending === true;
+    const anchorOnly = repairPending && checkpoint !== null && context.latestSequence < checkpoint.throughSequence;
     compact = redactSensitiveValue({ ...compact, compaction_details: {
       ...details,
       ...(inheritedDegradation ? { quality: {
         ...(details?.quality as Record<string, unknown> | undefined), inherited_degradation: true,
       } } : {}),
       ...(options.repair ? { source_repair: true } : {}),
+      ...(repairPending ? { source_repair_pending: true, source_repair_target_sequence: sourceSequence } : {}),
       source_checkpoint_sequence: sourceCheckpoint?.throughSequence ?? 0,
-      provider, model, source_sequence: sourceSequence, diagnostics: diagnostics.snapshot(),
+      provider, model, source_sequence: repairPending ? context.latestSequence : sourceSequence, diagnostics: diagnostics.snapshot(),
     } }, configuredCredentialValues(this.config));
     const quality = compactionQuality(compact);
     if (options.repair && quality.degraded) {
       throw Object.assign(new Error("Repair did not produce a complete semantic checkpoint"), {
         code: "compaction_repair_incomplete",
+      });
+    }
+    // The database upserts by watermark: preserving an older checkpoint id
+    // cannot protect a healthy anchor when degraded output targets that same row.
+    const replacedCheckpoint = quality.degraded ? this.store.latestCheckpoint(sessionId, {
+      portableOnly: true, throughSequence: context.latestSequence,
+    }) : null;
+    if (replacedCheckpoint?.throughSequence === context.latestSequence
+      && hasUsableCompactionOutput(replacedCheckpoint.compact) && !compactionQuality(replacedCheckpoint.compact).degraded) {
+      throw Object.assign(new Error("Degraded recompaction would replace a healthy checkpoint at the same watermark"), {
+        code: "compaction_checkpoint_preserved",
       });
     }
     // Keep one older non-degraded portable anchor while degraded descendants
@@ -981,10 +1058,15 @@ export class ConversationEngine {
       && typeof (usage as Record<string, unknown>).input_tokens === "number"
       ? (usage as { input_tokens: number }).input_tokens
       : null;
-    if (!this.store.saveCheckpointAndResetContinuityFenced(
+    assertCallerActive();
+    if (options.repair && retryBudgetExpired(retryBudget)) throw retryBudgetError(retryBudget);
+    const saved = anchorOnly ? this.store.saveRepairAnchorFenced(
+      sessionId, executionToken, context.latestSequence, compact, inputTokens,
+    ) : this.store.saveCheckpointAndResetContinuityFenced(
       sessionId, executionToken, context.latestSequence, compact, inputTokens,
       true, repairAnchor?.id,
-    )) {
+    );
+    if (!saved) {
       throw this.operationLeaseError(sessionId, executionToken, "saving compacted context");
     }
     if (metrics) metrics.compactions += 1;
@@ -1011,8 +1093,7 @@ export class ConversationEngine {
       })) throw this.operationLeaseError(sessionId, executionToken, "saving compacted context");
       try { options.callbacks?.onWarning?.(message); } catch { /* Observer only. */ }
     }
-    const contextTokens = Math.ceil(JSON.stringify(projectContext(this.store, sessionId).input).length / 4);
-    try { options.callbacks?.onContextCompacted?.(); } catch { /* Observer only. */ }
+    try { if (!anchorOnly) options.callbacks?.onContextCompacted?.(); } catch { /* Observer only. */ }
     if (compactionId) this.emitVisualizer({
       type: "context.compact",
       sessionId,
@@ -1023,15 +1104,18 @@ export class ConversationEngine {
       model,
       provider,
       ...(inputTokens !== null ? { inputTokens } : {}),
-      contextTokens,
+      contextTokens: estimateContextTokens(this.store, sessionId),
       ...(options.modelInfo ? { contextWindow: options.modelInfo.contextWindow } : {}),
       duration: Math.max(0, Date.now() - compactionStartedAt),
       status: "complete",
-      summary: degraded ? "context compacted (degraded checkpoint)" : "context compacted",
+      summary: repairPending ? "repair progress saved" : degraded ? "context compacted (degraded checkpoint)" : "context compacted",
     });
-    try { options.callbacks?.onStatus?.(degraded ? "Context compacted (degraded checkpoint)" : "Context compacted"); }
+    try { options.callbacks?.onStatus?.(repairPending
+      ? `Repair progress saved through event ${context.latestSequence}; run /compact repair to continue.`
+      : degraded ? "Context compacted (degraded checkpoint)" : "Context compacted"); }
     catch { /* A committed checkpoint cannot be undone by an observer. */ }
-    return { degraded, inheritedDegradation: quality.inheritedDegradation };
+    return { degraded, inheritedDegradation: quality.inheritedDegradation
+      || (anchorOnly && compactionQuality(checkpoint.compact).degraded), ...(repairPending ? { repairPending: true } : {}) };
   }
 
   private async waitForRetry(
@@ -1272,13 +1356,16 @@ export class ConversationEngine {
           if (!visibleText && (isContextOverflowError(error) || oversizedEmptyReplay
             || oversizedRejectedReplay || portableRejectedReplay)
             && !contextRecoveryUsed && !options.signal.aborted) {
+            if (!retryBudgetCanRetry(retryBudget)) throw retryBudgetError(retryBudget);
             contextRecoveryUsed = true;
             options.callbacks?.onStatus?.(portableRejectedReplay
               ? "Recovering migrated conversation context"
               : oversizedEmptyReplay || oversizedRejectedReplay
                 ? "Recovering oversized local context"
                 : "Recovering context overflow");
-            await this.compactLocked(session.id, options, executionToken, metrics);
+            await this.compactLocked(session.id, {
+              ...options, signal: budgetSignal.signal, enclosingRetryBudget: retryBudget,
+            }, executionToken, metrics);
             currentSession = this.requireSession(session.id);
             currentInput = projectContext(this.store, session.id).input;
             currentPreviousResponseId = undefined;
@@ -1289,6 +1376,7 @@ export class ConversationEngine {
             && !staleRecoveryUsed
             && isStaleResponseError(error, true)
             && !options.signal.aborted) {
+            if (!retryBudgetCanRetry(retryBudget)) throw retryBudgetError(retryBudget);
             staleRecoveryUsed = true;
             options.callbacks?.onStatus?.("Recovering conversation context");
             const context = projectContext(this.store, session.id);
@@ -1730,7 +1818,9 @@ export class ConversationEngine {
   }
 
   private usableContextTokens(model: ModelInfo): number {
-    return Math.max(1, model.contextWindow - Math.max(20_000, model.maxOutputTokens ?? 0));
+    // A large-model safety reserve must not consume a small model's entire window.
+    const reserve = Math.min(model.contextWindow / 4, Math.max(20_000, model.maxOutputTokens ?? 0));
+    return Math.max(1, model.contextWindow - reserve);
   }
 
   private estimatedRequestTokens(session: SessionRecord, input: ResponseInputItem[]): number {

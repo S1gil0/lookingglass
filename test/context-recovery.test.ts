@@ -442,7 +442,7 @@ test("stateless tool rounds compact when estimated replay crosses the 80 percent
   const result = await engine.turn(session.id, "use the large tool", {
     signal: new AbortController().signal,
     interaction: { approve: async () => "once", ask: async () => "" },
-    modelInfo: { ...modelInfo, contextWindow: 40_000 },
+    modelInfo: { ...modelInfo, contextWindow: 24_000 },
   });
 
   assert.equal(result.text, "ESTIMATED_COMPACTED");
@@ -677,7 +677,7 @@ test("oversized stateless input is compacted before its first stream request", a
   const engine = new ConversationEngine(
     structuredClone(DEFAULT_CONFIG), root, sessions, artifacts, client, new ToolRegistry(), "instructions",
   );
-  const result = await engine.turn(session.id, "x".repeat(20_000), {
+  const result = await engine.turn(session.id, "x".repeat(80_000), {
     signal: new AbortController().signal,
     interaction: { approve: async () => "once", ask: async () => "" },
     modelInfo: { ...modelInfo, contextWindow: 25_000 },
@@ -1707,7 +1707,7 @@ for (const guard of ["unanchored", "repeated", "visible", "cancelled", "retry-bu
     assert.equal(bodies.length, guard === "repeated" ? 2 : 1);
     if (guard === "repeated") assert.equal("previous_response_id" in bodies[1]!, false);
     assert.equal(statuses.filter((status) => status === "Recovering conversation context").length,
-      guard === "repeated" || guard === "retry-budget" ? 1 : 0);
+      guard === "repeated" ? 1 : 0);
     assert.deepEqual(deltas, guard === "visible" ? ["already visible"] : []);
     assert.equal(sessions.events(session.id).filter((event) => event.kind === "user").length, 1);
     assert.equal(sessions.events(session.id).filter((event) => event.kind === "response").length, 0);

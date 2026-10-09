@@ -4,8 +4,8 @@ import { compactTranscript } from "../model/codex-lb.js";
 export const COMPACTION_MAX_ATTEMPTS = 2;
 export const COMPACTION_MAX_ELAPSED_MS = 180_000;
 export const COMPACTION_RECENT_CHARACTERS = 32_768;
-// Reject large source repairs before building model replay. The model still
-// applies its tighter transcript/part limits; this is not a larger token budget.
+// Bound source materialization per repair batch. The model still applies its
+// tighter transcript/part limits; this is not a larger token budget.
 export const COMPACTION_REPAIR_MAX_SOURCE_CHARACTERS = 8 * 1024 * 1024;
 
 export function compactionQuality(compact: Record<string, unknown>) {

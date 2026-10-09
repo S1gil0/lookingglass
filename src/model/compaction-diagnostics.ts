@@ -6,6 +6,7 @@ export interface CompactionFailure {
   stage: CompactionStage;
   kind: string;
   code?: string;
+  param?: string;
   status?: number;
   part?: number;
   attempt?: number;
@@ -18,7 +19,8 @@ const SAFE_CODES = new Set([
   "compaction_input_too_large", "responses_compact_input_too_large",
   "automated_provider_retry_exhausted", "checkpoint_conversion_unavailable",
   "compaction_pending_tools", "nonportable_compaction", "model_not_found",
-  "compaction_repair_source_unavailable", "compaction_repair_incomplete",
+  "compaction_repair_source_unavailable", "compaction_repair_incomplete", "compaction_repair_batch_too_large",
+  "compaction_checkpoint_preserved", "unsupported_value", "unsupported_parameter", "invalid_value",
   "invalid_api_key", "unauthorized", "forbidden", "invalid_request_error",
   "context_length_exceeded", "context_window_exceeded", "max_tokens_exceeded", "prompt_too_long",
   "rate_limit_exceeded", "insufficient_quota", "server_error", "internal_server_error",
@@ -29,6 +31,10 @@ const SAFE_CODES = new Set([
 const SAFE_KINDS = new Set([
   "timeout", "cancelled", "refused", "dns", "network", "protocol", "availability",
   "auth", "invalid_request", "context_overflow", "unsupported", "generic",
+]);
+const SAFE_PARAMS = new Set([
+  "model", "input", "instructions", "tools", "reasoning", "reasoning.effort", "reasoning.summary",
+  "max_tokens", "max_output_tokens", "text.verbosity", "service_tier", "store", "stream",
 ]);
 
 export function compactionFailure(
@@ -45,6 +51,7 @@ export function compactionFailure(
     stage,
     kind,
     ...(code && SAFE_CODES.has(code) ? { code } : {}),
+    ...(normalized.param && SAFE_PARAMS.has(normalized.param) ? { param: normalized.param } : {}),
     ...(status !== undefined ? { status } : {}),
     ...(Number.isInteger(position.part) && position.part! > 0 && position.part! <= 32 ? { part: position.part! } : {}),
     ...(Number.isInteger(position.attempt) && position.attempt! > 0 && position.attempt! <= 128 ? { attempt: position.attempt! } : {}),
@@ -56,8 +63,13 @@ export function formatCompactionFailure(failure: CompactionFailure): string {
     ? "remote time/retry budget exhausted"
     : failure.code === "compaction_repair_source_unavailable" ? "repair source history is missing or incomplete"
     : failure.code === "compaction_repair_incomplete" ? "repair produced a degraded summary; previous checkpoint kept"
+    : failure.code === "compaction_repair_batch_too_large" ? "one source exchange or checkpoint exceeds the repair batch limit; previous progress kept"
+    : failure.code === "compaction_checkpoint_preserved" ? "degraded replacement rejected; healthy checkpoint preserved"
     : failure.code ?? failure.kind;
-  return `${failure.stage}: ${reason}${failure.status !== undefined ? ` (HTTP ${failure.status})` : ""}`;
+  const hint = failure.param === "reasoning" || failure.param === "reasoning.effort" || failure.param === "reasoning.summary"
+    ? "; check leaf model reasoning support" : "";
+  return `${failure.stage}: ${reason}${failure.status !== undefined ? ` (HTTP ${failure.status})` : ""}`
+    + (failure.param ? ` [${failure.param}]` : "") + hint;
 }
 
 /** Bounded operation-local diagnostics; not part of model replay. */

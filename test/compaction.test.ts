@@ -143,6 +143,76 @@ test("automatic end-of-turn compaction uses the leaf, not the main model", async
   assert.ok(providers.includes("openrouter"));
 });
 
+for (const model of ["gpt-6-astra", "gpt-5.6-luna"]) {
+  for (const mode of ["manual", "automatic", "repair"] as const) {
+    test(`${mode} compaction resolves ${model} leaf capabilities through the catalog and saves all parts`, async (t) => {
+      const { sessions, session, config, engine, seed } = fixture(t);
+      seed();
+      sessions.updateSettings(session.id, { model: "expensive-main", agentModel: model,
+        agentProvider: "codex-lb", agentsEnabled: false, agentReasoningEffort: "high" });
+      if (mode === "repair") sessions.saveCheckpoint(session.id, 2, {
+        ...checkpoint("DEGRADED_MUST_REBUILD"), compaction_details: { degraded: true },
+      }, 10);
+      const client = new CodexLbClient(config);
+      t.after(() => client.close());
+      let catalogs = 0;
+      let parts = 0;
+      t.mock.method(globalThis, "fetch", async (url: string, init: RequestInit) => {
+        if (url.endsWith("/models")) {
+          catalogs += 1;
+          return globalThis.Response.json({ data: [{ id: model, supports_reasoning: true,
+            metadata: { context_window: 272_000, supported_reasoning_levels: [
+              { effort: "medium" }, { effort: "high" }, { effort: "low" },
+            ] },
+          }] });
+        }
+        assert.ok(url.endsWith("/responses"));
+        const body = JSON.parse(String(init.body));
+        assert.equal(body.model, model);
+        assert.deepEqual(body.reasoning, { effort: "low" });
+        assert.equal("previous_response_id" in body, false);
+        assert.equal("include" in body, false);
+        assert.equal("prompt_cache_key" in body, false);
+        assert.doesNotMatch(JSON.stringify(body.input), /DEGRADED_MUST_REBUILD/);
+        parts += 1;
+        return globalThis.Response.json(answer("leaf", "LEAF_CHECKPOINT"));
+      });
+      const stream = t.mock.method(client, "stream", async () => ({
+        ...answer("main", "MAIN_ANSWER"), usage: { input_tokens: 250_000, output_tokens: 2, total_tokens: 250_002 },
+      }));
+      const compactingEngine = engine(client, undefined, async (id, provider, signal) => {
+        assert.equal(id, model);
+        assert.equal(provider, "codex-lb");
+        const info = (await client.models(signal)).find((candidate) => candidate.id === id);
+        assert.ok(info);
+        return info;
+      });
+      if (mode === "automatic") {
+        const result = await compactingEngine.turn(session.id, "continue", {
+          signal: new AbortController().signal, modelInfo: { ...modelInfo, id: "expensive-main" },
+          interaction: { approve: async () => "once", ask: async () => "" },
+        });
+        assert.equal(result.compacted, true);
+        assert.equal(result.text, "MAIN_ANSWER");
+      } else {
+        assert.equal((await compactingEngine.compactNow(session.id, {
+          signal: new AbortController().signal, repair: mode === "repair",
+        }))?.degraded, false);
+      }
+      assert.equal(catalogs, 1);
+      assert.equal(parts, 3);
+      assert.equal(stream.mock.callCount(), mode === "automatic" ? 1 : 0);
+      const saved = sessions.latestCheckpoint(session.id)!;
+      assert.equal(saved.throughSequence, 2);
+      assert.equal(compactionQuality(saved.compact).degraded, false);
+      assert.equal((saved.compact.compaction_details as { semantic_parts: number }).semantic_parts, 3);
+      assert.match(JSON.stringify(projectContext(sessions, session.id).input), /LEAF_CHECKPOINT/);
+      assert.equal(sessions.get(session.id)?.model, "expensive-main");
+      assert.equal(sessions.get(session.id)?.agentModel, model);
+    });
+  }
+}
+
 test("an unavailable leaf never falls back to the main provider", async (t) => {
   const { sessions, session, engine, seed } = fixture(t);
   seed();
@@ -214,6 +284,8 @@ for (const provider of ["codex-lb", "custom"] as const) {
           const part = Number(/transcript part (\d+) of 4/u.exec(body.instructions)?.[1]);
           assert.ok(part >= 1 && part <= 4);
           assert.equal(body.max_output_tokens, 2_048);
+          // Ignore shortening too: true overflow must stay bounded and degraded.
+          if (pending.has(part)) return globalThis.Response.json(answer(`part_${part}`, summaries[part - 1]!));
           return new Promise<globalThis.Response>((resolve) => { pending.set(part, resolve); });
         });
         const work = new CodexLbClient(config).compact({ model: "leaf", instructions: "Keep context",
@@ -239,6 +311,7 @@ for (const provider of ["codex-lb", "custom"] as const) {
       const reverse = await run([4, 3, 2, 1]);
       assert.deepEqual(forward, reverse);
       assert.equal(qualityOf(forward).truncated_parts, overflow ? 2 : 0);
+      assert.equal((forward.compaction_details as { attempts: number }).attempts, overflow ? 6 : 4);
       if (!overflow) for (const summary of summaries) assert.ok(textOf(forward).includes(summary));
       for (const marker of ["HEAD_1", "TAIL_1", "HEAD_2", "TAIL_2", "SHORT_3", "SHORT_4"]) {
         assert.ok(textOf(forward).includes(marker));
@@ -728,6 +801,98 @@ for (const [name, details, warning] of [
   });
 }
 
+test("shortening honors the original operation deadline and retains all completed parts", async (t) => {
+  const { sessions, session, config, engine, seed } = fixture(t);
+  seed();
+  const events = sessions.events(session.id);
+  config.automation.providerRetryMaxElapsedMs = 100;
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
+  const client = new CodexLbClient(config);
+  t.after(() => client.close());
+  let started!: () => void;
+  const ready = new Promise<void>((resolve) => { started = resolve; });
+  const late: Array<(response: globalThis.Response) => void> = [];
+  const signals: AbortSignal[] = [];
+  let calls = 0;
+  t.mock.method(globalThis, "fetch", async (_url: string, init: RequestInit) => {
+    const body = JSON.parse(String(init.body));
+    calls += 1;
+    if (!body.instructions.includes("previous summary was too long")) {
+      if (calls === 1) t.mock.timers.tick(60);
+      return globalThis.Response.json(answer("long", `ORIGINAL_HEAD ${"x".repeat(40_000)} ORIGINAL_TAIL`));
+    }
+    signals.push(init.signal!);
+    const total = Number(/transcript part \d+ of (\d+)/u.exec(body.instructions)?.[1]);
+    return new Promise<globalThis.Response>((resolve) => {
+      late.push(resolve);
+      if (late.length === total) started();
+    });
+  });
+  const pending = engine(client).compactNow(session.id, { signal: new AbortController().signal, automated: true });
+  await ready;
+  t.mock.timers.tick(39);
+  assert.ok(signals.every((signal) => !signal.aborted));
+  t.mock.timers.tick(1);
+  const result = await pending;
+  assert.equal(result?.degraded, true);
+  assert.ok(signals.every((signal) => signal.aborted));
+  assert.equal(calls, late.length * 2);
+  const saved = sessions.latestCheckpoint(session.id)!;
+  const quality = compactionQuality(saved.compact);
+  assert.equal(quality.totalParts, late.length);
+  assert.equal(quality.localParts, 0);
+  assert.equal(quality.truncatedParts, late.length);
+  assert.match(JSON.stringify(saved.compact.output), /ORIGINAL_HEAD/);
+  assert.match(JSON.stringify(saved.compact.output), /ORIGINAL_TAIL/);
+  assert.deepEqual(sessions.events(session.id).slice(0, events.length), events);
+  for (const resolve of late) resolve(globalThis.Response.json(answer("late", "LATE_MUST_NOT_COMMIT")));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(sessions.latestCheckpoint(session.id), saved);
+});
+
+test("shortening repairs new overflow without erasing inherited omissions outside source repair", async (t) => {
+  const { db, sessions, session, config, engine, seed } = fixture(t);
+  seed();
+  sessions.saveCheckpoint(session.id, 2, { ...checkpoint("LOSSY_ANCESTOR"), compaction_details: { degraded: true } }, null);
+  const events = sessions.events(session.id);
+  const client = new CodexLbClient(config);
+  t.after(() => client.close());
+  const inputs: string[] = [];
+  let rewrites = 0;
+  t.mock.method(globalThis, "fetch", async (_url: string, init: RequestInit) => {
+    const body = JSON.parse(String(init.body));
+    inputs.push(JSON.stringify(body.input));
+    if (body.instructions.includes("previous summary was too long")) {
+      rewrites += 1;
+      return globalThis.Response.json(answer("short", "SHORT_DURABLE_FACTS"));
+    }
+    return globalThis.Response.json(answer("long", "x".repeat(40_000)));
+  });
+  for (const repair of [false, true]) {
+    inputs.length = 0;
+    rewrites = 0;
+    const warnings: string[] = [];
+    const result = await engine(client).compactNow(session.id, { repair, signal: new AbortController().signal,
+      callbacks: { onWarning: (message) => warnings.push(message) } });
+    assert.ok(rewrites > 0);
+    assert.deepEqual(result, { degraded: false, inheritedDegradation: !repair });
+    const saved = new SessionStore(db).latestCheckpoint(session.id)!.compact;
+    assert.equal(compactionQuality(saved).truncatedParts, 0);
+    assert.equal(compactionQuality(saved).incompleteParts, 0);
+    assert.equal(compactionQuality(saved).degraded, !repair);
+    assert.equal((saved.compaction_details as { source_repair?: boolean }).source_repair, repair ? true : undefined);
+    if (repair) {
+      assert.match(inputs.join("\n"), /ORIGINAL_REQUIREMENT/);
+      assert.doesNotMatch(inputs.join("\n"), /LOSSY_ANCESTOR|SHORT_DURABLE_FACTS/);
+    } else {
+      assert.match(inputs.join("\n"), /LOSSY_ANCESTOR/);
+      assert.doesNotMatch(inputs.join("\n"), /ORIGINAL_REQUIREMENT/);
+    }
+    assert.deepEqual(warnings, []);
+    assert.deepEqual(sessions.events(session.id), events);
+  }
+});
+
 test("explicit repair recovers original events, retains recent exchanges, and refreshes context", async (t) => {
   const { sessions, session, engine, seed } = fixture(t);
   seed();
@@ -861,7 +1026,7 @@ test("source repair retains the existing part limit and never replaces an oversi
   t.mock.method(globalThis, "fetch", () => { assert.fail("over 32 parts must fail before HTTP"); });
   await assert.rejects(engine(new CodexLbClient(config)).compactNow(session.id, {
     signal: new AbortController().signal, repair: true,
-  }), { code: "compaction_input_too_large" });
+  }), { code: "compaction_repair_batch_too_large" });
   assert.deepEqual(sessions.latestCheckpoint(session.id), saved);
 });
 

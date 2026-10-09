@@ -2463,7 +2463,9 @@ export async function runTui(app: LookingGlassApp, initialSessionId?: string): P
     try {
       const compact = await app.engine.compactNow(session.id, { signal: controller.signal, callbacks: callbacks(), repair });
       refreshContextUsage();
-      if (!controller.signal.aborted && compact && !compact.degraded) addNotice("compact",
+      if (!controller.signal.aborted && compact?.repairPending) addNotice("compact",
+        "Repair progress saved. The source rebuild is not complete; run /compact repair to continue from the saved prefix.", yellow);
+      else if (!controller.signal.aborted && compact && !compact.degraded) addNotice("compact",
         repair ? "Conversation checkpoint rebuilt from retained source." : "Conversation context compacted.", green);
     } catch (error) {
       if (controller.signal.aborted) addNotice("cancelled", "Compaction cancelled.", yellow);

@@ -138,7 +138,8 @@ export interface CompactRequest {
   fast: boolean;
   /** Generate portable text directly, without native/opaque compaction. */
   semanticOnly?: boolean;
-  modelInfo?: Pick<ModelInfo, "contextWindow" | "maxOutputTokens">;
+  modelInfo?: Pick<ModelInfo, "contextWindow" | "maxOutputTokens">
+    & Partial<Pick<ModelInfo, "supportsReasoning" | "reasoningEfforts">>;
   /** Output ceiling for a bounded semantic part. */
   maxOutputTokens?: number;
   signal?: AbortSignal;
@@ -687,9 +688,9 @@ function portableCodexReplayInput(input: ResponseInputItem[]): ResponseInputItem
 const MAX_COMPACTION_CHUNKS = 32;
 const MAX_COMPACTION_OUTPUT_TOKENS = 8_192;
 const CODEX_FALLBACK_CHUNK_CHARS = 32_768;
-// Large transcripts must not starve individual summaries. With at most 32
-// parts these floors cap generation at 32k tokens/attempt and replay at 64k
-// characters, while leaving small checkpoints at their existing budgets.
+// Large transcripts must not starve individual summaries. These floors keep
+// useful per-part allowances and bound replay to 64k characters at 32 parts.
+// Output-exhaustion retries can grow within the model's bounded output ceiling.
 const MIN_CODEX_PART_OUTPUT_TOKENS = 1_024;
 const CODEX_PART_CHECKPOINT_CHARS = 2_048;
 const MAX_SEMANTIC_COMPACTION_ATTEMPTS = 3;
@@ -701,12 +702,38 @@ const CHECKPOINT_SEPARATOR = "\n\n";
 const CHECKPOINT_TRUNCATION_MARKER = "\n...[truncated]...\n";
 const LOCAL_CHECKPOINT_EXCERPT_PREFIX = "[Semantic summary unavailable; bounded local transcript excerpt]\n";
 
-function semanticCompactionLimits(request: CompactRequest): { chunkChars: number; outputTokens: number } {
+/** Never force an unadvertised effort (not all reasoning models accept "none"). */
+function compactionReasoningEffort(request: CompactRequest): ReasoningEffort | undefined {
+  if (request.modelInfo?.supportsReasoning === false) return undefined;
+  const supported = request.modelInfo?.reasoningEfforts;
+  return (["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] as const)
+    .find((effort) => supported?.includes(effort));
+}
+
+/** Bound even adapters/body readers that ignore abort; late work cannot commit. */
+async function semanticAttempt<T>(operation: () => Promise<T>, signal: AbortSignal): Promise<T> {
+  signal.throwIfAborted();
+  let onAbort!: () => void;
+  const aborted = new Promise<never>((_, reject) => {
+    onAbort = () => reject(signal.reason ?? new Error("Compaction aborted"));
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([operation(), aborted]);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
+}
+
+function semanticCompactionLimits(request: Pick<CompactRequest, "instructions" | "modelInfo" | "maxOutputTokens">): {
+  chunkChars: number; outputTokens: number;
+} {
   const window = request.modelInfo?.contextWindow;
   const knownWindow = typeof window === "number" && Number.isFinite(window) && window > 0;
   const outputLimit = request.modelInfo?.maxOutputTokens;
   const outputTokens = Math.max(1, Math.floor(Math.min(
     MAX_COMPACTION_OUTPUT_TOKENS,
+    typeof request.maxOutputTokens === "number" && request.maxOutputTokens > 0 ? request.maxOutputTokens : MAX_COMPACTION_OUTPUT_TOKENS,
     typeof outputLimit === "number" && outputLimit > 0 ? outputLimit : MAX_COMPACTION_OUTPUT_TOKENS,
     knownWindow ? window / 4 : MAX_COMPACTION_OUTPUT_TOKENS,
   )));
@@ -785,6 +812,7 @@ function boundedCheckpointText(summaries: string[], maxChars = MAX_CHECKPOINT_CH
   return {
     text: `${CHECKPOINT_PREFIX}${parts.map((part, index) => boundCheckpointPart(part, allocated[index]!)).join(CHECKPOINT_SEPARATOR)}`,
     truncated: parts.map((part, index) => part.length > allocated[index]!),
+    allocated,
   };
 }
 
@@ -818,6 +846,20 @@ function chunkTranscript(transcript: string, maxChars: number): string[] {
     continuesFromPrevious = forcedSplit;
   }
   return chunks;
+}
+
+/** Plan repair prefixes with the same serializer, framing and part limit as dispatch. */
+export function fitsSemanticCompaction(
+  request: Pick<CompactRequest, "input" | "instructions" | "modelInfo" | "maxOutputTokens">,
+): boolean {
+  const limits = semanticCompactionLimits(request);
+  try {
+    chunkTranscript(compactTranscript(request.input, true), limits.chunkChars);
+    return true;
+  } catch (error) {
+    if ((error as { code?: string })?.code === "compaction_input_too_large") return false;
+    throw error;
+  }
 }
 
 function combinedUsage(values: Array<Record<string, number> | undefined>): Record<string, number> | undefined {
@@ -1638,6 +1680,8 @@ export class CodexLbClient {
     const transcriptChunks = chunkTranscript(transcript, limits.chunkChars);
     const maxTokens = Math.min(limits.outputTokens,
       Math.max(MIN_CODEX_PART_OUTPUT_TOKENS, Math.floor(limits.outputTokens / transcriptChunks.length)));
+    const reasoningEffort = compactionReasoningEffort(request);
+    let maxRequestedOutputTokens = maxTokens;
     const checkpointChars = Math.max(MAX_CHECKPOINT_CHARS, transcriptChunks.length * CODEX_PART_CHECKPOINT_CHARS);
     const partBudgets = checkpointPartBudgets(transcriptChunks.length, checkpointChars);
     const checkpointInstructions = [
@@ -1649,22 +1693,30 @@ export class CodexLbClient {
     const summaries: Array<string | undefined> = Array.from({ length: transcriptChunks.length });
     const usages: Array<Record<string, number> | undefined> = Array.from({ length: transcriptChunks.length });
     const fallbackErrors: Array<Error | undefined> = Array.from({ length: transcriptChunks.length });
+    const partAttempts = transcriptChunks.map(() => 0);
+    const partOutputTokens = transcriptChunks.map(() => maxTokens);
     const workerController = new AbortController();
     let nextIndex = 0;
-    let completed = 0;
+    const completedParts = new Set<number>();
     let semanticParts = 0;
     let attempts = 0;
     let protocolFailures = 0;
     let transientFailures = 0;
     const oversizedParts = new Set<number>();
-    let incompleteParts = 0;
+    const incompleteParts = new Set<number>();
     let failed = false;
     let firstError: unknown;
-    const saveSummary = (index: number, summary: string): void => {
+    const saveSummary = (index: number, summary: string, incomplete: boolean, shortening: boolean): void => {
+      // A failed shortening must not replace usable work with worse output.
+      if (shortening && (incomplete || summary.length > summaries[index]!.length
+        || (summary.length === summaries[index]!.length && !incompleteParts.has(index)))) return;
       // A part cannot use more than the entire checkpoint. Bound retained work
       // even if a provider disregards max_output_tokens, but don't cut to its
       // equal share before the other parts' actual sizes are known.
       if (summary.length > checkpointChars) oversizedParts.add(index);
+      else oversizedParts.delete(index);
+      if (incomplete) incompleteParts.add(index);
+      else incompleteParts.delete(index);
       summaries[index] = boundCheckpointPart(summary, checkpointChars);
     };
     const localSummary = (index: number): string => {
@@ -1692,8 +1744,9 @@ export class CodexLbClient {
           transient_failures: transientFailures,
           quality: {
             truncated_parts: truncatedParts,
-            incomplete_parts: incompleteParts,
-            max_output_tokens_per_part: maxTokens,
+            incomplete_parts: incompleteParts.size,
+            max_output_tokens_per_part: maxRequestedOutputTokens,
+            ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
             checkpoint_character_budget: checkpointChars,
             checkpoint_characters: summary.length,
           },
@@ -1708,13 +1761,16 @@ export class CodexLbClient {
         ...(usage ? { usage } : {}),
       };
     };
-    const processPart = async (index: number): Promise<"semantic" | "local"> => {
+    const processPart = async (index: number, shorteningCeiling?: number): Promise<"semantic" | "local"> => {
+      let partMaxTokens = partOutputTokens[index]!;
+      const shortening = shorteningCeiling !== undefined;
       const chunk = transcriptChunks[index] as string;
       const label = transcriptChunks.length > 1 ? `Checkpoint part ${index + 1} of ${transcriptChunks.length}:\n` : "";
-      const partCharacterCeiling = Math.max(1, (partBudgets[index] ?? 1) - label.length);
+      const partCharacterCeiling = shorteningCeiling ?? Math.max(1, (partBudgets[index] ?? 1) - label.length);
       const profile: ResponseRequest = {
         model: request.model,
-        instructions: `${checkpointInstructions} This is transcript part ${index + 1} of ${transcriptChunks.length}; produce a self-contained checkpoint for this part. Keep this part's checkpoint text at or below ${partCharacterCeiling} characters. Use low verbosity and prioritize durable facts over prose.`,
+        instructions: `${checkpointInstructions} This is transcript part ${index + 1} of ${transcriptChunks.length}; produce a self-contained checkpoint for this part. Keep this part's checkpoint text at or below ${partCharacterCeiling} characters. Use low verbosity and prioritize durable facts over prose.`
+          + (shortening ? " The previous summary was too long for the combined checkpoint. Rewrite from the original transcript more concisely within this character limit; remove repetition and prose, not durable facts or unresolved safety constraints." : ""),
         input: [{
           role: "user",
           content: [{
@@ -1732,30 +1788,28 @@ export class CodexLbClient {
         ...(request.signal ? { signal: request.signal } : {}),
       };
       const attemptTimeoutMs = Math.min(this.config.gateway.timeoutMs, 120_000);
-      const processAttempt = async (timeout: AbortSignal, context: ProviderErrorContext): Promise<void> => {
-        const signal = AbortSignal.any([workerController.signal, ...(request.signal ? [request.signal] : []), timeout]);
+      const processAttempt = async (signal: AbortSignal, context: ProviderErrorContext): Promise<void> => {
         if (provider !== "codex-lb") {
           // Reuse the provider's semantic adapter for one already-bounded part.
           const compact = await this.compactSingle({
             ...request, input: profile.input, instructions: profile.instructions,
-            semanticOnly: false, maxOutputTokens: maxTokens, signal,
+            semanticOnly: false, maxOutputTokens: partMaxTokens, signal,
           });
+          signal.throwIfAborted();
           const summary = (compact.output as Array<{ content: Array<{ text: string }> }>)
             .flatMap((item) => item.content.map((part) => part.text)).join("\n")
             .replace(/^Conversation checkpoint generated by Looking Glass:\n/u, "").trim();
           if (!summary) throw providerError({ code: "empty_response" }, { ...context, protocol: true });
-          saveSummary(index, summary);
           usages[index] = combinedUsage([usages[index], normalizedUsage(compact.usage)]);
           const quality = (compact.compaction_details as { quality?: { incomplete_parts?: number } } | undefined)?.quality;
-          if (quality?.incomplete_parts) incompleteParts += 1;
+          saveSummary(index, summary, Boolean(quality?.incomplete_parts), shortening);
           return;
         }
         let http: globalThis.Response;
         try {
           const params = buildResponseParams("codex-lb", profile, "responses") as Record<string, unknown>;
-          // The fallback is deliberately a stateless semantic request. Explicitly
-          // disable reasoning so a backend default cannot consume the small output
-          // budget without emitting checkpoint text. Do not preserve native
+          // Stateless semantic requests use the cheapest advertised effort, or
+          // omit the override when capabilities are unknown. Never carry native
           // reasoning state or route parts through one prompt-cache affinity bridge.
           const {
             include: _include,
@@ -1772,15 +1826,17 @@ export class CodexLbClient {
             },
             body: JSON.stringify({
               ...plainParams,
-              reasoning: { effort: "none" },
-              max_output_tokens: maxTokens,
+              ...(reasoningEffort ? { reasoning: { effort: reasoningEffort } } : {}),
+              max_output_tokens: partMaxTokens,
             }),
             signal,
           }));
         } catch (error) {
           throw providerError(error, context);
         }
+        signal.throwIfAborted();
         const payload = objectPayload(await readJsonResponse(http, context), context, "compaction returned an invalid payload");
+        signal.throwIfAborted();
         const response = payload as unknown as Response;
         const attemptUsage = normalizedUsage(response.usage);
         const recordAttemptUsage = (): void => {
@@ -1806,7 +1862,8 @@ export class CodexLbClient {
         }
         if (response.output.length === 0) {
           recordAttemptUsage();
-          throw providerError({ code: "empty_response", message: "compaction returned no checkpoint text" }, {
+          throw providerError({ code: "empty_response", message: "compaction returned no checkpoint text",
+            ...(response.status === "incomplete" ? { incompleteReason: response.incomplete_details?.reason } : {}) }, {
             ...context,
             protocol: true,
           });
@@ -1823,17 +1880,17 @@ export class CodexLbClient {
         }
         if (!summary) {
           recordAttemptUsage();
-          throw providerError({ code: "empty_response", message: "compaction returned no checkpoint text" }, {
+          throw providerError({ code: "empty_response", message: "compaction returned no checkpoint text",
+            ...(response.status === "incomplete" ? { incompleteReason: response.incomplete_details?.reason } : {}) }, {
             ...context,
             protocol: true,
           });
         }
-        if (response.status === "incomplete") incompleteParts += 1;
-        saveSummary(index, summary);
+        saveSummary(index, summary, response.status === "incomplete", shortening);
         recordAttemptUsage();
       };
       const processPartWithRetries = async (): Promise<"semantic" | "local"> => {
-        for (let attempt = 0; attempt < MAX_SEMANTIC_COMPACTION_ATTEMPTS; attempt += 1) {
+        for (let attempt = partAttempts[index]!; attempt < MAX_SEMANTIC_COMPACTION_ATTEMPTS; attempt += 1) {
           if (request.signal?.aborted) throw request.signal.reason ?? new Error("compaction was cancelled by the caller");
           if (workerController.signal.aborted) throw workerController.signal.reason ?? new Error("compaction part was cancelled");
           if (semanticParts === 0 && attempts >= MAX_SEMANTIC_NO_PROGRESS_ATTEMPTS) {
@@ -1842,10 +1899,12 @@ export class CodexLbClient {
             return "local";
           }
           const timeout = AbortSignal.timeout(attemptTimeoutMs);
+          const signal = AbortSignal.any([workerController.signal, ...(request.signal ? [request.signal] : []), timeout]);
           const context = requestContext(provider, "compact", this.apiKey, request.signal, timeout);
           try {
+            partAttempts[index] = attempt + 1;
             attempts += 1;
-            await processAttempt(timeout, context);
+            await semanticAttempt(() => processAttempt(signal, context), signal);
             return "semantic";
           } catch (error) {
             if (request.signal?.aborted) throw request.signal.reason ?? error;
@@ -1859,9 +1918,20 @@ export class CodexLbClient {
             if (isSemanticProtocolError(error)) protocolFailures += 1;
             else transientFailures += 1;
             if (attempt + 1 >= MAX_SEMANTIC_COMPACTION_ATTEMPTS) {
+              if (shortening) return "semantic";
               fallbackErrors[index] = semanticPartRetryExhausted(error, context);
               summaries[index] = localSummary(index);
               return "local";
+            }
+            // Reasoning-only output may exhaust a divided part allowance. Grow
+            // only on explicit output exhaustion, within the leaf's existing cap.
+            // Try that cap on the final attempt: doubling a 1k floor alone never
+            // reaches an 8k ceiling within three attempts on large transcripts.
+            if ((error as { incompleteReason?: string })?.incompleteReason === "max_output_tokens") {
+              partMaxTokens = attempt + 2 === MAX_SEMANTIC_COMPACTION_ATTEMPTS
+                ? limits.outputTokens : Math.min(limits.outputTokens, partMaxTokens * 2);
+              partOutputTokens[index] = partMaxTokens;
+              maxRequestedOutputTokens = Math.max(maxRequestedOutputTokens, partMaxTokens);
             }
             // Avoid immediately exhausting all attempts during the same outage.
             // Keep completed parts, and allow cancellation while workers back off.
@@ -1874,29 +1944,86 @@ export class CodexLbClient {
       };
       return processPartWithRetries();
     };
+    const shorteningBudgets = new Map<number, number>();
+    const shorteningQueue: number[] = [];
+    const scheduleShortening = (): void => {
+      // Pending local excerpts can temporarily crowd out summaries that would
+      // fit once a small sibling arrives. Require overflow even with unfinished
+      // parts empty, including all labels, before spending attempts on rewrites.
+      const minimum = boundedCheckpointText(summaries.map((part, index) =>
+        completedParts.has(index) ? part! : ""), checkpointChars);
+      const candidates = minimum.truncated.flatMap((truncated, index) =>
+        truncated && completedParts.has(index) && !fallbackErrors[index] && !shorteningBudgets.has(index)
+          && partAttempts[index]! < MAX_SEMANTIC_COMPACTION_ATTEMPTS ? [index] : []);
+      if (candidates.length === 0) return;
+      // Reserve the real partial checkpoint's local excerpts in the ceilings;
+      // do not borrow the empty placeholders used only to prove overflow above.
+      const bounded = boundedCheckpointText(summaries.map((part, index) => part ?? localSummary(index)), checkpointChars);
+      for (const index of candidates) {
+        const label = transcriptChunks.length > 1 ? `Checkpoint part ${index + 1} of ${transcriptChunks.length}:\n` : "";
+        shorteningBudgets.set(index, Math.max(1, bounded.allocated[index]! - label.length));
+        shorteningQueue.push(index);
+      }
+    };
+    let activeParts = 0;
+    let wakeWorkers!: () => void;
+    let progress = new Promise<void>((resolve) => { wakeWorkers = resolve; });
+    const notifyProgress = (): void => {
+      const wake = wakeWorkers;
+      progress = new Promise<void>((resolve) => { wakeWorkers = resolve; });
+      wake();
+    };
     const worker = async (): Promise<void> => {
       while (true) {
         if (failed) return;
-        const index = nextIndex;
-        nextIndex += 1;
-        if (index >= transcriptChunks.length) return;
+        let index: number;
+        let shorteningCeiling: number | undefined;
+        if (nextIndex < transcriptChunks.length) {
+          // Never let a rewrite delay an undispatched initial part.
+          index = nextIndex++;
+        } else {
+          scheduleShortening();
+          const queued = shorteningQueue.shift();
+          if (queued === undefined) {
+            if (activeParts === 0) return;
+            // Stay available: later initial completions may prove overflow while
+            // a straggler still occupies another slot in this same bounded pool.
+            await progress;
+            continue;
+          }
+          index = queued;
+          shorteningCeiling = shorteningBudgets.get(index)!;
+        }
+        activeParts += 1;
         try {
-          const outcome = await processPart(index);
+          const outcome = await processPart(index, shorteningCeiling);
           if (failed) return;
-          if (outcome === "semantic") semanticParts += 1;
-          completed += 1;
-          if (semanticParts > 0 && request.onPartialCheckpoint) request.onPartialCheckpoint(checkpointSnapshot());
-          request.onStatus?.(`Compacting context (${completed}/${transcriptChunks.length} parts${outcome === "local" ? "; bounded local fallback" : ""})`);
+          if (shorteningCeiling === undefined) {
+            if (outcome === "semantic") semanticParts += 1;
+            completedParts.add(index);
+          }
+          try { if (semanticParts > 0) request.onPartialCheckpoint?.(checkpointSnapshot()); }
+          catch { /* Observers cannot turn a completed part into a provider failure. */ }
+          try { request.onStatus?.(shorteningCeiling !== undefined
+            ? `Shortening context checkpoint (part ${index + 1}/${transcriptChunks.length})`
+            : `Compacting context (${completedParts.size}/${transcriptChunks.length} parts${outcome === "local" ? "; bounded local fallback" : ""})`); }
+          catch { /* Observer only. */ }
         } catch (error) {
           if (!failed) {
             failed = true;
             firstError = error;
-            workerController.abort();
+            workerController.abort(error);
           }
           return;
+        } finally {
+          activeParts -= 1;
+          notifyProgress();
         }
       }
     };
+    // Each part gets at most one shortening pass, using the original source,
+    // remaining per-part attempts and caller deadline. Idle slots can shorten
+    // completed work without waiting for every initial part to settle.
     await Promise.all(Array.from({ length: Math.min(4, transcriptChunks.length) }, () => worker()));
     if (request.signal?.aborted) throw request.signal.reason ?? new Error("compaction was cancelled by the caller");
     if (failed) throw firstError;
@@ -1908,6 +2035,7 @@ export class CodexLbClient {
   }
 
   async compact(request: CompactRequest): Promise<Record<string, unknown>> {
+    request.signal?.throwIfAborted();
     this.requireOpenCodeApiKey();
     if (request.semanticOnly) {
       if (request.input.some((item) => item.type === "compaction")) {

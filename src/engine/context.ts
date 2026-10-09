@@ -2,6 +2,7 @@ import { toResponseInputItems } from "openai/lib/responses/ResponseInputItems";
 import type { ResponseInputItem, ResponseOutputItem } from "openai/resources/responses/responses";
 import type { ContextCheckpoint, SessionStore } from "../storage/session-store.js";
 import type { SessionEvent } from "../types.js";
+import { COMPACTION_REPAIR_MAX_SOURCE_CHARACTERS } from "./compaction.js";
 import type {
   ProjectedContext,
   StoredResponsePayload,
@@ -76,6 +77,8 @@ export function projectContext(
     throughSequence?: number;
     /** Compact an older prefix, keeping a bounded suffix of complete exchanges verbatim. */
     retainRecentCharacters?: number;
+    /** Select a complete bounded repair prefix rather than reject the entire backlog. */
+    repairBatch?: { fits: (input: ResponseInputItem[]) => boolean; hasMoreSource: boolean };
   } = {},
 ): ProjectedContext {
   const checkpoint = options.ignoreCheckpoint ? null : options.checkpoint !== undefined ? options.checkpoint : store.latestCheckpoint(sessionId, {
@@ -93,8 +96,7 @@ export function projectContext(
     input.push(...normalizeCompactionOutput(output));
   }
 
-  const events = store.events(sessionId, checkpointSequence)
-    .filter((event) => options.throughSequence === undefined || event.sequence <= options.throughSequence);
+  const events = store.events(sessionId, checkpointSequence, options.throughSequence);
   const outputlessCallIds = events.flatMap((event) => {
     if (event.kind !== "tool_result" && event.kind !== "tool_denied") return [];
     const payload = event.payload as StoredToolResultPayload;
@@ -104,7 +106,8 @@ export function projectContext(
   const storedOutput = (callId: string): string | undefined => toolOutputs.get(callId);
   const boundaries: Array<{ sequence: number; items: number; characters: number }> = [];
   const pendingCalls = new Set<string>();
-  if (options.retainRecentCharacters) {
+  const trackBoundaries = options.retainRecentCharacters || options.repairBatch;
+  if (trackBoundaries) {
     for (const item of input) {
       if (item.type === "function_call") pendingCalls.add(item.call_id);
       if (item.type === "function_call_output") pendingCalls.delete(item.call_id);
@@ -117,7 +120,7 @@ export function projectContext(
     if (items.length === 0) continue;
     input.push(...items);
     latestSequence = event.sequence;
-    if (options.retainRecentCharacters) {
+    if (trackBoundaries) {
       for (const item of items) {
         characters += JSON.stringify(item).length + 1;
         if (item.type === "function_call") pendingCalls.add(item.call_id);
@@ -125,6 +128,28 @@ export function projectContext(
       }
       if (pendingCalls.size === 0) boundaries.push({ sequence: latestSequence, items: input.length, characters });
     }
+  }
+  if (options.repairBatch && (options.repairBatch.hasMoreSource || !options.repairBatch.fits(input))) {
+    // A batch may stop before an oversized exchange, but never inside its tool
+    // calls/results or between a user request and its first response.
+    const candidates = boundaries.filter((entry) =>
+      (input[entry.items - 1] as { role?: string }).role !== "user"
+      || (input[entry.items] as { role?: string } | undefined)?.role === "user");
+    let low = 0;
+    let high = candidates.length;
+    while (low < high) {
+      const middle = Math.floor((low + high) / 2);
+      if (options.repairBatch.fits(input.slice(0, candidates[middle]!.items))) low = middle + 1;
+      else high = middle;
+    }
+    const boundary = candidates[low - 1];
+    if (!boundary || boundary.sequence <= checkpointSequence) {
+      throw Object.assign(new Error("No complete source exchange fits the bounded repair batch"), {
+        code: "compaction_repair_batch_too_large",
+      });
+    }
+    input.length = boundary.items;
+    return { input, checkpointSequence, latestSequence: boundary.sequence, repairPending: true };
   }
   const recentLimit = options.retainRecentCharacters ?? 0;
   if (recentLimit > 0 && pendingCalls.size > 0) {
@@ -164,6 +189,21 @@ export interface ContextUsage {
   estimated: boolean;
 }
 
+/** Keep display-only accounting from materializing an unbounded unrepaired tail. */
+export function estimateContextTokens(
+  store: SessionStore,
+  sessionId: string,
+  checkpoint = store.latestCheckpoint(sessionId),
+): number {
+  const throughSequence = store.latestSequence(sessionId);
+  const source = store.sourceHistoryStats(sessionId, checkpoint?.throughSequence ?? 0, throughSequence);
+  const characters = JSON.stringify(checkpoint?.compact.output ?? []).length + source.characters;
+  // Large replays use an aggregate approximation, including out-of-line tool
+  // results. Smaller replays retain the exact projected-text estimate.
+  if (characters > COMPACTION_REPAIR_MAX_SOURCE_CHARACTERS) return Math.ceil(characters / 4);
+  return Math.ceil(JSON.stringify(projectContext(store, sessionId, { checkpoint, throughSequence }).input).length / 4);
+}
+
 /** Prefer provider usage only when it was measured against the current checkpoint. */
 export function contextUsage(store: SessionStore, sessionId: string, stateless = false): ContextUsage {
   const usage = store.latestResponseUsage(sessionId);
@@ -178,7 +218,7 @@ export function contextUsage(store: SessionStore, sessionId: string, stateless =
     && (!checkpoint || (sourceSequence !== undefined
       ? usage.sequence > sourceSequence
       : usage.sequence > checkpoint.throughSequence && usage.createdAt > checkpoint.createdAt));
-  const projected = !fresh || stateless ? Math.ceil(JSON.stringify(projectContext(store, sessionId).input).length / 4) : 0;
+  const projected = !fresh || stateless ? estimateContextTokens(store, sessionId, checkpoint) : 0;
   return fresh ? { inputTokens: Math.max(usage.inputTokens, projected), estimated: projected > usage.inputTokens }
     : { inputTokens: projected, estimated: true };
 }

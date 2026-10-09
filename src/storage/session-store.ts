@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { GlassDatabase } from "./database.js";
+import { compactionQuality } from "../engine/compaction.js";
+import { hasUsableCompactionOutput } from "../model/codex-lb.js";
 import {
   normalizeTaskPlan,
   parseTaskPlanSnapshotPayload,
@@ -725,13 +727,22 @@ export class SessionStore {
           ORDER BY through_sequence DESC
         `).all(id) as Array<{ id: number; compact_json: string }>;
         let portableCheckpointId: number | null = null;
+        let repairAnchorId: number | null = null;
         let nativeCheckpointId: number | null = null;
         for (const checkpoint of checkpoints) {
           try {
-            const compact = JSON.parse(checkpoint.compact_json) as unknown;
+            const compact = JSON.parse(checkpoint.compact_json) as Record<string, unknown>;
             if (isPortableCheckpoint(compact)) {
-              portableCheckpointId = checkpoint.id;
-              break;
+              if (portableCheckpointId === null) {
+                portableCheckpointId = checkpoint.id;
+                if (!compactionQuality(compact).degraded) break;
+              } else if (hasUsableCompactionOutput(compact) && !compactionQuality(compact).degraded) {
+                // A degraded descendant still needs its healthy source anchor
+                // after migration, including when degradation is inherited.
+                repairAnchorId = checkpoint.id;
+                break;
+              }
+              continue;
             }
             if (nativeCheckpointId === null && hasCheckpointOutput(compact)) nativeCheckpointId = checkpoint.id;
           } catch {
@@ -740,8 +751,8 @@ export class SessionStore {
         }
         const retainedCheckpointId = portableCheckpointId ?? nativeCheckpointId;
         if (retainedCheckpointId !== null) {
-          this.db.prepare("DELETE FROM context_checkpoints WHERE session_id = ? AND id <> ?")
-            .run(id, retainedCheckpointId);
+          this.db.prepare("DELETE FROM context_checkpoints WHERE session_id = ? AND id <> ? AND id <> ?")
+            .run(id, retainedCheckpointId, repairAnchorId ?? -1);
         } else {
           this.db.prepare("DELETE FROM context_checkpoints WHERE session_id = ?").run(id);
         }
@@ -1039,26 +1050,26 @@ export class SessionStore {
     return append.immediate();
   }
 
-  events(sessionId: string, afterSequence = 0): SessionEvent[] {
+  events(sessionId: string, afterSequence = 0, throughSequence = Number.MAX_SAFE_INTEGER): SessionEvent[] {
     const rows = this.db.prepare(`
       SELECT * FROM session_events
-      WHERE session_id = ? AND sequence > ?
+      WHERE session_id = ? AND sequence > ? AND sequence <= ?
       ORDER BY sequence ASC
-    `).all(sessionId, afterSequence) as EventRow[];
+    `).all(sessionId, afterSequence, throughSequence) as EventRow[];
     return rows.map(eventFromRow);
   }
 
-  /** Aggregate-only preflight for explicit checkpoint repair, including out-of-line tool outputs. */
+  /** Aggregate-only preflight for checkpoint conversion/repair, including out-of-line tool results. */
   sourceHistoryStats(sessionId: string, afterSequence: number, throughSequence: number): {
     events: number; characters: number; missingToolOutputs: number;
   } {
     return this.db.prepare(`
       SELECT COUNT(*) AS events,
-        COALESCE(SUM(length(e.payload_json) + COALESCE(length(t.output_text), 0)), 0) AS characters,
+        COALESCE(SUM(length(e.payload_json) + COALESCE(length(COALESCE(t.output_text, t.error_text)), 0)), 0) AS characters,
         COALESCE(SUM(CASE WHEN e.kind IN ('tool_result', 'tool_denied')
           AND json_extract(e.payload_json, '$.item') IS NULL
           AND json_extract(e.payload_json, '$.output') IS NULL
-          AND t.output_text IS NULL THEN 1 ELSE 0 END), 0) AS missingToolOutputs
+          AND COALESCE(t.output_text, t.error_text) IS NULL THEN 1 ELSE 0 END), 0) AS missingToolOutputs
       FROM session_events e
       LEFT JOIN tool_calls t ON t.session_id = e.session_id
         AND t.call_id = json_extract(e.payload_json, '$.callId')
@@ -1232,6 +1243,32 @@ export class SessionStore {
       this.db.prepare("UPDATE sessions SET last_response_id = NULL, updated_at = ? WHERE id = ?")
         .run(createdAt, sessionId);
       return { id: result.id, sessionId, throughSequence, compact, inputTokens, createdAt };
+    });
+    return save.immediate();
+  }
+
+  /** Save a repaired prefix without changing the newer active checkpoint or continuity. */
+  saveRepairAnchorFenced(
+    sessionId: string,
+    executionToken: string,
+    throughSequence: number,
+    compact: Record<string, unknown>,
+    inputTokens: number | null,
+  ): ContextCheckpoint | null {
+    const save = this.db.transaction(() => {
+      if (!this.hasOperationLeaseRow(sessionId, executionToken, Date.now())) return null;
+      const active = this.latestCheckpoint(sessionId);
+      if (!active || active.throughSequence <= throughSequence || !isPortableCheckpoint(compact)
+        || !hasUsableCompactionOutput(compact) || compactionQuality(compact).degraded) {
+        throw new Error("Repair progress requires a healthy prefix behind the active checkpoint");
+      }
+      const anchor = this.latestCheckpoint(sessionId, { portableOnly: true,
+        accept: candidate => hasUsableCompactionOutput(candidate) && !compactionQuality(candidate).degraded });
+      if (anchor && throughSequence <= anchor.throughSequence) throw new Error("Repair progress must advance the healthy anchor");
+      const saved = this.saveCheckpoint(sessionId, throughSequence, compact, inputTokens);
+      this.db.prepare("DELETE FROM context_checkpoints WHERE session_id = ? AND id <> ? AND id <> ?")
+        .run(sessionId, active.id, saved.id);
+      return saved;
     });
     return save.immediate();
   }

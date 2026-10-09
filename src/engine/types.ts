@@ -36,4 +36,6 @@ export interface ProjectedContext {
   input: ResponseInputItem[];
   checkpointSequence: number;
   latestSequence: number;
+  /** A complete repair prefix was selected; more source remains for a later batch. */
+  repairPending?: boolean;
 }

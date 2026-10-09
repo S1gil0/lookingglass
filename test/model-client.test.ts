@@ -293,7 +293,7 @@ test("codex-lb falls back to bounded semantic Responses checkpoints only for inp
   for (const body of responseBodies) {
     assert.equal(body.service_tier, "priority");
     assert.equal(body.tools && Array.isArray(body.tools) && (body.tools as unknown[]).length, 0);
-    assert.deepEqual(body.reasoning, { effort: "none" });
+    assert.equal(body.reasoning, undefined, "unknown capabilities must not force unsupported reasoning");
     assert.equal("include" in body, false);
     assert.equal("previous_response_id" in body, false);
     const input = body.input as Array<Record<string, unknown>>;
@@ -572,11 +572,17 @@ test("codex-lb semantic fallback bounds oversized parts, preserves usage, and re
     onStatus: (status) => statuses.push(status),
   });
 
-  const totalParts = responseBodies.length;
+  const totalParts = Number(/transcript part \d+ of (\d+)/u.exec(String(responseBodies[0]!.instructions))?.[1]);
   assert.ok(totalParts > 1);
+  assert.equal(responseBodies.length, totalParts * 2, "one bounded shortening pass before trimming");
   assert.ok(maxInFlight > 1);
   assert.ok(maxInFlight <= 4);
-  assert.deepEqual(statuses, Array.from({ length: totalParts }, (_, index) => `Compacting context (${index + 1}/${totalParts} parts)`));
+  // Idle workers may shorten completed parts before the last initial response.
+  assert.deepEqual(statuses.filter((status) => status.startsWith("Compacting context (")),
+    Array.from({ length: totalParts }, (_, index) => `Compacting context (${index + 1}/${totalParts} parts)`));
+  assert.equal(statuses.length, totalParts * 2);
+  assert.deepEqual(statuses.filter((status) => status.startsWith("Shortening context checkpoint")).sort(),
+    Array.from({ length: totalParts }, (_, index) => `Shortening context checkpoint (part ${index + 1}/${totalParts})`).sort());
   const outputText = String(((compacted.output as Array<Record<string, unknown>>)[0]?.content as Array<Record<string, unknown>>)[0]?.text);
   assert.ok(outputText.length <= 32_768);
   assert.match(outputText, /\.\.\.\[truncated\]\.\.\./u);
@@ -585,15 +591,15 @@ test("codex-lb semantic fallback bounds oversized parts, preserves usage, and re
     assert.match(outputText, new RegExp(`TAIL_${index}`));
   }
   assert.deepEqual(compacted.usage, {
-    input_tokens: totalParts * 101,
-    output_tokens: totalParts * 5_000,
-    total_tokens: totalParts * 5_101,
+    input_tokens: responseBodies.length * 101,
+    output_tokens: responseBodies.length * 5_000,
+    total_tokens: responseBodies.length * 5_101,
   });
   assert.deepEqual(compacted.compaction_details, {
     total_parts: totalParts,
     semantic_parts: totalParts,
     local_parts: 0,
-    attempts: totalParts,
+    attempts: responseBodies.length,
     protocol_failures: 0,
     transient_failures: 0,
     quality: {
@@ -607,7 +613,7 @@ test("codex-lb semantic fallback bounds oversized parts, preserves usage, and re
   assert.equal(compacted.id, "compact_semantic_fallback");
   for (const body of responseBodies) {
     assert.deepEqual(body.text, { verbosity: "low" });
-    assert.deepEqual(body.reasoning, { effort: "none" });
+    assert.equal(body.reasoning, undefined, "unknown capabilities must not force unsupported reasoning");
     assert.equal("prompt_cache_key" in body, false);
     assert.match(String(body.instructions), /at or below \d+ characters/u);
   }
@@ -646,13 +652,13 @@ test("codex-lb semantic fallback allocates deterministic budgets across 32 parts
     fast: true,
   });
 
-  assert.equal(responseBodies.length, 32);
+  assert.equal(responseBodies.length, 64);
   const requestedParts = responseBodies
     .map((body) => Number(/transcript part (\d+) of (\d+)/u.exec(String(body.instructions))?.[1] ?? 0))
     .sort((left, right) => left - right);
-  assert.deepEqual(requestedParts, Array.from({ length: 32 }, (_, index) => index + 1));
+  assert.deepEqual(requestedParts, Array.from({ length: 32 }, (_, index) => [index + 1, index + 1]).flat());
   assert.deepEqual(new Set(responseBodies.map((body) => body.max_output_tokens)), new Set([1_024]));
-  assert.equal(responseBodies.reduce((sum, body) => sum + Number(body.max_output_tokens ?? 0), 0), 32_768);
+  assert.equal(responseBodies.reduce((sum, body) => sum + Number(body.max_output_tokens ?? 0), 0), 65_536);
 
   const outputText = String(((compacted.output as Array<Record<string, unknown>>)[0]?.content as Array<Record<string, unknown>>)[0]?.text);
   assert.ok(outputText.length <= 65_536);
@@ -667,7 +673,7 @@ test("codex-lb semantic fallback allocates deterministic budgets across 32 parts
     total_parts: 32,
     semantic_parts: 32,
     local_parts: 0,
-    attempts: 32,
+    attempts: 64,
     protocol_failures: 0,
     transient_failures: 0,
     quality: {
